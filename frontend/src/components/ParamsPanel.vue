@@ -1,21 +1,44 @@
 <script setup>
+import { ref } from 'vue'
 import { useConvertStore, DEFAULT_PARAMS } from '../store'
 
 const store = useConvertStore()
 
 const fields = [
-  { key: 'tol', label: 'Fit tolerance', unit: 'mm', step: 0.01,
-    help: 'How closely lines and arcs must follow the mesh profile. Smaller = more detail kept, more faces.' },
-  { key: 'accept_p95', label: 'Surface deviation (p95)', unit: 'mm', step: 0.01,
-    help: '95% of the surface must be within this distance of the original mesh.' },
-  { key: 'accept_max', label: 'Surface deviation (max)', unit: 'mm', step: 0.01,
-    help: 'No single point may deviate more than this.' },
-  { key: 'accept_hole_max', label: 'Bore deviation (max)', unit: 'mm', step: 0.01,
-    help: 'Tighter budget for cylindrical holes — a wrong hole size stops parts fitting.' },
-  { key: 'accept_vol_pct', label: 'Volume error', unit: '%', step: 0.1,
-    help: 'The rebuilt solid volume must match the mesh within this percentage.' },
+  {
+    key: 'tol', label: 'Fit tolerance', unit: 'mm', step: 0.01,
+    blurb: 'The converter redraws each outline of your part using clean straight lines and arcs. This sets how far that redrawn outline is allowed to stray from the original mesh.',
+    lower: 'Follows every tiny bump — keeps more detail, but makes more faces and can mistake 3D-print roughness for real features.',
+    higher: 'Smooths over small bumps — a simpler, cleaner part, but very small features may get rounded away.',
+  },
+  {
+    key: 'accept_p95', label: 'Surface deviation (p95)', unit: 'mm', step: 0.01,
+    blurb: 'After rebuilding, the tool measures thousands of points and checks how far the new solid is from the original surface. 95% of the surface must be closer than this. It is the main quality bar: fail it, and you get the exact faceted copy instead of a clean solid.',
+    lower: 'Demands a near-perfect match — more parts will fall back to the faceted copy.',
+    higher: 'Accepts a rougher match — more parts convert to clean solids, but they may visibly differ from the original.',
+  },
+  {
+    key: 'accept_max', label: 'Surface deviation (max)', unit: 'mm', step: 0.01,
+    blurb: 'The same check, but for the single worst spot anywhere on the part. A taper, chamfer, or rounded corner is usually what breaks this limit.',
+    lower: 'Even one slightly-off spot rejects the clean solid.',
+    higher: 'Lets one small area be off (say, a taper the tool can’t model yet) while the rest stays accurate.',
+  },
+  {
+    key: 'accept_hole_max', label: 'Bore deviation (max)', unit: 'mm', step: 0.01,
+    blurb: 'Round holes get their own, stricter budget. A hole that is even slightly the wrong size means a screw or pin will not fit, so hole error is judged separately from the rest of the surface.',
+    lower: 'Holes must be almost exactly the right size.',
+    higher: 'Tolerates hole-size error — only sensible when the holes are cosmetic and nothing has to fit in them.',
+  },
+  {
+    key: 'accept_vol_pct', label: 'Volume error', unit: '%', step: 0.1,
+    blurb: 'A final sanity check: the rebuilt part must contain about the same amount of material as the original. It catches big mistakes, like a pocket that got filled in or a chunk that went missing.',
+    lower: 'Stricter overall shape check.',
+    higher: 'More forgiving — rarely needs changing either way.',
+  },
 ]
 
+const openInfo = ref(null)
+const toggleInfo = (key) => { openInfo.value = openInfo.value === key ? null : key }
 const isDefault = (key) => store.params[key] === DEFAULT_PARAMS[key]
 </script>
 
@@ -35,6 +58,12 @@ const isDefault = (key) => store.params[key] === DEFAULT_PARAMS[key]
         <label :for="f.key">
           {{ f.label }}
           <span class="unit num">{{ f.unit }}</span>
+          <button
+            class="info num"
+            :aria-expanded="openInfo === f.key"
+            :aria-label="`What does ${f.label} do?`"
+            @click="toggleInfo(f.key)"
+          >i</button>
         </label>
         <input
           :id="f.key" type="number" :step="f.step" min="0.01"
@@ -42,14 +71,18 @@ const isDefault = (key) => store.params[key] === DEFAULT_PARAMS[key]
           :class="{ touched: !isDefault(f.key) }"
         />
       </div>
-      <p class="help">{{ f.help }}</p>
+      <div v-if="openInfo === f.key" class="explain">
+        <p>{{ f.blurb }}</p>
+        <p><span class="dir">Lower it:</span> {{ f.lower }}</p>
+        <p><span class="dir">Raise it:</span> {{ f.higher }}</p>
+      </div>
     </div>
 
     <label class="check">
       <input type="checkbox" v-model="store.params.force_prismatic" />
       <span>
         Force prismatic on scan-like meshes
-        <span class="help">Dense organic scans normally skip straight to faceted output.</span>
+        <span class="help">Dense organic scans (millions of tiny triangles) normally skip straight to the faceted copy, because they rarely have flat faces and true cylinders to recover. Tick this to make the tool try anyway.</span>
       </span>
     </label>
   </section>
@@ -77,7 +110,42 @@ const isDefault = (key) => store.params[key] === DEFAULT_PARAMS[key]
 label { font-weight: 500; }
 .unit { color: var(--muted); font-size: 12px; margin-left: 2px; }
 input.touched { border-color: var(--edge); }
-.help { margin-top: 2px; }
+
+.info {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 16px;
+  height: 16px;
+  margin-left: 6px;
+  border-radius: 50%;
+  border: 1px solid var(--muted);
+  background: none;
+  color: var(--muted);
+  font-size: 11px;
+  font-style: italic;
+  line-height: 1;
+  vertical-align: 1px;
+}
+.info:hover, .info[aria-expanded='true'] {
+  border-color: var(--edge);
+  color: var(--edge);
+}
+
+.explain {
+  margin-top: 8px;
+  padding: 8px 10px;
+  border-left: 2px solid var(--edge);
+  background: var(--panel-2);
+  border-radius: 0 4px 4px 0;
+  font-size: 12px;
+  color: var(--text);
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.explain .dir { color: var(--edge); font-weight: 600; }
+
 .check {
   display: flex;
   gap: 8px;
