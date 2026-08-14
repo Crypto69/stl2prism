@@ -27,7 +27,7 @@ single container:
 ```bash
 # on the NAS (SSH)
 cd <share-path>
-docker run --rm -v "$PWD":/git alpine/git clone https://github.com/Crypto69/stl2prism.git
+git clone https://github.com/Crypto69/stl2prism.git
 # (public repo, https clone — no deploy key needed, unlike portfolio)
 
 cd stl2prism
@@ -39,7 +39,7 @@ Build natively on the NAS (x86_64) — never copy images built on an ARM Mac
 without `--platform linux/amd64`:
 
 ```bash
-docker compose build     # pulls the ~2 GB CAD stack; expect 15–30 min first time
+docker compose build     # pulls the ~2 GB CAD stack; ~2.5 min measured on the NAS CPU
 docker compose up -d
 ```
 
@@ -109,8 +109,11 @@ Same box, same quirks — full detail in the portfolio repo's
   `<app-path>/DockerEngine/dockerd/bin` (already on PATH via `~/.bashrc`).
   If the daemon is down, start **DockerEngine** in App Center — containers
   come back.
-- **No git on TOS**: use the `alpine/git` container as shown above. This repo
-  is public https, so none of portfolio's deploy-key/SSH-alias setup applies.
+- **Git**: TOS now ships git (2.54 as of this deploy, 2026-08), so the
+  portfolio runbook's `alpine/git` container workaround is no longer needed.
+  If a TOS update ever drops it again:
+  `docker run --rm -v "$PWD":/git alpine/git <clone|pull ...>`. This repo is
+  public https, so none of portfolio's deploy-key/SSH-alias setup applies.
 - **Share ACLs strip file modes**: after every clone/pull run
   `chmod -R a+rX .` in the repo dir. The image itself is immune (everything
   is COPY'd at build time); only the `data/` bind mount and build context
@@ -123,7 +126,7 @@ Same box, same quirks — full detail in the portfolio repo's
 
 ```bash
 cd <share-path>/stl2prism
-docker run --rm -v "$PWD":/git alpine/git pull
+git pull
 chmod -R a+rX .                                # ACLs strip modes on pull
 docker compose build && docker compose up -d
 ```
