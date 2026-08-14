@@ -153,6 +153,6 @@ brings the container back on its own. Only two checks:
 | Upload rejected with 413 | STL exceeds `STL2PRISM_MAX_UPLOAD` — raise it in compose `environment` |
 | Button stuck on "Waiting in queue…" | A previous conversion is still running (they're serialized). Big scans take minutes on the N-series CPU — watch `docker compose logs -f` |
 | Conversion dies with no result, container fine | Worker was OOM-killed inside `mem_limit` — raise the limit or convert a decimated mesh |
-| Scan upload errors mentioning pymeshlab | The image builds with the `[scan]` extra, so this means a broken build — rebuild; `docker compose exec stl2prism python -c "import pymeshlab"` should be silent |
+| Scan upload errors mentioning pymeshlab | Hit on first deploy (2026-08-14): pymeshlab's bundled Qt needs `libcom-err2 libp11-kit0 libgpg-error0`, added to the Dockerfile since. Pull + rebuild; `docker compose exec stl2prism python -c "import pymeshlab"` should be silent |
 | UI loads but every API call 404s | Stale image where `frontend/dist` was baked without the backend — rebuild with `docker compose build --no-cache` |
 | Port 8321 already in use | Another stack claimed it — change the left side of `ports:` in compose and the tailscale serve target |

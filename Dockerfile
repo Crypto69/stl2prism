@@ -11,9 +11,11 @@ RUN npm run build
 # ---- backend ----
 FROM python:3.12-slim
 # OpenCascade (via the OCP wheel) and pymeshlab link against OpenGL/X11
-# libraries even when used headless.
+# libraries even when used headless; pymeshlab's bundled Qt/plugins also
+# need libcom-err2, libp11-kit0 and libgpg-error0 on slim images.
 RUN apt-get update && apt-get install -y --no-install-recommends \
         libgl1 libglu1-mesa libxrender1 libxext6 libsm6 libx11-6 fontconfig \
+        libcom-err2 libp11-kit0 libgpg-error0 \
     && rm -rf /var/lib/apt/lists/*
 WORKDIR /app
 COPY pyproject.toml README.md LICENSE ./

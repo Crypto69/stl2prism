@@ -144,9 +144,15 @@ def _poisson_rebuild(m, target_faces, verbose, attempts=REPAIR_ATTEMPTS):
     try:
         import pymeshlab  # noqa: F401
     except ImportError as e:
+        # Distinguish "not installed" from "installed but won't load" (e.g.
+        # a missing system library) — the remedies are entirely different.
+        if e.name == 'pymeshlab':
+            raise PrepError(
+                "scan input needs pymeshlab, which is an optional dependency; "
+                "install it with: pip install 'stl2prism[scan]'") from e
         raise PrepError(
-            "scan input needs pymeshlab, which is an optional dependency; "
-            "install it with: pip install 'stl2prism[scan]'") from e
+            f"pymeshlab is installed but failed to load ({e}); "
+            f"a system library is probably missing") from e
 
     import multiprocessing as mp
     import tempfile, os
