@@ -26,3 +26,6 @@ env/
 # Output artifacts
 *.step
 *.STEP
+
+# Local test input — never published
+/samples/
