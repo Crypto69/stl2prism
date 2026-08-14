@@ -27,5 +27,10 @@ env/
 *.step
 *.STEP
 
+# Web app
+frontend/node_modules/
+frontend/dist/
+/data/
+
 # Local test input — never published
 /samples/

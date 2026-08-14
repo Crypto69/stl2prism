@@ -18,7 +18,6 @@ dependencies = [
     "rtree",
     "scipy",
     "cadquery",
-    "fast-simplification",
 ]
 
 [project.optional-dependencies]
@@ -29,3 +28,6 @@ stl2prism = "stl2prism.pipeline:main"
 
 [tool.setuptools.packages.find]
 include = ["stl2prism*"]
+
+[tool.pytest.ini_options]
+markers = ["slow: end-to-end runs over large sample meshes"]

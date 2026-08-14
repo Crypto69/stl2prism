@@ -32,6 +32,35 @@ print(result["mode"], result["metrics"])   # 'prismatic' | 'faceted'
 Exit code 0 on success. The log reports which mode produced the output and
 the measured fidelity (surface deviation, volume error) of prismatic results.
 
+## Web app
+
+A browser UI for the same pipeline: drag an STL in, inspect it in 3D,
+set the acceptance tolerances, convert, and download the STEP with a
+fidelity report (mode, surface deviation vs. your limits, volume error,
+face counts and surface types for both files).
+
+### Run locally (dev)
+
+```bash
+python -m venv .venv && .venv/bin/pip install -e . fastapi 'uvicorn[standard]' python-multipart
+.venv/bin/uvicorn backend.main:app --port 8000     # API
+cd frontend && npm install && npm run dev           # UI on :5173, proxies /api
+```
+
+### Run as a container
+
+```bash
+docker compose up --build        # then open http://localhost:8321
+```
+
+For deployment on the x86_64 NAS (clone on the NAS, build
+natively, optional tailscale HTTPS front), follow the runbook in
+[docs/DEPLOY-NAS.md](docs/DEPLOY-NAS.md).
+
+Environment knobs: `STL2PRISM_DATA` (job storage dir, default `/data` in
+the container), `STL2PRISM_JOB_TTL` (seconds before old jobs are purged,
+default 86400), `STL2PRISM_MAX_UPLOAD` (bytes, default 200 MB).
+
 ## How it works
 
 The pipeline implements the classical reverse-engineering architecture
@@ -40,9 +69,12 @@ the *extrusion-cylinder* decomposition strategy rather than free surface
 stitching — which sidesteps the brittle face-intersection/topology problem
 that makes general mesh-to-BREP hard.
 
-1. **Prep** (`mesh_prep`) — load, merge, repair. Scan-like input (huge,
-   non-watertight) is rebuilt via screened Poisson reconstruction and
-   decimated with topology preservation.
+1. **Prep** (`mesh_prep`) — load, merge, repair. Scan-like input (dense
+   tessellation, identified by a low mean dihedral angle) is rebuilt via
+   screened Poisson reconstruction and decimated with topology preservation.
+   Being non-watertight is treated as *needs repair*, not as *is a scan*: a
+   CAD export with an unstitched seam is repaired and still gets the
+   prismatic treatment.
 2. **Axis discovery** (`extrusion`) — face normals are clustered on the
    Gaussian sphere; the top candidate axes (snapped to global XYZ within
    5°) are each *scored* by the volume fraction of the part that has a
