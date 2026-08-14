@@ -3,25 +3,59 @@ import numpy as np
 import trimesh
 
 
-def load_and_prep(path, scan_faces_threshold=200000, target_faces=40000, verbose=True):
-    """Load an STL, repair it, and return a watertight-ish mesh.
+class PrepError(RuntimeError):
+    """Mesh preparation could not produce a usable mesh."""
 
-    CAD-exported meshes are passed through with light cleanup.
-    Scan-like meshes (huge, noisy, holed) get Poisson reconstruction.
+
+# Mean dihedral angle (degrees) below which geometry is treated as a scan.
+# Calibrated on the sample set: scans measure 3.4-4.2, CAD exports 11.2-29.2.
+# A very finely tessellated CAD export would also sit low here, which is why
+# this is paired with a face-count floor rather than used alone.
+SCAN_DIHEDRAL_DEG = 8.0
+SCAN_MIN_FACES = 50000
+
+
+def mean_dihedral_deg(m, cap=400000):
+    """Mean absolute dihedral angle across face adjacencies, in degrees.
+
+    Scans tessellate smooth surfaces densely, so neighbouring facets differ
+    by very little; CAD exports put their facets where the curvature is and
+    meet at genuine feature angles.
+    """
+    a = m.face_adjacency_angles
+    if len(a) == 0:
+        return float('inf')
+    if len(a) > cap:
+        a = a[np.linspace(0, len(a) - 1, cap).astype(np.int64)]
+    return float(np.degrees(np.abs(a)).mean())
+
+
+def load_and_prep(path, target_faces=40000, verbose=True,
+                  scan_dihedral_deg=SCAN_DIHEDRAL_DEG,
+                  scan_min_faces=SCAN_MIN_FACES):
+    """Load an STL, repair it, and return (mesh, is_scan).
+
+    `is_scan` (organic geometry with no analytic surfaces to recover) and
+    `needs_repair` (not watertight) are judged separately: a CAD export with
+    one unstitched seam needs repair but must still reach the prismatic path.
     """
     m = trimesh.load(path, force='mesh')
     m.merge_vertices()
     m.update_faces(m.nondegenerate_faces())
     m.remove_unreferenced_vertices()
 
-    is_scan = len(m.faces) > scan_faces_threshold or not m.is_watertight
+    dih = mean_dihedral_deg(m)
+    is_scan = len(m.faces) > scan_min_faces and dih < scan_dihedral_deg
+    needs_repair = not m.is_watertight
     if verbose:
         print(f"[prep] {len(m.faces)} faces, watertight={m.is_watertight}, "
-              f"treating as {'scan' if is_scan else 'CAD export'}")
+              f"mean dihedral {dih:.1f}deg, "
+              f"treating as {'scan' if is_scan else 'CAD export'}"
+              f"{' (needs repair)' if needs_repair else ''}")
 
-    if is_scan and len(m.faces) > scan_faces_threshold:
+    if is_scan:
         m = _poisson_rebuild(m, target_faces, verbose)
-    elif not m.is_watertight:
+    elif needs_repair:
         trimesh.repair.fill_holes(m)
         if not m.is_watertight and verbose:
             print("[prep] warning: mesh still not watertight after repair")
@@ -30,24 +64,152 @@ def load_and_prep(path, scan_faces_threshold=200000, target_faces=40000, verbose
     return m, is_scan
 
 
-def _poisson_rebuild(m, target_faces, verbose):
+def _pymeshlab_worker(src, dst, target_faces, method, arg):
+    """Repair a scan and decimate it, in a child process.
+
+    Isolated because screened Poisson terminates the process on some inputs
+    ("Failed to close loop") — and terminates it with status 0, so neither a
+    try/except nor an exit code tells you it failed. Only the absence of the
+    output file does.
+    """
     import pymeshlab
-    import tempfile, os
-    with tempfile.TemporaryDirectory() as td:
-        src = os.path.join(td, 'in.stl')
-        dst = os.path.join(td, 'out.stl')
-        m.export(src)
-        ms = pymeshlab.MeshSet()
-        ms.load_new_mesh(src)
+    import trimesh as tm
+
+    mid = dst + '.mid.ply'
+    ms = pymeshlab.MeshSet()
+    ms.load_new_mesh(src)
+    if method == 'poisson':
         ms.generate_sampling_poisson_disk(samplenum=250000, exactnumflag=False)
         ms.compute_normal_for_point_clouds(k=12)
-        ms.generate_surface_reconstruction_screened_poisson(depth=10, samplespernode=3.0)
-        ms.save_current_mesh(dst)
-        p = trimesh.load(dst)
+        ms.generate_surface_reconstruction_screened_poisson(
+            depth=arg, samplespernode=3.0)
+    else:
+        # Direct repair: stitch the scan as-is rather than resurfacing it.
+        # Keeps the measured geometry, and has no fragile solver to abort.
+        ms.meshing_remove_duplicate_vertices()
+        ms.meshing_remove_duplicate_faces()
+        ms.meshing_remove_unreferenced_vertices()
+        ms.meshing_repair_non_manifold_edges()
+        ms.meshing_repair_non_manifold_vertices()
+        # `arg` is the hole size cap, in edges. Scans vary hugely in how big
+        # their gaps are, so this is retried wider rather than guessed once.
+        # selfintersection=True refuses to bridge a hole with overlapping
+        # triangles, which keeps the solid BRepCheck-clean but leaves the
+        # hardest holes open. 'close_loose' allows them: a closed shell that
+        # fails solid-level validation still beats an open one, so it is
+        # tried only after the strict pass has had its chance.
+        ms.meshing_close_holes(maxholesize=arg,
+                               selfintersection=(method == 'close'))
+    ms.save_current_mesh(mid)
+
+    # Keep only the largest connected body: both routes leave small detached
+    # blobs, and decimating those wastes the face budget.
+    p = tm.load(mid)
     p.merge_vertices()
-    main = sorted(p.split(only_watertight=False), key=lambda x: len(x.faces), reverse=True)[0]
-    d = main.simplify_quadric_decimation(face_count=target_faces)
-    d.merge_vertices()
+    main = max(p.split(only_watertight=False), key=lambda c: len(c.faces))
+    main.export(mid)
+
+    # Quadric decimation with preservetopology=True. trimesh's
+    # fast_simplification path is faster but breaks manifoldness, which
+    # leaves the sewing stage with hundreds of disjoint shells.
+    ms2 = pymeshlab.MeshSet()
+    ms2.load_new_mesh(mid)
+    ms2.meshing_decimation_quadric_edge_collapse(
+        targetfacenum=target_faces, preservetopology=True,
+        preservenormal=True, planarquadric=True)
+    ms2.save_current_mesh(dst)
+
+
+# Repair attempts in order. Direct stitching runs first: it preserves the
+# measured surface and cannot abort, whereas screened Poisson resurfaces the
+# part and fails on some scans regardless of depth. Poisson stays as the
+# fallback for scans too broken to stitch.
+REPAIR_ATTEMPTS = (('close', 3000), ('close', 100000),
+                   ('close_loose', 3000), ('close_loose', 100000),
+                   ('poisson', 10), ('poisson', 9), ('poisson', 8))
+
+
+def _open_edges(d):
+    """Count edges with only one adjacent face — how far from closed a mesh is.
+
+    Ranks near-miss repairs against each other when none of them close fully;
+    face count alone cannot tell a nearly-sealed mesh from a badly torn one.
+    """
+    import trimesh as tm
+    return len(tm.grouping.group_rows(d.edges_sorted, require_count=1))
+
+
+def _poisson_rebuild(m, target_faces, verbose, attempts=REPAIR_ATTEMPTS):
+    """Rebuild a scan as a clean watertight mesh, trying each repair route."""
+    try:
+        import pymeshlab  # noqa: F401
+    except ImportError as e:
+        raise PrepError(
+            "scan input needs pymeshlab, which is an optional dependency; "
+            "install it with: pip install 'stl2prism[scan]'") from e
+
+    import multiprocessing as mp
+    import tempfile, os
+
+    import gc
+
+    ctx = mp.get_context('spawn')
+    best, best_open = None, float('inf')
+    with tempfile.TemporaryDirectory() as td:
+        src = os.path.join(td, 'in.stl')
+        m.export(src)
+        # Release the source mesh before the child starts: a 2M-face scan is
+        # ~500MB in trimesh, and holding it while pymeshlab loads its own copy
+        # doubles peak memory for no reason.
+        del m
+        gc.collect()
+        for i, (method, arg) in enumerate(attempts):
+            label = (f'poisson depth {arg}' if method == 'poisson'
+                     else f'{method} holes<={arg}')
+            dst = os.path.join(td, f'out{i}.ply')
+            proc = ctx.Process(target=_pymeshlab_worker,
+                               args=(src, dst, target_faces, method, arg))
+            proc.start()
+            proc.join()
+            # The output file is the only trustworthy success signal: the
+            # Poisson solver exits 0 even when it has given up.
+            if not os.path.exists(dst):
+                if verbose:
+                    print(f"[prep] {label} failed (exit {proc.exitcode}); "
+                          f"trying next repair route")
+                continue
+            d = _clean(trimesh.load(dst))
+            if d.is_watertight:
+                if verbose:
+                    print(f"[prep] repair via {label}")
+                best = d
+                break
+            # A non-watertight repair sews into an open shell, so keep looking;
+            # hold on to the closest-to-closed effort in case nothing closes.
+            open_e = _open_edges(d)
+            if verbose:
+                print(f"[prep] {label} -> not watertight "
+                      f"({open_e} open edges); trying next repair route")
+            if best is None or open_e < best_open:
+                best, best_open = d, open_e
+    if best is None:
+        raise PrepError(
+            f"every repair route failed "
+            f"({', '.join(a[0] for a in attempts)}); "
+            f"the scan may be too noisy or too large")
     if verbose:
-        print(f"[prep] poisson rebuild -> {len(d.faces)} faces, watertight={d.is_watertight}")
+        print(f"[prep] scan rebuild -> {len(best.faces)} faces, "
+              f"watertight={best.is_watertight}")
+        if not best.is_watertight:
+            print("[prep] warning: no repair route produced a watertight mesh; "
+                  "the export will be an open shell, not a closed solid")
+    return best
+
+
+def _clean(d):
+    d.merge_vertices()
+    d.update_faces(d.nondegenerate_faces())
+    d.remove_unreferenced_vertices()
+    if not d.is_watertight:
+        trimesh.repair.fill_holes(d)
     return d

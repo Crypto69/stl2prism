@@ -5,8 +5,21 @@ import numpy as np
 import trimesh
 
 
-def validate(solid, mesh, n_samples=5000):
-    """Sample source mesh surface, measure distance to rebuilt solid mesh."""
+def validate(solid, mesh, n_samples=5000, cyls=None, hole_band=0.15):
+    """Sample source mesh surface, measure distance to rebuilt solid mesh.
+
+    Deviation is reported globally and, separately, restricted to points
+    lying on cylindrical bores. A millimetre of error on a flat outer wall is
+    cosmetic; the same error on a bore changes the hole size and the part
+    stops fitting, so the two cannot share one budget.
+
+    hole_band is deliberately tight: it only has to admit sample points on
+    the bore wall itself (within the circle-fit residual of radius r), while
+    excluding chamfer and edge points a fraction of a radius away — those
+    belong to the global budget. A rebuild radius error larger than the band
+    is still caught, because the band selects points by the *mesh* fit and
+    the deviation is measured against the *rebuilt* wall.
+    """
     import cadquery as cq
     import tempfile, os
     with tempfile.TemporaryDirectory() as td:
@@ -17,24 +30,56 @@ def validate(solid, mesh, n_samples=5000):
     _, dist, _ = trimesh.proximity.closest_point(rb, pts)
     vol_mesh = mesh.volume if mesh.is_watertight else float('nan')
     vol_solid = solid.val().Volume()
-    return {
+    worst = int(np.argmax(dist))
+    out = {
         'dev_max': float(dist.max()),
         'dev_p95': float(np.percentile(dist, 95)),
         'dev_mean': float(dist.mean()),
+        'dev_max_xyz': [round(float(v), 2) for v in pts[worst]],
         'vol_mesh': vol_mesh,
         'vol_solid': vol_solid,
         'vol_err_pct': abs(vol_solid - vol_mesh) / vol_mesh * 100
                        if vol_mesh == vol_mesh else float('nan'),
+        'hole_dev_max': float('nan'),
+        'hole_dev_p95': float('nan'),
+        'holes_checked': 0,
     }
+    on_hole = np.zeros(len(pts), bool)
+    for c in (cyls or []):
+        axis, (bx, by) = c['axis'], c['basis']
+        c3 = c['center2'][0] * bx + c['center2'][1] * by
+        rel = pts - c3
+        h = rel @ axis
+        radial = np.linalg.norm(rel - np.outer(h, axis), axis=1)
+        # Inset axially rather than extend: points at the bore mouths sit on
+        # chamfers and edge breaks, whose deviation belongs to the global
+        # budget, not the hole-size one.
+        on_hole |= ((np.abs(radial - c['r']) < hole_band) &
+                    (h >= c['h0'] + hole_band) & (h <= c['h1'] - hole_band))
+    if on_hole.any():
+        out['hole_dev_max'] = float(dist[on_hole].max())
+        out['hole_dev_p95'] = float(np.percentile(dist[on_hole], 95))
+        out['holes_checked'] = len(cyls or [])
+    return out
 
 
 def run(in_path, out_path, tol=0.08, accept_p95=0.25, accept_vol_pct=2.0,
+        accept_max=0.26, accept_hole_max=0.10,
         force_prismatic=False, verbose=True):
     from .mesh_prep import load_and_prep
     from .extrusion import dominant_axis
-    from .rebuild import build_solid, export_step, faceted_fallback
+    from .rebuild import build_solid, export_step
 
     mesh, is_scan = load_and_prep(in_path, verbose=verbose)
+
+    # Before any axis work: scoring an axis means cross-sectioning the mesh
+    # several times per candidate, which is wasted on organic geometry.
+    if is_scan and not force_prismatic:
+        if verbose:
+            print('[out] scan input: skipping prismatic attempt '
+                  '(use --force-prismatic to override)')
+        return _emit_faceted(mesh, out_path, verbose)
+
     from .extrusion import score_axis
     cands = dominant_axis(mesh)
     best = None
@@ -56,28 +101,52 @@ def run(in_path, out_path, tol=0.08, accept_p95=0.25, accept_vol_pct=2.0,
               f"cross-section; prismatic fit may be poor there")
 
     result = {'mode': None, 'metrics': None}
-    if is_scan and not force_prismatic:
-        if verbose:
-            print('[out] scan input: skipping prismatic attempt (use --force-prismatic to override)')
-        faceted_fallback(mesh, out_path)
-        result.update(mode='faceted')
-        if verbose:
-            print(f'[out] faceted solid -> {out_path}')
-        return result
     try:
         solid, rep = build_solid(slabs, axis, tol=tol, verbose=verbose)
         from .features import find_cross_cylinders, subtract_cylinders
-        cyls = find_cross_cylinders(mesh, axis)
+        # Concave regions are holes; convex ones are bosses/fillets, which
+        # must be neither subtracted (that would carve away material) nor
+        # held to the hole tolerance. Of the holes, only cross-axis ones get
+        # subtracted — axis-parallel holes are already rings in the extruded
+        # profile, but their fitted radii deserve the same tight gate.
+        all_cyls = find_cross_cylinders(mesh, axis, exclude_parallel=False)
+        holes = [c for c in all_cyls if c['concave']]
+        cyls = [c for c in holes if not c['parallel']]
         if cyls:
             solid = subtract_cylinders(solid, cyls, verbose=verbose)
-        metrics = validate(solid, mesh)
+        metrics = validate(solid, mesh, cyls=holes)
         if verbose:
             print(f"[check] p95 dev {metrics['dev_p95']:.3f}mm, "
-                  f"max {metrics['dev_max']:.3f}mm, "
+                  f"max {metrics['dev_max']:.3f}mm at "
+                  f"{metrics['dev_max_xyz']}, "
                   f"volume err {metrics['vol_err_pct']:.2f}%")
+            if metrics['holes_checked']:
+                print(f"[check] bore dev p95 {metrics['hole_dev_p95']:.3f}mm, "
+                      f"max {metrics['hole_dev_max']:.3f}mm "
+                      f"over {metrics['holes_checked']} bore(s)")
+        # Gate bores on p95, not max: a wrong radius shifts every wall
+        # sample by the same amount, so p95 catches it just as surely,
+        # while a single edge/chamfer outlier cannot fail a good hole.
+        hole_p95 = metrics['hole_dev_p95']
         ok = (metrics['dev_p95'] <= accept_p95 and
+              metrics['dev_max'] <= accept_max and
+              (hole_p95 != hole_p95 or hole_p95 <= accept_hole_max) and
               (metrics['vol_err_pct'] <= accept_vol_pct or
                metrics['vol_err_pct'] != metrics['vol_err_pct']))
+        if verbose and not ok:
+            why = []
+            if metrics['dev_p95'] > accept_p95:
+                why.append(f"p95 {metrics['dev_p95']:.3f} > {accept_p95}")
+            if metrics['dev_max'] > accept_max:
+                why.append(f"max {metrics['dev_max']:.3f} > {accept_max} "
+                           f"at {metrics['dev_max_xyz']}")
+            if hole_p95 == hole_p95 and hole_p95 > accept_hole_max:
+                why.append(f"bore p95 {hole_p95:.3f} > {accept_hole_max}")
+            if (metrics['vol_err_pct'] == metrics['vol_err_pct']
+                    and metrics['vol_err_pct'] > accept_vol_pct):
+                why.append(f"volume {metrics['vol_err_pct']:.2f}% "
+                           f"> {accept_vol_pct}%")
+            print(f"[check] rejected: {'; '.join(why)}")
         if ok:
             export_step(solid, out_path)
             result.update(mode='prismatic', metrics=metrics)
@@ -91,11 +160,31 @@ def run(in_path, out_path, tol=0.08, accept_p95=0.25, accept_vol_pct=2.0,
         if verbose:
             print(f"[out] prismatic rebuild failed ({type(e).__name__}: {e}); "
                   f"falling back to faceted")
-    faceted_fallback(mesh, out_path)
-    result.update(mode='faceted')
+    return _emit_faceted(mesh, out_path, verbose)
+
+
+def _emit_faceted(mesh, out_path, verbose, accept_vol_pct=5.0):
+    """Write the faceted STEP, then check the artifact rather than the mode.
+
+    The prismatic path has a deviation/volume gate; without an equivalent here
+    a fragmentary export reports success exactly as loudly as a good one.
+    """
+    from .rebuild import faceted_fallback
+    stats = faceted_fallback(mesh, out_path, verbose=verbose)
+    vol_mesh = mesh.volume if mesh.is_watertight else float('nan')
+    vol_err = (abs(stats['volume'] - vol_mesh) / vol_mesh * 100
+               if vol_mesh == vol_mesh and vol_mesh > 0 else float('nan'))
+    if verbose:
+        print(f"[check] faceted {stats['faces_out']} faces from "
+              f"{stats['faces_in']}, volume {stats['volume']:.0f}mm^3"
+              + (f", volume err {vol_err:.2f}%" if vol_err == vol_err else ""))
+    if vol_err == vol_err and vol_err > accept_vol_pct:
+        raise RuntimeError(
+            f"faceted solid volume differs from the mesh by {vol_err:.1f}% "
+            f"(limit {accept_vol_pct}%); refusing to report success")
     if verbose:
         print(f"[out] faceted solid -> {out_path}")
-    return result
+    return {'mode': 'faceted', 'metrics': stats}
 
 
 def main():
@@ -109,13 +198,24 @@ def main():
                     help='profile fit tolerance in mm (default 0.08)')
     ap.add_argument('--accept-p95', type=float, default=0.25,
                     help='max p95 surface deviation to accept prismatic result')
+    ap.add_argument('--accept-max', type=float, default=0.26,
+                    help='max single-point surface deviation, mm (default 0.26)')
+    ap.add_argument('--accept-hole-max', type=float, default=0.10,
+                    help='max deviation on cylindrical bores, mm (default 0.10)')
     ap.add_argument('--force-prismatic', action='store_true',
                     help='attempt prismatic fit even for scan-like input')
     ap.add_argument('--quiet', action='store_true')
     args = ap.parse_args()
     out = args.output or args.input.rsplit('.', 1)[0] + '.step'
-    r = run(args.input, out, tol=args.tol, accept_p95=args.accept_p95,
-            force_prismatic=args.force_prismatic, verbose=not args.quiet)
+    try:
+        r = run(args.input, out, tol=args.tol, accept_p95=args.accept_p95,
+                accept_max=args.accept_max,
+                accept_hole_max=args.accept_hole_max,
+                force_prismatic=args.force_prismatic, verbose=not args.quiet)
+    except Exception as e:
+        # A crash must not look like a success to a calling script.
+        print(f"[error] {type(e).__name__}: {e}", file=sys.stderr)
+        sys.exit(1)
     sys.exit(0 if r['mode'] else 1)
 
 

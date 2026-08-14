@@ -14,8 +14,15 @@ from .profile_fit import fit_circle_taubin
 
 
 def find_cross_cylinders(mesh, primary_axis, angle_tol_deg=12.0,
-                         max_r=30.0, min_faces=8, resid_tol=0.12):
-    """Return list of dicts {axis, center, r, h0, h1} for cross-axis bores."""
+                         max_r=30.0, min_faces=8, resid_tol=0.12,
+                         exclude_parallel=True):
+    """Return list of dicts {axis, center, r, h0, h1} for cylindrical bores.
+
+    With exclude_parallel=True (default) only cross-axis bores are returned —
+    the ones that must be subtracted, since axis-parallel holes are already
+    interior rings of the extruded profile. exclude_parallel=False keeps the
+    parallel ones too (tagged 'parallel'), which validation needs: a hole is
+    a hole regardless of which stage of the rebuild produced it."""
     n = mesh.face_normals
     curved = _curved_face_mask(mesh)
     if curved.sum() < min_faces:
@@ -39,7 +46,8 @@ def find_cross_cylinders(mesh, primary_axis, angle_tol_deg=12.0,
         if w[0] > 0.05 * w[2]:          # normals not planar enough
             continue
         cos = abs(float(axis @ primary_axis))
-        if cos > np.cos(np.radians(angle_tol_deg)):
+        parallel = cos > np.cos(np.radians(angle_tol_deg))
+        if parallel and exclude_parallel:
             continue                     # parallel to primary: already built
         centers = mesh.triangles_center[comp]
         basis = _plane_basis(axis)
@@ -51,14 +59,19 @@ def find_cross_cylinders(mesh, primary_axis, angle_tol_deg=12.0,
         c3 = fit['center'][0] * basis[0] + fit['center'][1] * basis[1]
         radial = centers - c3 - np.outer(centers @ axis, axis)
         radial /= np.linalg.norm(radial, axis=1, keepdims=True)
-        align = np.abs((radial * nn).sum(axis=1))
-        if align.mean() < 0.95:
+        signed = (radial * nn).sum(axis=1)
+        if np.abs(signed).mean() < 0.95:
             continue
+        # Outward mesh normals pointing back toward the cylinder axis mean
+        # the surface encloses a void: a hole. Pointing away means a boss or
+        # fillet — an outer surface, not a mating feature.
+        concave = float(signed.mean()) < 0.0
         hs = centers @ axis
         verts = mesh.vertices[np.unique(mesh.faces[comp])]
         vh = verts @ axis
         out.append({'axis': axis, 'center2': fit['center'], 'basis': basis,
-                    'r': float(fit['r']),
+                    'r': float(fit['r']), 'parallel': bool(parallel),
+                    'concave': concave,
                     'h0': float(vh.min()), 'h1': float(vh.max()),
                     'faces': len(comp)})
     return _merge_coaxial(out)
