@@ -184,8 +184,37 @@ def _axis_basis(axis):
     return T
 
 
+def write_step(shapes, path):
+    """Write one or more OCC solids to a single AP214 STEP file.
+
+    Several solids go into one compound, so a multi-body part imports as
+    multiple bodies of one component (Fusion, FreeCAD, Onshape all do this)
+    rather than as separate files. Explicit MANIFOLD_SOLID_BREP per solid.
+    """
+    from OCP.TopoDS import TopoDS_Compound
+    from OCP.BRep import BRep_Builder
+    from OCP.STEPControl import STEPControl_Writer, STEPControl_ManifoldSolidBrep
+    from OCP.Interface import Interface_Static
+    shapes = list(shapes)
+    if not shapes:
+        raise ValueError('nothing to write')
+    if len(shapes) == 1:
+        shape = shapes[0]
+    else:
+        shape = TopoDS_Compound()
+        b = BRep_Builder()
+        b.MakeCompound(shape)
+        for s in shapes:
+            b.Add(shape, s)
+    w = STEPControl_Writer()
+    Interface_Static.SetCVal_s('write.step.schema', 'AP214')
+    w.Transfer(shape, STEPControl_ManifoldSolidBrep)
+    w.Write(path)
+
+
 def export_step(solid, path):
-    cq.exporters.export(solid, path)
+    """Write a CadQuery solid (Workplane) as STEP."""
+    write_step([solid.val().wrapped], path)
 
 
 class FacetedError(RuntimeError):
@@ -266,13 +295,23 @@ def faceted_fallback(mesh, path, angular_tol=5e-3, min_face_frac=0.5,
     Returns stats describing what was actually written. Raises FacetedError
     rather than emitting a fragment that would pass as a valid STEP file.
     """
+    shape, stats = faceted_solid(mesh, angular_tol=angular_tol,
+                                 min_face_frac=min_face_frac, verbose=verbose)
+    write_step([shape], path)
+    return stats
+
+
+def faceted_solid(mesh, angular_tol=5e-3, min_face_frac=0.5, verbose=True):
+    """Sew triangles into a solid and unify coplanar faces; nothing written.
+
+    Returns (TopoDS_Shape, stats). Raises FacetedError rather than returning
+    a fragment that would pass as a valid solid.
+    """
     from OCP.gp import gp_Pnt
     from OCP.BRepBuilderAPI import (BRepBuilderAPI_MakePolygon,
         BRepBuilderAPI_MakeFace, BRepBuilderAPI_Sewing)
     from OCP.TopAbs import TopAbs_FACE
     from OCP.ShapeUpgrade import ShapeUpgrade_UnifySameDomain
-    from OCP.STEPControl import STEPControl_Writer, STEPControl_ManifoldSolidBrep
-    from OCP.Interface import Interface_Static
 
     sew = BRepBuilderAPI_Sewing(1e-3)
     V = mesh.vertices
@@ -331,10 +370,7 @@ def faceted_fallback(mesh, path, angular_tol=5e-3, min_face_frac=0.5,
         print(f"[faceted] warning: {naked2} naked edge(s) remain; the result "
               f"is an open shell, not a closed solid")
 
-    w = STEPControl_Writer()
-    Interface_Static.SetCVal_s('write.step.schema', 'AP214')
-    w.Transfer(solid2, STEPControl_ManifoldSolidBrep)
-    w.Write(path)
-    return {'faces_in': n_added, 'faces_out': faces2, 'shells': n_shells,
-            'free_edges': free_edges, 'naked_edges': naked2, 'volume': vol,
-            'is_solid': bool(valid and naked2 == 0)}
+    return solid2, {
+        'faces_in': n_added, 'faces_out': faces2, 'shells': n_shells,
+        'free_edges': free_edges, 'naked_edges': naked2, 'volume': vol,
+        'is_solid': bool(valid and naked2 == 0)}

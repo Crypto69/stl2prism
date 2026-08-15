@@ -77,6 +77,50 @@ def load_and_prep(path, target_faces=40000, verbose=True,
     `needs_repair` (not watertight) are judged separately: a CAD export with
     one unstitched seam needs repair but must still reach the prismatic path.
     """
+    m = _load_scaled(path, units, verbose)
+    is_scan = classify(m, verbose, scan_dihedral_deg, scan_min_faces)
+    return repair(m, is_scan, target_faces, verbose), is_scan
+
+
+def load_and_prep_bodies(path, target_faces=40000, verbose=True,
+                         scan_dihedral_deg=SCAN_DIHEDRAL_DEG,
+                         scan_min_faces=SCAN_MIN_FACES, units='mm'):
+    """Like load_and_prep, but one prepared mesh per connected body.
+
+    Returns (bodies, is_scan, n_dropped). Bodies are sorted largest first.
+    Sliver bodies (see split_bodies) are dropped and counted; a body whose
+    scan repair fails is dropped with a log line rather than failing the
+    whole file. Single-body files take exactly the load_and_prep path.
+    """
+    m = _load_scaled(path, units, verbose)
+    is_scan = classify(m, verbose, scan_dihedral_deg, scan_min_faces)
+    parts, n_dropped = split_bodies(m, is_scan, verbose)
+    if len(parts) == 1:
+        return [repair(parts[0], is_scan, target_faces, verbose)], is_scan, n_dropped
+
+    if is_scan:
+        _require_pymeshlab()   # fail once, loudly, not once per body
+    total = sum(len(p.faces) for p in parts)
+    bodies = []
+    for i, p in enumerate(parts):
+        # Share the decimation budget by size, with a floor so small bodies
+        # keep enough facets to stay recognisable.
+        budget = max(1000, int(target_faces * len(p.faces) / total))
+        if verbose and is_scan:
+            print(f"[body {i + 1}/{len(parts)}] repairing {len(p.faces)} faces "
+                  f"(watertight={p.is_watertight}, budget {budget})")
+        try:
+            bodies.append(repair(p, is_scan, budget, verbose))
+        except PrepError as e:
+            if verbose:
+                print(f"[body {i + 1}] repair failed ({e}); body dropped")
+            n_dropped += 1
+    if not bodies:
+        raise PrepError('no body survived preparation')
+    return bodies, is_scan, n_dropped
+
+
+def _load_scaled(path, units, verbose):
     if units not in UNIT_SCALE:
         raise PrepError(f"unknown units '{units}'; "
                         f"expected one of: {', '.join(UNIT_SCALE)}")
@@ -85,25 +129,75 @@ def load_and_prep(path, target_faces=40000, verbose=True,
         m.apply_scale(UNIT_SCALE[units])
         if verbose:
             print(f"[prep] input units {units}: scaled x{UNIT_SCALE[units]:g} to mm")
+    return m
 
+
+def classify(m, verbose=True, scan_dihedral_deg=SCAN_DIHEDRAL_DEG,
+             scan_min_faces=SCAN_MIN_FACES):
+    """Decide scan vs CAD export for the whole file (and log the verdict)."""
     dih = mean_dihedral_deg(m)
     is_scan = len(m.faces) > scan_min_faces and dih < scan_dihedral_deg
-    needs_repair = not m.is_watertight
     if verbose:
         print(f"[prep] {len(m.faces)} faces, watertight={m.is_watertight}, "
               f"mean dihedral {dih:.1f}deg, "
               f"treating as {'scan' if is_scan else 'CAD export'}"
-              f"{' (needs repair)' if needs_repair else ''}")
+              f"{'' if m.is_watertight else ' (needs repair)'}")
+    return is_scan
 
+
+def repair(m, is_scan, target_faces=40000, verbose=True):
+    """Close and normalise one body: Poisson/stitch ladder for scans, hole
+    filling for leaky CAD exports, consistent outward normals for all."""
     if is_scan:
         m = _poisson_rebuild(m, target_faces, verbose)
-    elif needs_repair:
+    elif not m.is_watertight:
         trimesh.repair.fill_holes(m)
         if not m.is_watertight and verbose:
             print("[prep] warning: mesh still not watertight after repair")
-
     trimesh.repair.fix_normals(m)
-    return m, is_scan
+    return m
+
+
+# A body this small cannot be closed (a tetrahedron is 4 faces); anything
+# below is an export artefact, not a part.
+MIN_BODY_FACES = 4
+# Scans shed detached blobs; on scan input a body is also dropped if it is
+# both tiny in absolute terms and negligible relative to the whole mesh.
+SCAN_SLIVER_FACES = 100
+SCAN_SLIVER_FRAC = 0.001
+
+
+def split_bodies(m, is_scan, verbose=True):
+    """Split into connected bodies, largest first; drop slivers.
+
+    Returns (bodies, n_dropped). CAD input keeps every body that could be a
+    closed solid, however small — a washer is a part. Scan input additionally
+    sheds blobs under SCAN_SLIVER_FACES that are also under SCAN_SLIVER_FRAC
+    of the mesh, since those are repair noise, not geometry.
+    """
+    parts = m.split(only_watertight=False)
+    if len(parts) <= 1:
+        return [m], 0
+    total = len(m.faces)
+
+    def sliver(p):
+        n = len(p.faces)
+        return n < MIN_BODY_FACES or (
+            is_scan and n < SCAN_SLIVER_FACES and n < SCAN_SLIVER_FRAC * total)
+
+    kept = sorted((p for p in parts if not sliver(p)),
+                  key=lambda p: len(p.faces), reverse=True)
+    dropped = len(parts) - len(kept)
+    if verbose:
+        msg = f"[bodies] {len(parts)} connected bodies"
+        if dropped:
+            lost = total - sum(len(p.faces) for p in kept)
+            msg += (f"; dropping {dropped} sliver(s) "
+                    f"({lost} faces, {lost / total:.2%} of the mesh)")
+        print(msg + f"; converting {len(kept)}")
+    if not kept:
+        raise PrepError('every body is a sliver; nothing to convert')
+    return kept, dropped
 
 
 def _pymeshlab_worker(src, dst, target_faces, method, arg):
@@ -181,8 +275,7 @@ def _open_edges(d):
     return len(tm.grouping.group_rows(d.edges_sorted, require_count=1))
 
 
-def _poisson_rebuild(m, target_faces, verbose, attempts=REPAIR_ATTEMPTS):
-    """Rebuild a scan as a clean watertight mesh, trying each repair route."""
+def _require_pymeshlab():
     try:
         import pymeshlab  # noqa: F401
     except ImportError as e:
@@ -195,6 +288,11 @@ def _poisson_rebuild(m, target_faces, verbose, attempts=REPAIR_ATTEMPTS):
         raise PrepError(
             f"pymeshlab is installed but failed to load ({e}); "
             f"a system library is probably missing") from e
+
+
+def _poisson_rebuild(m, target_faces, verbose, attempts=REPAIR_ATTEMPTS):
+    """Rebuild a scan as a clean watertight mesh, trying each repair route."""
+    _require_pymeshlab()
 
     import multiprocessing as mp
     import tempfile, os

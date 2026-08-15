@@ -51,6 +51,7 @@ def step_stats(path):
     which is the number CAD users compare against the triangle count.
     """
     faces = 0
+    solids = 0
     kinds = {k: 0 for k in _FACE_KINDS}
     pat = re.compile(r'=\s*([A-Z_0-9]+)\s*\(')
     with open(path, errors='replace') as f:
@@ -61,6 +62,8 @@ def step_stats(path):
             name = m.group(1)
             if name == 'ADVANCED_FACE':
                 faces += 1
+            elif name == 'MANIFOLD_SOLID_BREP':
+                solids += 1
             elif name in kinds:
                 kinds[name] += 1
             elif name.startswith('B_SPLINE_SURFACE'):
@@ -68,6 +71,7 @@ def step_stats(path):
     return {
         'file_size': os.path.getsize(path),
         'faces': faces,
+        'solids': solids,
         'surface_types': {
             'planes': kinds['PLANE'],
             'cylinders': kinds['CYLINDRICAL_SURFACE'],

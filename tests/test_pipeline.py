@@ -225,6 +225,63 @@ def test_obj_matches_stl_endtoend(tmp_path):
     assert os.path.getsize(out) > 0
 
 
+# --- multi-body -----------------------------------------------------------
+
+def _assembly(path):
+    """Two boxes, a sphere and a 2-triangle sliver in one file: three real
+    bodies (two prismatic, one not) plus the kind of stray fragment exporters
+    leave behind."""
+    a = trimesh.creation.box((20, 10, 5))
+    b = trimesh.creation.box((8, 8, 8))
+    b.apply_translation((40, 0, 0))
+    c = trimesh.creation.icosphere(subdivisions=3, radius=5)
+    c.apply_translation((0, 40, 0))
+    sliver = trimesh.Trimesh(
+        vertices=[[80, 0, 0], [81, 0, 0], [80, 1, 0], [80, 0, 1]],
+        faces=[[0, 1, 2], [0, 2, 3]], process=False)
+    trimesh.util.concatenate([a, b, c, sliver]).export(path)
+    return path
+
+
+def test_split_bodies_drops_only_slivers(tmp_path):
+    """CAD input keeps every closable body, however small (a 12-face box is
+    a part); only fragments that cannot close are dropped."""
+    from stl2prism.mesh_prep import load_mesh, split_bodies
+    m = load_mesh(_assembly(str(tmp_path / 'asm.stl')))
+    parts, dropped = split_bodies(m, is_scan=False, verbose=False)
+    assert dropped == 1
+    assert [len(p.faces) for p in parts] == [1280, 12, 12]   # largest first
+
+
+def test_multi_body_writes_every_body_into_one_step(tmp_path):
+    """The bug that shipped one knurled dial out of an 85-body controller:
+    every body must be converted on its own and land in the same STEP."""
+    from stl2prism.pipeline import run
+    out = str(tmp_path / 'asm.step')
+    r = run(_assembly(str(tmp_path / 'asm.stl')), out, verbose=False)
+    assert r['mode'] == 'mixed'
+    assert (r['n_bodies'], r['n_written'], r['n_dropped']) == (3, 3, 1)
+    modes = sorted(b['mode'] for b in r['bodies'])
+    assert modes == ['faceted', 'prismatic', 'prismatic']
+    assert all(b['error'] is None for b in r['bodies'])
+    assert r['metrics']['n_prismatic'] == 2
+    got = _reimport(out)
+    assert got['solids'] == 3, f'expected 3 solids in one STEP: {got}'
+    assert got['naked_edges'] == 0
+
+
+def test_single_body_result_shape_unchanged(tmp_path):
+    """Callers of run() on ordinary parts must see the old keys and values."""
+    from stl2prism.pipeline import run
+    p = str(tmp_path / 'box.stl')
+    trimesh.creation.box((20, 10, 5)).export(p)
+    r = run(p, str(tmp_path / 'box.step'), verbose=False)
+    assert r['mode'] == 'prismatic'
+    assert 'bodies' not in r
+    assert r['metrics']['dev_p95'] == pytest.approx(0.0, abs=1e-6)
+    assert (r['n_bodies'], r['n_written'], r['n_dropped']) == (1, 1, 0)
+
+
 # --- faceted export sanity ------------------------------------------------
 
 def test_faceted_export_keeps_the_geometry(tmp_path):

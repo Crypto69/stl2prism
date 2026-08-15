@@ -47,10 +47,50 @@ const inputRows = computed(() => {
   ]
 })
 
+// Multi-body runs carry a per-body list; single-body runs do not.
+const bodies = computed(() => store.result?.bodies || null)
+
+const verdict = computed(() => {
+  const r = store.result
+  if (!r?.ok) return null
+  if (!bodies.value) {
+    return r.mode === 'prismatic'
+      ? { title: 'Prismatic solid', cls: 'prismatic',
+          note: 'Clean BREP with true planes and cylinders — every gate below passed.' }
+      : { title: 'Faceted solid', cls: 'faceted',
+          note: 'A prismatic fit wasn’t possible within your limits, so this is an exact faceted copy of the mesh: valid and manifold, but not clean geometry to sketch on.' }
+  }
+  const m = r.metrics
+  const parts = []
+  if (m.n_prismatic) parts.push(`${m.n_prismatic} prismatic`)
+  if (m.n_faceted) parts.push(`${m.n_faceted} faceted`)
+  if (m.n_failed) parts.push(`${m.n_failed} failed`)
+  const dropped = r.n_dropped
+    ? ` ${r.n_dropped} sliver${r.n_dropped === 1 ? '' : 's'} (a few stray triangles) dropped.` : ''
+  return {
+    title: `${r.n_written} bodies · ${parts.join(' · ')}`,
+    cls: r.mode,
+    note: `The mesh held ${r.n_bodies} separate bodies. Each was converted on its own and all are in the one STEP as separate solids — prismatic where it passed your gates, an exact faceted copy where it didn’t.${dropped}`,
+  }
+})
+
+// Per-body rows for multi-body results.
+const bodyRows = computed(() =>
+  (bodies.value || []).map((b) => ({
+    n: b.index + 1,
+    faces: b.faces.toLocaleString(),
+    mode: b.error ? 'failed' : b.mode,
+    detail: b.error ? b.error
+      : b.mode === 'prismatic'
+        ? `p95 ${fmt(b.metrics.dev_p95)} · max ${fmt(b.metrics.dev_max)} mm`
+        : `${b.metrics.faces_out.toLocaleString()} faces`
+          + (b.metrics.is_solid === false ? ' · open shell' : ''),
+  })))
+
 // The inspection card: measured value vs the limit the run was gated on.
 const gates = computed(() => {
   const r = store.result
-  if (!r?.ok || r.mode !== 'prismatic') return []
+  if (!r?.ok || r.mode !== 'prismatic' || bodies.value) return []
   const m = r.metrics
   const p = r.params
   const rows = [
@@ -72,6 +112,7 @@ const outputRows = computed(() => {
   if (!r?.ok) return []
   const o = r.output_stats
   const rows = [['BREP faces', o.faces.toLocaleString()]]
+  if (o.solids > 1) rows.push(['Solids', o.solids.toLocaleString()])
   const t = o.surface_types
   const kinds = [
     ['planes', t.planes], ['cylinders', t.cylinders], ['cones', t.cones],
@@ -80,7 +121,9 @@ const outputRows = computed(() => {
   if (kinds.length) {
     rows.push(['Surface types', kinds.map(([k, n]) => `${n} ${k}`).join(', ')])
   }
-  if (r.mode === 'prismatic') {
+  if (bodies.value) {
+    // per-body detail lives in the bodies table; only file-level rows here
+  } else if (r.mode === 'prismatic') {
     rows.push(['Mean deviation', `${fmt(r.metrics.dev_mean)} mm`])
     rows.push(['Worst point at', `(${(r.metrics.dev_max_xyz || []).join(', ')}) mm`])
     if (r.metrics.vol_solid != null) {
@@ -97,7 +140,7 @@ const outputRows = computed(() => {
 const reduction = computed(() => {
   const tris = store.inputStats?.triangles
   const faces = store.result?.output_stats?.faces
-  if (!tris || !faces || store.result.mode !== 'prismatic') return null
+  if (!tris || !faces || store.result.mode === 'faceted') return null
   return `${tris.toLocaleString()} triangles → ${faces.toLocaleString()} faces`
 })
 </script>
@@ -117,17 +160,24 @@ const reduction = computed(() => {
 
     <section v-if="store.status === 'done' && store.result?.ok"
              ref="verdictEl" class="verdict">
-      <div class="mode" :class="store.result.mode">
-        {{ store.result.mode === 'prismatic' ? 'Prismatic solid' : 'Faceted solid' }}
-      </div>
-      <p v-if="store.result.mode === 'prismatic'" class="modenote">
-        Clean BREP with true planes and cylinders — every gate below passed.
-      </p>
-      <p v-else class="modenote">
-        A prismatic fit wasn't possible within your limits, so this is an
-        exact faceted copy of the mesh: valid and manifold, but not clean
-        geometry to sketch on.
-      </p>
+      <div class="mode" :class="verdict.cls">{{ verdict.title }}</div>
+      <p class="modenote">{{ verdict.note }}</p>
+
+      <table v-if="bodyRows.length" class="gatecard bodies">
+        <thead>
+          <tr class="micro">
+            <th>#</th><th>Triangles</th><th>Result</th><th>Detail</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr v-for="b in bodyRows" :key="b.n">
+            <td class="num">{{ b.n }}</td>
+            <td class="num">{{ b.faces }}</td>
+            <td :class="b.mode">{{ b.mode }}</td>
+            <td class="num detail">{{ b.detail }}</td>
+          </tr>
+        </tbody>
+      </table>
 
       <table v-if="gates.length" class="gatecard">
         <thead>
@@ -193,6 +243,12 @@ th { text-align: left; font-weight: 600; }
   color: var(--edge);
 }
 .mode.faceted { border-color: var(--muted); color: var(--text); }
+.mode.mixed { border-color: var(--edge); color: var(--text); }
+.bodies td:first-child { color: var(--muted); }
+.bodies td.prismatic { color: var(--edge); font-weight: 600; }
+.bodies td.faceted { color: var(--text); }
+.bodies td.failed { color: var(--fail); font-weight: 600; }
+.bodies .detail { color: var(--muted); font-size: 12px; word-break: break-word; }
 .modenote { color: var(--muted); font-size: 12px; margin: 6px 0 10px; }
 
 .gatecard {

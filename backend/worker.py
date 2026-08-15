@@ -29,8 +29,9 @@ def main():
                 force_prismatic=params['force_prismatic'],
                 units=params.get('units', 'mm'),
                 verbose=True)
-        result.update(ok=True, mode=r['mode'], metrics=r['metrics'],
-                      output_stats=step_stats(out_path))
+        # Pass the whole pipeline result through (mode, metrics, and for
+        # multi-body files the per-body list and counts).
+        result.update(r, ok=True, output_stats=step_stats(out_path))
     except Exception as e:
         traceback.print_exc()
         result['error'] = f'{type(e).__name__}: {e}'

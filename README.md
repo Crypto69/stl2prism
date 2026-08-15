@@ -117,6 +117,14 @@ that makes general mesh-to-BREP hard.
    solid written. Otherwise the tool falls back to the faceted converter
    (triangle sewing -> manifold solid -> coplanar-face unification ->
    AP214 STEP with an explicit MANIFOLD_SOLID_BREP).
+8. **Multi-body files** — a mesh holding several disconnected bodies (an
+   assembly export, a controller with knobs and sticks) is split into
+   bodies first; steps 2-7 run per body, and every body is written into
+   the *one* STEP as a separate solid, so CAD imports it as multiple
+   bodies of one component. The result reports `mixed` when some bodies
+   went prismatic and others faceted, with a per-body table. Bodies that
+   cannot be closed (under 4 triangles; on scan input also stray blobs
+   under 100 triangles and 0.1% of the mesh) are dropped and counted.
 
 ### Research basis
 
@@ -140,8 +148,8 @@ need GPU inference stacks and mostly carry non-commercial licenses.
 
 ## Limitations (v0.1)
 
-* **Single primary axis.** One extrusion direction per part (plus
-  cross-axis cylindrical holes). Parts needing several extrusion
+* **Single primary axis per body.** One extrusion direction per body (plus
+  cross-axis cylindrical holes). Bodies needing several extrusion
   directions for solid material (not just holes) get the faceted fallback.
 * **Tapered/lofted features** — gussets, draft angles, chamfered ribs —
   are approximated by their mid-height section. Deviation shows in the
