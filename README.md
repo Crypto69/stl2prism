@@ -1,6 +1,6 @@
 # stl2prism
 
-Convert STL meshes into **prismatic STEP solids** — clean BREP with true
+Convert STL or OBJ meshes into **prismatic STEP solids** — clean BREP with true
 planes and cylinders you can sketch on, dimension against, and constrain —
 replicating the core of Fusion 360's paid "Prismatic" mesh conversion.
 Guaranteed output: when a mesh isn't prismatic, the tool falls back to a
@@ -17,6 +17,7 @@ pip install .[scan]      # + pymeshlab, for 3D-scan repair (Poisson)
 
 ```bash
 stl2prism part.stl                 # -> part.step
+stl2prism part.obj                 # OBJ works the same way
 stl2prism part.stl out.step --tol 0.05
 stl2prism scan.stl --force-prismatic   # attempt prismatic on scan input
 ```
@@ -34,7 +35,7 @@ the measured fidelity (surface deviation, volume error) of prismatic results.
 
 ## Web app
 
-A browser UI for the same pipeline: drag an STL in, inspect it in 3D,
+A browser UI for the same pipeline: drag an STL or OBJ in, inspect it in 3D,
 set the acceptance tolerances, convert, and download the STEP with a
 fidelity report (mode, surface deviation vs. your limits, volume error,
 face counts and surface types for both files).
@@ -69,7 +70,10 @@ the *extrusion-cylinder* decomposition strategy rather than free surface
 stitching — which sidesteps the brittle face-intersection/topology problem
 that makes general mesh-to-BREP hard.
 
-1. **Prep** (`mesh_prep`) — load, merge, repair. Scan-like input (dense
+1. **Prep** (`mesh_prep`) — load, merge, repair. Input is STL or OBJ
+   (geometry only: OBJ per-corner normals/UVs are merged away, `.mtl`
+   materials are ignored, quads/n-gons are triangulated, and multiple
+   objects are combined into one mesh). Scan-like input (dense
    tessellation, identified by a low mean dihedral angle) is rebuilt via
    screened Poisson reconstruction and decimated with topology preservation.
    Being non-watertight is treated as *needs repair*, not as *is a scan*: a

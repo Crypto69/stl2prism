@@ -1,7 +1,7 @@
 """In-process job registry over subprocess workers.
 
 One directory per job under DATA_DIR:
-    input.stl  params.json  output.step  result.json  log.txt
+    input.<stl|obj>  params.json  output.step  result.json  log.txt
 """
 import json
 import os
@@ -57,11 +57,12 @@ def _run(job_id):
     with _run_slot:
         with _lock:
             _jobs[job_id]['status'] = 'running'
+            input_name = _jobs[job_id].get('input', 'input.stl')
         log = open(os.path.join(d, 'log.txt'), 'wb')
         # -u: unbuffered, so the log endpoint sees pipeline progress live.
         proc = subprocess.Popen(
             [sys.executable, '-u', '-m', 'backend.worker',
-             os.path.join(d, 'input.stl'), os.path.join(d, 'output.step'),
+             os.path.join(d, input_name), os.path.join(d, 'output.step'),
              os.path.join(d, 'params.json'), os.path.join(d, 'result.json')],
             stdout=log, stderr=subprocess.STDOUT,
             cwd=os.path.dirname(os.path.dirname(os.path.abspath(__file__))))

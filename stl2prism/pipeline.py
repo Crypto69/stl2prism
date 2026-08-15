@@ -190,9 +190,10 @@ def _emit_faceted(mesh, out_path, verbose, accept_vol_pct=5.0):
 def main():
     ap = argparse.ArgumentParser(
         prog='stl2prism',
-        description='Convert an STL mesh into a prismatic STEP solid via '
-                    'extrusion-structure recognition, with faceted fallback.')
-    ap.add_argument('input')
+        description='Convert an STL or OBJ mesh into a prismatic STEP solid '
+                    'via extrusion-structure recognition, with faceted '
+                    'fallback.')
+    ap.add_argument('input', help='input mesh (.stl or .obj)')
     ap.add_argument('output', nargs='?', default=None)
     ap.add_argument('--tol', type=float, default=0.08,
                     help='profile fit tolerance in mm (default 0.08)')

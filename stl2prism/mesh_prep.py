@@ -1,10 +1,40 @@
 """Mesh loading, repair, and normalization."""
+import os
+
 import numpy as np
 import trimesh
 
 
 class PrepError(RuntimeError):
     """Mesh preparation could not produce a usable mesh."""
+
+
+# Input formats accepted at the user-facing entry points (CLI, web upload).
+# trimesh picks the reader from the extension, so keep this list to formats
+# it reads without optional dependencies.
+SUPPORTED_EXTS = ('.stl', '.obj')
+
+
+def load_mesh(path):
+    """Read an STL or OBJ into one clean, geometry-only Trimesh.
+
+    OBJ exporters commonly write per-corner normals (`vn`) and UVs (`vt`);
+    trimesh keeps those as split vertices, and the default merge_vertices()
+    refuses to merge vertices whose normal/uv differ — so a perfectly closed
+    part reads as non-watertight with no face adjacency at all. We only care
+    about geometry, so merge on position alone. Multiple `o`/`g` objects are
+    concatenated by force='mesh'; a missing .mtl is only a warning.
+    """
+    ext = os.path.splitext(path)[1].lower()
+    if ext not in SUPPORTED_EXTS:
+        raise PrepError(
+            f"unsupported input format '{ext or '(none)'}'; "
+            f"expected one of: {', '.join(SUPPORTED_EXTS)}")
+    m = trimesh.load(path, force='mesh')
+    m.merge_vertices(merge_tex=True, merge_norm=True)
+    m.update_faces(m.nondegenerate_faces())
+    m.remove_unreferenced_vertices()
+    return m
 
 
 # Mean dihedral angle (degrees) below which geometry is treated as a scan.
@@ -33,16 +63,13 @@ def mean_dihedral_deg(m, cap=400000):
 def load_and_prep(path, target_faces=40000, verbose=True,
                   scan_dihedral_deg=SCAN_DIHEDRAL_DEG,
                   scan_min_faces=SCAN_MIN_FACES):
-    """Load an STL, repair it, and return (mesh, is_scan).
+    """Load an STL or OBJ, repair it, and return (mesh, is_scan).
 
     `is_scan` (organic geometry with no analytic surfaces to recover) and
     `needs_repair` (not watertight) are judged separately: a CAD export with
     one unstitched seam needs repair but must still reach the prismatic path.
     """
-    m = trimesh.load(path, force='mesh')
-    m.merge_vertices()
-    m.update_faces(m.nondegenerate_faces())
-    m.remove_unreferenced_vertices()
+    m = load_mesh(path)
 
     dih = mean_dihedral_deg(m)
     is_scan = len(m.faces) > scan_min_faces and dih < scan_dihedral_deg

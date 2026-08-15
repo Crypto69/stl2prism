@@ -4,7 +4,7 @@ The STL→STEP converter runs on the NAS (`nas-host` on the tailnet) as a
 single container:
 
 - app code + job data on the **`apps` shared folder on Volume 5**
-  (unencrypted — job files are uploaded STLs and generated STEPs, nothing
+  (unencrypted — job files are uploaded STL/OBJ meshes and generated STEPs, nothing
   sensitive, and everything is auto-purged after 24 h)
 - one container serving both the API and the web UI on port **8321**
   (portfolio owns 8090 and `https=443`; this stack stays clear of both)
@@ -51,7 +51,7 @@ curl -s http://127.0.0.1:8321/ | head  # serves the UI's index.html
 ```
 
 Then from a browser on the LAN: `http://nas-host:8321` (or the NAS IP).
-Drop a sample STL, convert, download — the report card appearing with PASS
+Drop a sample STL or OBJ, convert, download — the report card appearing with PASS
 gates is the acceptance test.
 
 ### Optional HTTPS front (tailnet access)
@@ -94,7 +94,7 @@ All set in `docker-compose.yml` (edit + `docker compose up -d` to apply):
 | `ports` | `8321:8000` | LAN port |
 | `STL2PRISM_JOB_TTL` | `86400` | seconds before job dirs are auto-deleted |
 | `STL2PRISM_CONCURRENCY` | `1` | parallel conversions — leave at 1 on 16 GB shared with portfolio |
-| `STL2PRISM_MAX_UPLOAD` | 200 MB (app default) | max STL upload size |
+| `STL2PRISM_MAX_UPLOAD` | 200 MB (app default) | max upload size (STL or OBJ) |
 | `mem_limit` | `12g` | drop to `8g` if the portfolio stack ever feels starved |
 
 The `data/` directory is disposable: `rm -rf data/*` while the container is
@@ -150,7 +150,7 @@ brings the container back on its own. Only two checks:
 | Symptom | Fix |
 |---|---|
 | `docker compose build` fails in `apt-get` | Transient mirror issue — retry; the package list (`libgl1 libglu1-mesa libxrender1 libxext6 libsm6 libx11-6 fontconfig`) is known-good on `python:3.12-slim` |
-| Upload rejected with 413 | STL exceeds `STL2PRISM_MAX_UPLOAD` — raise it in compose `environment` |
+| Upload rejected with 413 | File exceeds `STL2PRISM_MAX_UPLOAD` — raise it in compose `environment` |
 | Button stuck on "Waiting in queue…" | A previous conversion is still running (they're serialized). Big scans take minutes on the N-series CPU — watch `docker compose logs -f` |
 | Conversion dies with no result, container fine | Worker was OOM-killed inside `mem_limit` — raise the limit or convert a decimated mesh |
 | Scan upload errors mentioning pymeshlab | Hit on first deploy (2026-08-14): pymeshlab's bundled Qt needs `libcom-err2 libp11-kit0 libgpg-error0`, added to the Dockerfile since. Pull + rebuild; `docker compose exec stl2prism python -c "import pymeshlab"` should be silent |

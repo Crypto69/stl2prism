@@ -108,6 +108,107 @@ def test_leaky_cad_part_still_reaches_prismatic(tmp_path):
     assert os.path.getsize(out) > 0
 
 
+# --- OBJ input ------------------------------------------------------------
+
+def _hard_obj(path, mesh=None):
+    """Write `mesh` (default: a 20x10x5 box) as the kind of OBJ real exporters
+    produce: per-corner normals (`vn`), UVs (`vt`), several `g` groups, and a
+    `mtllib` pointing at a file that is not there. Every one of those makes
+    trimesh split vertices, so the mesh only reads as closed if the loader
+    merges on position alone."""
+    m = mesh if mesh is not None else trimesh.creation.box(extents=(20, 10, 5))
+    lines = ['mtllib missing.mtl', 'o part', 'vt 0 0', 'vt 1 0', 'vt 0 1']
+    lines += ['v %.6f %.6f %.6f' % tuple(v) for v in m.vertices]
+    lines += ['vn %.6f %.6f %.6f' % tuple(n) for n in m.face_normals]
+    half = len(m.faces) // 2
+    for i, f in enumerate(m.faces):
+        if i == 0:
+            lines += ['g A', 'usemtl matA']
+        if i == half:
+            lines += ['g B', 'usemtl matB']
+        lines.append('f %d/1/%d %d/2/%d %d/3/%d' % (
+            f[0] + 1, i + 1, f[1] + 1, i + 1, f[2] + 1, i + 1))
+    with open(path, 'w') as fh:
+        fh.write('\n'.join(lines) + '\n')
+    return path
+
+
+def test_obj_with_split_normals_loads_watertight(tmp_path):
+    """OBJ per-corner vn/vt must not turn a closed part into an open one."""
+    from stl2prism.mesh_prep import load_and_prep
+    src = trimesh.creation.box(extents=(20, 10, 5))
+    m, is_scan = load_and_prep(_hard_obj(str(tmp_path / 'hard.obj'), src),
+                               verbose=False)
+    assert m.is_watertight
+    assert len(m.faces) == len(src.faces)
+    assert len(m.vertices) == len(src.vertices)
+    assert m.volume == pytest.approx(src.volume, rel=1e-6)
+    assert is_scan is False
+
+
+def test_obj_quads_are_triangulated(tmp_path):
+    from stl2prism.mesh_prep import load_mesh
+    cube = """v 0 0 0
+v 10 0 0
+v 10 20 0
+v 0 20 0
+v 0 0 5
+v 10 0 5
+v 10 20 5
+v 0 20 5
+f 1 4 3 2
+f 5 6 7 8
+f 1 2 6 5
+f 2 3 7 6
+f 3 4 8 7
+f 4 1 5 8
+"""
+    p = tmp_path / 'quads.OBJ'   # mixed-case extension must work too
+    p.write_text(cube)
+    m = load_mesh(str(p))
+    assert len(m.faces) == 12
+    assert m.is_watertight
+    assert m.volume == pytest.approx(1000.0)
+
+
+def test_unsupported_extension_rejected(tmp_path):
+    from stl2prism.mesh_prep import load_mesh, PrepError
+    p = tmp_path / 'part.ply'
+    trimesh.creation.box().export(str(p))
+    with pytest.raises(PrepError, match='unsupported'):
+        load_mesh(str(p))
+
+
+def test_dji_obj_sample_loads_and_is_scan():
+    """The real-world sample: 21 objects, no .mtl, open, dense -> scan path.
+    Only the load + classification is checked; the repair ladder needs
+    pymeshlab, which is not available everywhere the tests run."""
+    from stl2prism.mesh_prep import (load_mesh, mean_dihedral_deg,
+                                     SCAN_DIHEDRAL_DEG, SCAN_MIN_FACES)
+    m = load_mesh(_sample('DJI_RC-N1_controller.obj'))
+    assert len(m.faces) == 301220
+    assert m.body_count > 1
+    assert not m.is_watertight
+    assert len(m.faces) > SCAN_MIN_FACES
+    assert mean_dihedral_deg(m) < SCAN_DIHEDRAL_DEG
+
+
+@pytest.mark.slow
+def test_obj_matches_stl_endtoend(tmp_path):
+    """End-to-end: a CAD part must convert identically whether it arrives as
+    STL or as a hard OBJ of the same triangles (same mode, same fidelity)."""
+    from stl2prism.pipeline import run
+    stl = _sample('servo_bracket_1.stl')
+    r_stl = run(stl, str(tmp_path / 'stl.step'), verbose=False)
+    obj = _hard_obj(str(tmp_path / 'cad.obj'), trimesh.load(stl, force='mesh'))
+    out = str(tmp_path / 'obj.step')
+    r_obj = run(obj, out, verbose=False)
+    assert r_obj['mode'] == r_stl['mode'] == 'prismatic', 'OBJ was misrouted'
+    assert r_obj['metrics']['dev_p95'] == pytest.approx(
+        r_stl['metrics']['dev_p95'], abs=0.01)
+    assert os.path.getsize(out) > 0
+
+
 # --- faceted export sanity ------------------------------------------------
 
 def test_faceted_export_keeps_the_geometry(tmp_path):

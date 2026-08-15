@@ -2,10 +2,13 @@
 import { onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import * as THREE from 'three'
 import { STLLoader } from 'three/addons/loaders/STLLoader.js'
+import { OBJLoader } from 'three/addons/loaders/OBJLoader.js'
+import { mergeGeometries } from 'three/addons/utils/BufferGeometryUtils.js'
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js'
 
 const props = defineProps({
-  buffer: { type: Object, default: null }, // { data: ArrayBuffer } (non-reactive)
+  // { data: ArrayBuffer, kind: 'stl' | 'obj' } (non-reactive)
+  buffer: { type: Object, default: null },
 })
 
 const host = ref(null)
@@ -39,12 +42,28 @@ onMounted(() => {
   resizeObs.observe(host.value)
   resize()
   animate()
-  if (props.buffer) loadMesh(props.buffer.data)
+  if (props.buffer) loadMesh(props.buffer)
 })
 
-watch(() => props.buffer, (b) => { if (b) loadMesh(b.data) })
+watch(() => props.buffer, (b) => { if (b) loadMesh(b) })
 
-function loadMesh(data) {
+// OBJLoader yields a Group of Meshes (one per object/material), each with
+// whatever attributes the file had (normal, uv, color). Reduce that to one
+// position-only geometry so the rest of the viewer treats it like an STL.
+function parseObj(data) {
+  const group = new OBJLoader().parse(new TextDecoder().decode(data))
+  const parts = []
+  group.traverse((o) => {
+    if (!o.isMesh || !o.geometry?.getAttribute('position')) return
+    const g = new THREE.BufferGeometry()
+    g.setAttribute('position', o.geometry.getAttribute('position'))
+    parts.push(g)
+  })
+  if (!parts.length) throw new Error('OBJ contains no faces')
+  return parts.length === 1 ? parts[0] : mergeGeometries(parts, false)
+}
+
+function loadMesh({ data, kind }) {
   if (mesh) {
     scene.remove(mesh)
     mesh.geometry.dispose()
@@ -55,7 +74,7 @@ function loadMesh(data) {
 
   let geo
   try {
-    geo = new STLLoader().parse(data)
+    geo = kind === 'obj' ? parseObj(data) : new STLLoader().parse(data)
   } catch {
     dims.value = null
     return
@@ -66,7 +85,10 @@ function loadMesh(data) {
   bb.getSize(size)
   dims.value = [size.x, size.y, size.z].map((v) => v.toFixed(1))
 
-  // STL is Z-up; the viewport floor is Y-up. Center on the floor.
+  // Assume Z-up (STL convention; CAD OBJ exports usually match). The
+  // viewport floor is Y-up. Center on the floor. A Y-up OBJ (e.g. from
+  // Blender) previews rotated, which is cosmetic: the pipeline finds
+  // the extrusion axis itself.
   const center = new THREE.Vector3()
   bb.getCenter(center)
   geo.translate(-center.x, -center.y, -bb.min.z)

@@ -1,4 +1,4 @@
-"""FastAPI app: upload an STL, convert it to STEP, report fidelity."""
+"""FastAPI app: upload an STL or OBJ, convert it to STEP, report fidelity."""
 import os
 import re
 
@@ -8,8 +8,13 @@ from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
+from stl2prism.mesh_prep import SUPPORTED_EXTS
+
 from . import jobs
-from .analysis import sanitize, stl_stats
+from .analysis import sanitize, mesh_stats
+
+_EXT_RE = re.compile(r'\.(' + '|'.join(e.lstrip('.') for e in SUPPORTED_EXTS)
+                     + r')$', re.IGNORECASE)
 
 app = FastAPI(title='stl2prism')
 
@@ -43,22 +48,27 @@ def _startup():
 
 @app.post('/api/jobs')
 async def create_job(file: UploadFile):
-    if not (file.filename or '').lower().endswith('.stl'):
-        raise HTTPException(400, 'expected a .stl file')
+    m = _EXT_RE.search(file.filename or '')
+    if not m:
+        raise HTTPException(
+            400, f"expected a {' or '.join(SUPPORTED_EXTS)} file")
+    # Keep the real extension: trimesh picks its reader from it.
+    input_name = 'input.' + m.group(1).lower()
     job_id, d = jobs.new_job()
     size = 0
-    with open(os.path.join(d, 'input.stl'), 'wb') as out:
+    with open(os.path.join(d, input_name), 'wb') as out:
         while chunk := await file.read(1 << 20):
             size += len(chunk)
             if size > MAX_UPLOAD:
                 raise HTTPException(413, 'file too large')
             out.write(chunk)
     try:
-        stats = stl_stats(os.path.join(d, 'input.stl'))
+        stats = mesh_stats(os.path.join(d, input_name))
     except Exception as e:
-        raise HTTPException(400, f'could not read STL: {e}')
+        raise HTTPException(400, f'could not read mesh: {e}')
     with jobs._lock:
         jobs._jobs[job_id]['filename'] = file.filename
+        jobs._jobs[job_id]['input'] = input_name
         jobs._jobs[job_id]['status'] = 'uploaded'
     return {'id': job_id, 'filename': file.filename,
             'input_stats': sanitize(stats)}
@@ -92,8 +102,7 @@ def download(job_id: str):
     path = os.path.join(jobs.job_dir(job_id), 'output.step')
     if not os.path.exists(path):
         raise HTTPException(404, 'no output yet')
-    stem = re.sub(r'\.stl$', '', job.get('filename') or 'part',
-                  flags=re.IGNORECASE)
+    stem = _EXT_RE.sub('', job.get('filename') or 'part')
     safe = re.sub(r'[^\w.-]+', '_', stem) or 'part'
     return FileResponse(path, media_type='application/step',
                         filename=f'{safe}.step')

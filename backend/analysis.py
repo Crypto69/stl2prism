@@ -1,4 +1,4 @@
-"""File statistics for the web UI: input STL and output STEP overviews."""
+"""File statistics for the web UI: input mesh (STL/OBJ) and output STEP overviews."""
 import math
 import os
 import re
@@ -15,9 +15,12 @@ def sanitize(obj):
     return obj
 
 
-def stl_stats(path):
-    import trimesh
-    m = trimesh.load(path, force='mesh')
+def mesh_stats(path):
+    # Same loader as the pipeline, so watertight/vertex/volume numbers here
+    # describe the geometry the conversion will actually see (an OBJ with
+    # per-corner normals would otherwise report as open with 4x the vertices).
+    from stl2prism.mesh_prep import load_mesh
+    m = load_mesh(path)
     ext = m.bounding_box.primitive.extents
     stats = {
         'file_size': os.path.getsize(path),

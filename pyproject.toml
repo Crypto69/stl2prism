@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "stl2prism"
 version = "0.1.0"
-description = "Convert STL meshes into prismatic STEP solids via extrusion-structure recognition, with a faceted-BREP fallback"
+description = "Convert STL/OBJ meshes into prismatic STEP solids via extrusion-structure recognition, with a faceted-BREP fallback"
 readme = "README.md"
 license = "MIT"
 license-files = ["LICENSE"]
