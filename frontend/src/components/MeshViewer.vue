@@ -1,5 +1,5 @@
 <script setup>
-import { onBeforeUnmount, onMounted, ref, watch } from 'vue'
+import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import * as THREE from 'three'
 import { STLLoader } from 'three/addons/loaders/STLLoader.js'
 import { OBJLoader } from 'three/addons/loaders/OBJLoader.js'
@@ -9,10 +9,15 @@ import { OrbitControls } from 'three/addons/controls/OrbitControls.js'
 const props = defineProps({
   // { data: ArrayBuffer, kind: 'stl' | 'obj' } (non-reactive)
   buffer: { type: Object, default: null },
+  // file units -> mm; the callout shows real-world size, the geometry is
+  // rendered as-is (the camera fits it either way)
+  unitScale: { type: Number, default: 1 },
 })
 
 const host = ref(null)
-const dims = ref(null)
+const rawSize = ref(null)  // in file units
+const dims = computed(() =>
+  rawSize.value && rawSize.value.map((v) => (v * props.unitScale).toFixed(1)))
 
 let renderer, scene, camera, controls, mesh, grid, frameId, resizeObs
 
@@ -76,14 +81,14 @@ function loadMesh({ data, kind }) {
   try {
     geo = kind === 'obj' ? parseObj(data) : new STLLoader().parse(data)
   } catch {
-    dims.value = null
+    rawSize.value = null
     return
   }
   geo.computeBoundingBox()
   const bb = geo.boundingBox
   const size = new THREE.Vector3()
   bb.getSize(size)
-  dims.value = [size.x, size.y, size.z].map((v) => v.toFixed(1))
+  rawSize.value = [size.x, size.y, size.z]
 
   // Assume Z-up (STL convention; CAD OBJ exports usually match). The
   // viewport floor is Y-up. Center on the floor. A Y-up OBJ (e.g. from

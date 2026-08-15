@@ -21,22 +21,28 @@ const fmtBytes = (n) => {
 }
 const fmt = (v, d = 3) => (v == null ? '—' : Number(v).toFixed(d))
 
+// Input stats come back in file units; show them in mm using the units the
+// user picked, so the numbers match what the pipeline will actually see.
 const inputRows = computed(() => {
   const s = store.inputStats
   if (!s) return []
+  const k = store.unitScale
+  const L = (v) => (v * k).toFixed(2).replace(/\.?0+$/, '')
+  const A = (v) => Math.round(v * k * k).toLocaleString()
+  const V = (v) => Math.round(v * k * k * k).toLocaleString()
   return [
     ['Triangles', s.triangles.toLocaleString()],
     ['Vertices', s.vertices.toLocaleString()],
     ['Watertight', s.watertight ? 'yes' : 'no'],
     ['Bodies', s.bodies],
-    ['Bounding box', `${s.bbox_mm.join(' × ')} mm`],
+    ['Bounding box', `${s.bbox_mm.map(L).join(' × ')} mm`],
     ...(s.edge_mm
       ? [['Edge length min / mean / max',
-          `${s.edge_mm.min} / ${s.edge_mm.mean} / ${s.edge_mm.max} mm`]]
+          `${(s.edge_mm.min * k).toFixed(3)} / ${(s.edge_mm.mean * k).toFixed(3)} / ${(s.edge_mm.max * k).toFixed(3)} mm`]]
       : []),
-    ['Surface area', `${s.surface_area_mm2.toLocaleString()} mm²`],
+    ['Surface area', `${A(s.surface_area_mm2)} mm²`],
     ['Volume', s.volume_mm3 == null ? 'n/a (not watertight)'
-                                    : `${s.volume_mm3.toLocaleString()} mm³`],
+                                    : `${V(s.volume_mm3)} mm³`],
     ['File size', fmtBytes(s.file_size)],
   ]
 })

@@ -27,6 +27,7 @@ def main():
                 accept_hole_max=params['accept_hole_max'],
                 accept_vol_pct=params['accept_vol_pct'],
                 force_prismatic=params['force_prismatic'],
+                units=params.get('units', 'mm'),
                 verbose=True)
         result.update(ok=True, mode=r['mode'], metrics=r['metrics'],
                       output_stats=step_stats(out_path))

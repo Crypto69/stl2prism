@@ -1,6 +1,16 @@
 import { defineStore } from 'pinia'
 
+// STL/OBJ files carry no units. `units` says what the file's numbers mean;
+// the backend scales the mesh to mm on load. Mirrors mesh_prep.UNIT_SCALE.
+export const UNITS = [
+  { key: 'mm', label: 'millimetres', scale: 1 },
+  { key: 'cm', label: 'centimetres', scale: 10 },
+  { key: 'in', label: 'inches', scale: 25.4 },
+  { key: 'm', label: 'metres', scale: 1000 },
+]
+
 export const DEFAULT_PARAMS = {
+  units: 'mm',
   tol: 0.08,
   accept_p95: 0.25,
   accept_max: 0.26,
@@ -28,6 +38,8 @@ export const useConvertStore = defineStore('convert', {
 
   getters: {
     busy: (s) => s.status === 'uploading' || s.status === 'running',
+    // file units -> mm, for showing input numbers the way the pipeline sees them
+    unitScale: (s) => UNITS.find((u) => u.key === s.params.units)?.scale ?? 1,
     downloadUrl: (s) =>
       s.status === 'done' && s.result?.ok
         ? `/api/jobs/${s.jobId}/download`

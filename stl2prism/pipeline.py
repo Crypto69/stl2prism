@@ -4,6 +4,8 @@ import sys
 import numpy as np
 import trimesh
 
+from .mesh_prep import UNIT_SCALE
+
 
 def validate(solid, mesh, n_samples=5000, cyls=None, hole_band=0.15):
     """Sample source mesh surface, measure distance to rebuilt solid mesh.
@@ -65,12 +67,12 @@ def validate(solid, mesh, n_samples=5000, cyls=None, hole_band=0.15):
 
 def run(in_path, out_path, tol=0.08, accept_p95=0.25, accept_vol_pct=2.0,
         accept_max=0.26, accept_hole_max=0.10,
-        force_prismatic=False, verbose=True):
+        force_prismatic=False, verbose=True, units='mm'):
     from .mesh_prep import load_and_prep
     from .extrusion import dominant_axis
     from .rebuild import build_solid, export_step
 
-    mesh, is_scan = load_and_prep(in_path, verbose=verbose)
+    mesh, is_scan = load_and_prep(in_path, verbose=verbose, units=units)
 
     # Before any axis work: scoring an axis means cross-sectioning the mesh
     # several times per candidate, which is wasted on organic geometry.
@@ -205,6 +207,9 @@ def main():
                     help='max deviation on cylindrical bores, mm (default 0.10)')
     ap.add_argument('--force-prismatic', action='store_true',
                     help='attempt prismatic fit even for scan-like input')
+    ap.add_argument('--units', choices=sorted(UNIT_SCALE), default='mm',
+                    help='unit the input file is in; STL/OBJ carry none, '
+                         'and the tool works in mm (default mm)')
     ap.add_argument('--quiet', action='store_true')
     args = ap.parse_args()
     out = args.output or args.input.rsplit('.', 1)[0] + '.step'
@@ -212,7 +217,8 @@ def main():
         r = run(args.input, out, tol=args.tol, accept_p95=args.accept_p95,
                 accept_max=args.accept_max,
                 accept_hole_max=args.accept_hole_max,
-                force_prismatic=args.force_prismatic, verbose=not args.quiet)
+                force_prismatic=args.force_prismatic, verbose=not args.quiet,
+                units=args.units)
     except Exception as e:
         # A crash must not look like a success to a calling script.
         print(f"[error] {type(e).__name__}: {e}", file=sys.stderr)

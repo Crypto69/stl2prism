@@ -14,6 +14,11 @@ class PrepError(RuntimeError):
 # it reads without optional dependencies.
 SUPPORTED_EXTS = ('.stl', '.obj')
 
+# Neither STL nor OBJ records units; the pipeline works in millimetres (all
+# tolerances are mm), so input in another unit is scaled on load. Multiply
+# file coordinates by this to get mm.
+UNIT_SCALE = {'mm': 1.0, 'cm': 10.0, 'm': 1000.0, 'in': 25.4}
+
 
 def load_mesh(path):
     """Read an STL or OBJ into one clean, geometry-only Trimesh.
@@ -62,14 +67,24 @@ def mean_dihedral_deg(m, cap=400000):
 
 def load_and_prep(path, target_faces=40000, verbose=True,
                   scan_dihedral_deg=SCAN_DIHEDRAL_DEG,
-                  scan_min_faces=SCAN_MIN_FACES):
-    """Load an STL or OBJ, repair it, and return (mesh, is_scan).
+                  scan_min_faces=SCAN_MIN_FACES, units='mm'):
+    """Load an STL or OBJ, repair it, and return (mesh, is_scan) in mm.
+
+    `units` names the unit the file's coordinates are in (see UNIT_SCALE);
+    the mesh is scaled to mm before anything else looks at it.
 
     `is_scan` (organic geometry with no analytic surfaces to recover) and
     `needs_repair` (not watertight) are judged separately: a CAD export with
     one unstitched seam needs repair but must still reach the prismatic path.
     """
+    if units not in UNIT_SCALE:
+        raise PrepError(f"unknown units '{units}'; "
+                        f"expected one of: {', '.join(UNIT_SCALE)}")
     m = load_mesh(path)
+    if UNIT_SCALE[units] != 1.0:
+        m.apply_scale(UNIT_SCALE[units])
+        if verbose:
+            print(f"[prep] input units {units}: scaled x{UNIT_SCALE[units]:g} to mm")
 
     dih = mean_dihedral_deg(m)
     is_scan = len(m.faces) > scan_min_faces and dih < scan_dihedral_deg

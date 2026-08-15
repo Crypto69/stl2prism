@@ -171,6 +171,22 @@ f 4 1 5 8
     assert m.volume == pytest.approx(1000.0)
 
 
+def test_units_scale_on_load(tmp_path):
+    """A 20x10x5 box in cm must arrive as 200x100x50 mm; unknown units
+    are refused before anything is loaded."""
+    from stl2prism.mesh_prep import load_and_prep, PrepError
+    p = str(tmp_path / 'box.obj')
+    trimesh.creation.box(extents=(20, 10, 5)).export(p)
+    m, _ = load_and_prep(p, verbose=False, units='cm')
+    assert m.bounding_box.primitive.extents == pytest.approx([200, 100, 50])
+    assert m.is_watertight
+    m_in, _ = load_and_prep(p, verbose=False, units='in')
+    assert m_in.bounding_box.primitive.extents == pytest.approx(
+        [508, 254, 127])
+    with pytest.raises(PrepError, match='unknown units'):
+        load_and_prep(p, verbose=False, units='furlongs')
+
+
 def test_unsupported_extension_rejected(tmp_path):
     from stl2prism.mesh_prep import load_mesh, PrepError
     p = tmp_path / 'part.ply'

@@ -1,6 +1,6 @@
 <script setup>
 import { ref } from 'vue'
-import { useConvertStore, DEFAULT_PARAMS } from '../store'
+import { useConvertStore, DEFAULT_PARAMS, UNITS } from '../store'
 
 const store = useConvertStore()
 
@@ -45,6 +45,31 @@ const isDefault = (key) => store.params[key] === DEFAULT_PARAMS[key]
 <template>
   <section class="params">
     <header class="head">
+      <h2 class="micro">Input units</h2>
+    </header>
+    <div class="row">
+      <label for="units">
+        The file's numbers are in
+        <button
+          class="info num"
+          :aria-expanded="openInfo === 'units'"
+          aria-label="What does Input units do?"
+          @click="toggleInfo('units')"
+        >i</button>
+      </label>
+      <select id="units" v-model="store.params.units"
+              :class="{ touched: !isDefault('units') }">
+        <option v-for="u in UNITS" :key="u.key" :value="u.key">
+          {{ u.key }} · {{ u.label }}
+        </option>
+      </select>
+    </div>
+    <div v-if="openInfo === 'units'" class="explain">
+      <p>STL and OBJ files do not say what unit they are in — they are just numbers. Every program guesses. This tool works in millimetres, so tell it what the file meant and it scales the mesh before doing anything else. All the limits below are in mm.</p>
+      <p><span class="dir">Tip:</span> Fusion 360 assumes centimetres for OBJ. If a part looks 10× too small here but right in Fusion, pick cm.</p>
+    </div>
+
+    <header class="head gate">
       <h2 class="micro">Acceptance gate</h2>
       <button class="reset" @click="store.resetParams()">Reset defaults</button>
     </header>
@@ -109,7 +134,8 @@ const isDefault = (key) => store.params[key] === DEFAULT_PARAMS[key]
 }
 label { font-weight: 500; }
 .unit { color: var(--muted); font-size: 12px; margin-left: 2px; }
-input.touched { border-color: var(--edge); }
+input.touched, select.touched { border-color: var(--edge); }
+.head.gate { border-top: 1px solid var(--line); padding-top: 12px; margin-top: 4px; }
 
 .info {
   display: inline-flex;

@@ -52,7 +52,7 @@ const canConvert = computed(
         @dragleave="dragOver = false"
         @drop.prevent="onDrop"
       >
-        <MeshViewer v-if="buffer" :buffer="buffer" />
+        <MeshViewer v-if="buffer" :buffer="buffer" :unit-scale="store.unitScale" />
         <div v-else class="dropzone">
           <div class="prism-mark" aria-hidden="true">
             <svg viewBox="0 0 120 100" width="120" height="100">

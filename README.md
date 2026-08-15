@@ -19,6 +19,7 @@ pip install .[scan]      # + pymeshlab, for 3D-scan repair (Poisson)
 stl2prism part.stl                 # -> part.step
 stl2prism part.obj                 # OBJ works the same way
 stl2prism part.stl out.step --tol 0.05
+stl2prism part.obj --units cm      # file is in cm (Fusion's OBJ default); scale to mm
 stl2prism scan.stl --force-prismatic   # attempt prismatic on scan input
 ```
 
@@ -73,7 +74,9 @@ that makes general mesh-to-BREP hard.
 1. **Prep** (`mesh_prep`) — load, merge, repair. Input is STL or OBJ
    (geometry only: OBJ per-corner normals/UVs are merged away, `.mtl`
    materials are ignored, quads/n-gons are triangulated, and multiple
-   objects are combined into one mesh). Scan-like input (dense
+   objects are combined into one mesh). Neither format records units and
+   the pipeline works in mm, so `--units cm|in|m` (UI: "Input units")
+   scales the mesh on load. Scan-like input (dense
    tessellation, identified by a low mean dihedral angle) is rebuilt via
    screened Poisson reconstruction and decimated with topology preservation.
    Being non-watertight is treated as *needs repair*, not as *is a scan*: a

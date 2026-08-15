@@ -1,6 +1,7 @@
 """FastAPI app: upload an STL or OBJ, convert it to STEP, report fidelity."""
 import os
 import re
+from typing import Literal
 
 from fastapi import FastAPI, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
@@ -38,6 +39,8 @@ class ConvertParams(BaseModel):
     accept_vol_pct: float = Field(2.0, gt=0, le=50,
                                   description='max volume error, %')
     force_prismatic: bool = False
+    # STL/OBJ carry no units; this says what the file's numbers mean.
+    units: Literal['mm', 'cm', 'm', 'in'] = 'mm'
 
 
 @app.on_event('startup')

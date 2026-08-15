@@ -39,7 +39,8 @@ button {
   cursor: pointer;
 }
 
-input[type='number'] {
+input[type='number'],
+select {
   font-family: var(--font-data);
   background: var(--ink);
   border: 1px solid var(--line);
@@ -49,8 +50,10 @@ input[type='number'] {
   width: 90px;
   font-size: 13px;
 }
+select { width: auto; max-width: 170px; }
 
 input[type='number']:focus-visible,
+select:focus-visible,
 button:focus-visible,
 input[type='checkbox']:focus-visible,
 summary:focus-visible {
