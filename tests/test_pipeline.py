@@ -6,6 +6,7 @@ what let that ship, so every test here also asserts on the artifact.
 """
 import os
 import glob
+import numpy as np
 import pytest
 import trimesh
 
@@ -251,6 +252,45 @@ def test_split_bodies_drops_only_slivers(tmp_path):
     parts, dropped = split_bodies(m, is_scan=False, verbose=False)
     assert dropped == 1
     assert [len(p.faces) for p in parts] == [1280, 12, 12]   # largest first
+
+
+def test_zero_volume_bodies_are_slivers():
+    """A 'closed' body with no volume — two triangles back to back, or a
+    flattened fan — passed the old face-count rule and then failed the
+    faceted volume gate 58 times over on a real assembly export."""
+    from stl2prism.mesh_prep import is_sliver
+    # two coincident triangles, opposite winding: closed, zero volume
+    flat = trimesh.Trimesh(vertices=[[0, 0, 0], [1, 0, 0], [0, 1, 0]],
+                           faces=[[0, 1, 2], [0, 2, 1]], process=False)
+    assert flat.is_watertight and is_sliver(flat) is True
+    # The pattern from the export: a triangular bipyramid (5 verts, 9 edges,
+    # 6 faces, every edge on exactly two faces) with both apexes squashed
+    # into the base plane — trimesh calls it watertight, volume is zero.
+    fan = trimesh.Trimesh(
+        vertices=[[0, 0, 0], [2, 0, 0], [1, 1, 0], [1, 0.4, 0], [1, 0.3, 0]],
+        faces=[[3, 0, 1], [3, 1, 2], [3, 2, 0],
+               [4, 1, 0], [4, 2, 1], [4, 0, 2]], process=False)
+    assert fan.is_watertight and is_sliver(fan) is True
+    # a thin but real washer-like plate is a part
+    plate = trimesh.creation.box((10, 10, 0.2))
+    assert is_sliver(plate) is False
+    assert is_sliver(trimesh.creation.box()) is False
+
+
+def test_faceted_merge_never_changes_volume():
+    """Coplanar merging is cosmetic; if it moves the volume by more than 1%
+    the unmerged (exact) solid must be kept. Regression for micron-thick
+    decal bodies where unify collapsed the two skins into each other."""
+    from stl2prism.rebuild import faceted_solid
+    # A thin, slightly bent sheet: many near-coplanar facets, 20um thick.
+    g = trimesh.creation.box((4, 3, 0.02))
+    g = g.subdivide().subdivide()
+    v = g.vertices.copy()
+    v[:, 2] += 0.002 * np.sin(v[:, 0])      # bend so faces are near-coplanar
+    g = trimesh.Trimesh(v, g.faces, process=True)
+    assert g.is_watertight
+    _, st = faceted_solid(g, verbose=False)
+    assert st['volume'] == pytest.approx(g.volume, rel=0.01)
 
 
 def test_multi_body_writes_every_body_into_one_step(tmp_path):

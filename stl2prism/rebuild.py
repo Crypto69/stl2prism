@@ -328,7 +328,8 @@ def faceted_solid(mesh, angular_tol=5e-3, min_face_frac=0.5, verbose=True):
     sew.Perform()
     free_edges = sew.NbFreeEdges()
 
-    solid, _, kept_faces, n_shells, _ = _largest_solid(sew.SewedShape(), 'sew')
+    solid, vol_sewn, kept_faces, n_shells, _ = _largest_solid(
+        sew.SewedShape(), 'sew')
     if n_shells > 1 and verbose:
         print(f"[faceted] sewing produced {n_shells} shells "
               f"({free_edges} free edges); keeping the largest by volume")
@@ -356,9 +357,14 @@ def faceted_solid(mesh, angular_tol=5e-3, min_face_frac=0.5, verbose=True):
     up.Build()
     solid2, vol, faces2, _, _ = _largest_solid(up.Shape(), 'unify')
     naked2 = _naked_edges(solid2)
-    if naked2 > naked:
+    # ...nor may it change the enclosed volume: on paper-thin bodies (decals,
+    # zero-thickness sheets) unify collapses opposite skins into each other.
+    vol_drift = (abs(vol - vol_sewn) / vol_sewn) if vol_sewn > 0 else 0.0
+    if naked2 > naked or vol_drift > 0.01:
         if verbose:
-            print(f"[faceted] coplanar merge opened {naked2 - naked} edge(s); "
+            why = (f"opened {naked2 - naked} edge(s)" if naked2 > naked
+                   else f"changed the volume by {vol_drift:.1%}")
+            print(f"[faceted] coplanar merge {why}; "
                   f"keeping the unmerged solid ({kept_faces} faces)")
         solid2, faces2, naked2 = solid, kept_faces, naked
         vol = _volume(solid2)

@@ -161,10 +161,29 @@ def repair(m, is_scan, target_faces=40000, verbose=True):
 # A body this small cannot be closed (a tetrahedron is 4 faces); anything
 # below is an export artefact, not a part.
 MIN_BODY_FACES = 4
+# A closed body thinner than this on average (2*volume/area, mm) encloses
+# nothing: flattened triangle pairs, zero-thickness decals. CAD exports of
+# assemblies are full of them and they cannot become solids.
+MIN_BODY_THICKNESS = 1e-3
 # Scans shed detached blobs; on scan input a body is also dropped if it is
 # both tiny in absolute terms and negligible relative to the whole mesh.
 SCAN_SLIVER_FACES = 100
 SCAN_SLIVER_FRAC = 0.001
+
+
+def is_sliver(p, is_scan=False, total_faces=None):
+    """True for a body that cannot be a solid: too few faces to close, closed
+    but with no volume (see MIN_BODY_THICKNESS), or — scan input only — a
+    detached blob that is negligible in both absolute and relative terms."""
+    n = len(p.faces)
+    if n < MIN_BODY_FACES:
+        return True
+    if p.is_watertight:
+        vol, area = abs(float(p.volume)), float(p.area)
+        if area <= 0 or 2 * vol / area < MIN_BODY_THICKNESS:
+            return True
+    return bool(is_scan and total_faces and n < SCAN_SLIVER_FACES
+                and n < SCAN_SLIVER_FRAC * total_faces)
 
 
 def split_bodies(m, is_scan, verbose=True):
@@ -181,9 +200,7 @@ def split_bodies(m, is_scan, verbose=True):
     total = len(m.faces)
 
     def sliver(p):
-        n = len(p.faces)
-        return n < MIN_BODY_FACES or (
-            is_scan and n < SCAN_SLIVER_FACES and n < SCAN_SLIVER_FRAC * total)
+        return is_sliver(p, is_scan, total)
 
     kept = sorted((p for p in parts if not sliver(p)),
                   key=lambda p: len(p.faces), reverse=True)
@@ -192,7 +209,7 @@ def split_bodies(m, is_scan, verbose=True):
         msg = f"[bodies] {len(parts)} connected bodies"
         if dropped:
             lost = total - sum(len(p.faces) for p in kept)
-            msg += (f"; dropping {dropped} sliver(s) "
+            msg += (f"; dropping {dropped} sliver(s) with no volume "
                     f"({lost} faces, {lost / total:.2%} of the mesh)")
         print(msg + f"; converting {len(kept)}")
     if not kept:
