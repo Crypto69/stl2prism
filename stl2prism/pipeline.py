@@ -163,7 +163,7 @@ def run(in_path, out_path, tol=0.08, accept_p95=0.25, accept_vol_pct=2.0,
                                write_script, verbose)
         return {'mode': mode, 'metrics': metrics,
                 'n_bodies': 1, 'n_written': 1, 'n_dropped': n_dropped,
-                'script': script}
+                'is_scan': bool(is_scan), 'script': script}
 
     per_body, shapes = [], []
     for i, body in enumerate(bodies):
@@ -213,7 +213,7 @@ def run(in_path, out_path, tol=0.08, accept_p95=0.25, accept_vol_pct=2.0,
               + f") -> {out_path}")
     return {'mode': mode, 'metrics': _aggregate(per_body), 'bodies': per_body,
             'n_bodies': len(bodies), 'n_written': len(shapes),
-            'n_dropped': n_dropped, 'script': script}
+            'n_dropped': n_dropped, 'is_scan': bool(is_scan), 'script': script}
 
 
 def _body_name(in_path, i, n):
@@ -225,6 +225,12 @@ def _body_name(in_path, i, n):
 def _write_script(builds, out_path, write_script, verbose):
     """Write the CadQuery script next to the STEP (same stem, .py)."""
     if not write_script:
+        return None
+    if not any(b.get('mode') == 'prismatic' and 'slabs' in b for b in builds):
+        # A script with no recognised bodies would be an empty program that
+        # crashes on its first line; better no file than a broken one.
+        if verbose:
+            print('[out] no prismatic bodies; no script written')
         return None
     try:
         from .script_export import emit_script

@@ -58,7 +58,9 @@ const verdict = computed(() => {
       ? { title: 'Prismatic solid', cls: 'prismatic',
           note: 'Clean BREP with true planes and cylinders — every gate below passed.' }
       : { title: 'Faceted solid', cls: 'faceted',
-          note: 'A prismatic fit wasn’t possible within your limits, so this is an exact faceted copy of the mesh: valid and manifold, but not clean geometry to sketch on.' }
+          note: r.is_scan && !r.params?.force_prismatic
+            ? 'This looked like a 3D scan (millions of tiny triangles, no flat facets), so the prismatic fit was skipped: the scan was repaired, closed and reduced, and this is an exact faceted copy of it. Tick “Force prismatic” to make the tool try anyway.'
+            : 'A prismatic fit wasn’t possible within your limits, so this is an exact faceted copy of the mesh: valid and manifold, but not clean geometry to sketch on.' }
   }
   const m = r.metrics
   const parts = []

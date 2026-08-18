@@ -114,6 +114,19 @@ def test_faceted_fallback_uses_reduce(tmp_path):
     assert r0['metrics']['faces_out'] == len(m.faces)
 
 
+def test_no_script_when_nothing_is_prismatic(tmp_path):
+    """A faceted-only result must not offer a script: it would be an empty
+    program (no recognised bodies) that crashes on `bodies[0]`."""
+    from stl2prism.pipeline import run
+    m = trimesh.creation.icosphere(subdivisions=3, radius=10)
+    p = str(tmp_path / 'sphere.stl'); m.export(p)
+    r = run(p, str(tmp_path / 'sphere.step'), verbose=False)
+    assert r['mode'] == 'faceted' and r['is_scan'] is False
+    assert r['script'] is None
+    assert not os.path.exists(tmp_path / 'sphere.py')
+    assert not os.path.exists(tmp_path / 'sphere_fusion.py')
+
+
 def test_fusion_script_is_emitted_and_parses(tmp_path):
     """Cannot run Fusion here: check the script exists, parses, and carries
     the expected structure (planes, sketches, extrude/loft/cut calls)."""

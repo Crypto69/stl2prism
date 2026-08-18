@@ -170,6 +170,7 @@ def emit_script(bodies_info, out_step_name='part.step'):
         body.append('')
     tail = [
         'bodies = [b for b in [' + ', '.join(names) + '] if b is not None]',
+        "assert bodies, 'no body in this file was recognised as an extrusion'",
         'result = bodies[0]',
         'for b in bodies[1:]:',
         '    result = result.add(b)',
