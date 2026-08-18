@@ -1,43 +1,544 @@
 """Rebuild a parametric solid from fitted slabs and export STEP."""
 import numpy as np
+import trimesh
 import cadquery as cq
-from .profile_fit import segment_polyline, try_full_circle, snap_profile
+from .profile_fit import (segment_polyline, try_full_circle, snap_profile,
+                          solve_junctions, refine_arcs_with_points)
 
 
-def build_solid(slabs, axis, tol=0.08, verbose=True):
+def build_solid(slabs, axis, tol=0.08, verbose=True, mesh=None):
     """Union of one extrusion per slab. Profiles fitted as lines/arcs,
-    then globally constraint-snapped (radii/centers unified across slabs)."""
+    refined against the mesh vertices (which lie exactly on the CAD
+    surface), then globally constraint-snapped (radii/centers unified
+    across slabs) and their junctions solved exactly.
+
+    Consecutive slabs with identical profiles are merged into one extrusion
+    (fewer Booleans, no seam faces); slabs are fused with glue since they
+    only touch."""
     basis = _axis_basis(axis)
-    # pass 1: fit every ring
+    # pass 1: fit every ring. A slab whose section varies (taper, draft,
+    # chamfer, countersink) is fitted at BOTH ends and lofted; a constant
+    # slab is fitted at its mid section and extruded.
     fitted = []
+    lofts = []
     for slab in slabs:
-        rings = []
-        for poly in slab['polygons']:
-            outer = _fit_ring(np.array(poly.exterior.coords), tol)
-            holes = [_fit_ring(np.array(r.coords), tol) for r in poly.interiors]
-            rings.append((outer, holes))
+        pts2d = _slab_vertices_2d(mesh, axis, basis, slab) if mesh is not None else None
+        rings = _fit_polys(slab['polygons'], tol, pts2d)
         fitted.append(rings)
+        loft = None
+        from .extrusion import _loftable
+        if not slab.get('constant', True) and slab.get('ends') and _loftable(slab):
+            (za, pa), (zb, pb) = slab['ends']
+            if pa and pb and len(pa) == len(pb):
+                ra = _fit_polys(pa, tol, pts2d)
+                rb_ = _fit_polys(pb, tol, pts2d)
+                if _compatible(ra, rb_):
+                    loft = (ra, rb_, za, zb)
+        lofts.append(loft)
+    # global radius/centre clustering over the constant (extruded) slabs
+    # only: a taper's end radii must not be averaged into them
     _global_snap(fitted)
+    for rings in fitted + [r for lf in lofts if lf for r in lf[:2]]:
+        for outer, holes in rings:
+            for ring in [outer] + holes:
+                if isinstance(ring, list):
+                    solve_junctions(ring, closed=True)
+                    _drop_degenerate(ring)
+    # merge consecutive slabs whose fitted profiles are identical
+    merged = _merge_equal_slabs(slabs, fitted, lofts)
     # pass 2: build
     solid = None
     report = []
-    for si, (slab, rings) in enumerate(zip(slabs, fitted)):
-        h = slab['z1'] - slab['z0']
+    for si, (z0, z1, rings, loft) in enumerate(merged):
+        h = z1 - z0
         wp = cq.Workplane(cq.Plane(
-            origin=tuple(np.asarray(axis) * slab['z0']),
+            origin=tuple(np.asarray(axis) * z0),
             xDir=tuple(basis[:3, 0]),
             normal=tuple(axis)))
         slab_solid = None
-        for outer, holes in rings:
-            s = _extrude_profile(wp, outer, holes, h)
-            slab_solid = s if slab_solid is None else slab_solid.union(s)
-        report.append({'slab': si, 'z0': slab['z0'], 'z1': slab['z1'],
-                       'profiles': len(rings)})
+        kind = 'extrude'
+        if loft is not None:
+            try:
+                ra, rb_, za, zb = loft
+                # the end sections were taken slightly inside the slab;
+                # extrapolate the (linear) profiles to the true slab ends
+                ta = (z0 - za) / (zb - za)
+                tb = (z1 - za) / (zb - za)
+                ra_e = _lerp_rings(ra, rb_, ta)
+                rb_e = _lerp_rings(ra, rb_, tb)
+                # continuity with the neighbouring extruded slabs: where the
+                # lofted end matches the neighbour's fitted profile within
+                # tolerance, take the neighbour's numbers exactly (no
+                # sliver step faces at the interface)
+                if si > 0 and merged[si - 1][3] is None:
+                    ra_e = _snap_rings_to(ra_e, merged[si - 1][2], tol)
+                if si + 1 < len(merged) and merged[si + 1][3] is None:
+                    rb_e = _snap_rings_to(rb_e, merged[si + 1][2], tol)
+                slab_solid = _loft_slab(wp, ra_e, rb_e, h)
+                kind = 'loft'
+            except Exception as e:
+                if verbose:
+                    print(f"[build] slab {si}: loft failed ({type(e).__name__}); extruding")
+                slab_solid = None
+        if slab_solid is None:
+            for outer, holes in rings:
+                s = _extrude_profile(wp, outer, holes, h)
+                slab_solid = s if slab_solid is None else slab_solid.union(s, tol=FUZZY)
+        report.append({'slab': si, 'z0': z0, 'z1': z1, 'profiles': len(rings),
+                       'rings': rings, 'kind': kind,
+                       'loft': loft})
         if verbose:
-            print(f"[build] slab {si}: z {slab['z0']:.2f}..{slab['z1']:.2f} "
-                  f"({len(rings)} profile(s))")
-        solid = slab_solid if solid is None else solid.union(slab_solid)
+            print(f"[build] slab {si}: z {z0:.2f}..{z1:.2f} "
+                  f"({len(rings)} profile(s), {kind})")
+        solid = slab_solid if solid is None else solid.union(slab_solid, tol=FUZZY)
+    solid = finish_solid(solid, verbose=verbose)
     return solid, report
+
+
+def _fit_polys(polys, tol, pts2d):
+    rings = []
+    for poly in polys:
+        outer = _fit_ring(np.array(poly.exterior.coords), tol, pts2d)
+        holes = [_fit_ring(np.array(r.coords), tol, pts2d) for r in poly.interiors]
+        rings.append((outer, holes))
+    return rings
+
+
+def _ring_types(ring):
+    if isinstance(ring, dict):
+        return 'O'
+    return ''.join('L' if p['type'] == 'line' else 'A' for p in ring)
+
+
+def _compatible(ra, rb):
+    """Two fitted sections can be lofted edge-to-edge: same number of
+    profiles, each with the same number of holes and the same primitive
+    sequence (up to cyclic rotation)."""
+    if len(ra) != len(rb):
+        return False
+    for (oa, ha), (ob, hb) in zip(ra, rb):
+        if len(ha) != len(hb):
+            return False
+        for x, y in [(oa, ob)] + list(zip(ha, hb)):
+            tx, ty = _ring_types(x), _ring_types(y)
+            if tx == 'O' or ty == 'O':
+                if tx != ty:
+                    return False
+                continue
+            if len(tx) != len(ty) or tx not in ty + ty:
+                return False
+    return True
+
+
+def _align_ring(ref, ring):
+    """Rotate `ring` (list of prims) so its first primitive corresponds to
+    ref's first primitive: same type sequence and nearest start point."""
+    if isinstance(ring, dict) or isinstance(ref, dict):
+        return ring
+    tr = _ring_types(ref)
+    n = len(ring)
+    best = None
+    for k in range(n):
+        rot = ring[k:] + ring[:k]
+        if _ring_types(rot) != tr:
+            continue
+        d = np.linalg.norm(np.asarray(rot[0]['p0'], float) - np.asarray(ref[0]['p0'], float))
+        if best is None or d < best[0]:
+            best = (d, rot)
+    return best[1] if best else ring
+
+
+def _loft_slab(wp, rings_a, rings_b, h):
+    """Ruled loft from the profiles at the slab bottom to those at the
+    top; holes are lofted separately and cut. Ruled lofts between matched
+    lines give planes, between matched arcs cones — a linear taper,
+    chamfer or countersink becomes exact analytic geometry."""
+    solid = None
+    for (oa, ha), (ob, hb) in zip(rings_a, rings_b):
+        ob = _align_ring(oa, ob)
+        body = _loft_ring(wp, oa, ob, h)
+        for x, y in zip(ha, hb):
+            y = _align_ring(x, y)
+            hole = _loft_ring(wp, x, y, h, grow=0.02)
+            body = body.cut(hole, tol=FUZZY)
+        solid = body if solid is None else solid.union(body, tol=FUZZY)
+    return solid
+
+
+def _loft_ring(wp, ring_a, ring_b, h, grow=0.0):
+    """Loft one wire pair. Analytic construction first (planes between
+    matched lines, cones/cylinders between matched arcs or full circles),
+    B-spline ruled loft as the fallback. `grow` extends a hole loft
+    slightly past both ends so the cut is clean."""
+    try:
+        s = _loft_ring_analytic(wp.plane, ring_a, ring_b, h, grow)
+        if s is not None:
+            return s
+    except Exception:
+        pass
+    if grow:
+        wp0 = wp.workplane(offset=-grow)
+        w = _draw(wp0, ring_a)
+        w = _draw(w.workplane(offset=h + 2 * grow), ring_b)
+    else:
+        w = _draw(wp, ring_a)
+        w = _draw(w.workplane(offset=h), ring_b)
+    return w.loft(combine=True, ruled=True)
+
+
+def _loft_ring_analytic(plane, ring_a, ring_b, h, grow=0.0):
+    """Ruled solid between two fitted rings at heights 0 and h of `plane`
+    (extended by `grow` at both ends), built from analytic faces."""
+    from OCP.BRepBuilderAPI import BRepBuilderAPI_MakeFace, BRepBuilderAPI_Sewing, BRepBuilderAPI_MakeSolid
+    from OCP.ShapeFix import ShapeFix_Face, ShapeFix_Solid
+    from OCP.TopoDS import TopoDS
+    from OCP.TopAbs import TopAbs_SHELL
+    from OCP.TopExp import TopExp_Explorer
+    from OCP.BRepCheck import BRepCheck_Analyzer
+    za, zb = -grow, h + grow
+
+    def W(x, y, z):
+        return plane.toWorldCoords(cq.Vector(float(x), float(y), float(z)))
+
+    # full circles: cone frustum / cylinder
+    if isinstance(ring_a, dict) and isinstance(ring_b, dict):
+        ca, ra = np.asarray(ring_a['center'], float), float(ring_a['r'])
+        cb, rb = np.asarray(ring_b['center'], float), float(ring_b['r'])
+        if np.linalg.norm(ca - cb) > 0.05:
+            return None
+        if grow:
+            t = (rb - ra) / h
+            ra_, rb_ = ra - t * grow, rb + t * grow
+        else:
+            ra_, rb_ = ra, rb
+        pnt = W(ca[0], ca[1], za)
+        d = plane.zDir
+        if abs(ra_ - rb_) < 1e-6:
+            return cq.Workplane('XY').newObject([cq.Solid.makeCylinder(ra_, zb - za, pnt, d)])
+        return cq.Workplane('XY').newObject([cq.Solid.makeCone(ra_, rb_, zb - za, pnt, d)])
+    if isinstance(ring_a, dict) or isinstance(ring_b, dict):
+        return None
+    if len(ring_a) != len(ring_b):
+        return None
+    if grow:
+        # extrapolate both rings along the ruling direction: p(z) linear
+        t0 = -grow / h
+        t1 = 1 + grow / h
+        ra_ = _lerp_ring(ring_a, ring_b, t0)
+        rb_ = _lerp_ring(ring_a, ring_b, t1)
+    else:
+        ra_, rb_ = ring_a, ring_b
+    faces = []
+    for pa, pb in zip(ra_, rb_):
+        if pa['type'] != pb['type']:
+            return None
+        A0, A1 = W(*pa['p0'], za), W(*pa['p1'], za)
+        B0, B1 = W(*pb['p0'], zb), W(*pb['p1'], zb)
+        if pa['type'] == 'line':
+            f = _quad_face(A0, A1, B1, B0)
+        else:
+            f = _cone_face(plane, pa, pb, za, zb, A0, A1, B0, B1)
+        if f is None:
+            return None
+        faces.append(f)
+    # caps
+    bottom = _cap_face(plane, ra_, za)
+    top = _cap_face(plane, rb_, zb)
+    if bottom is None or top is None:
+        return None
+    faces += [bottom, top]
+    sew = BRepBuilderAPI_Sewing(1e-3)
+    for f in faces:
+        sew.Add(f.wrapped)
+    sew.Perform()
+    sewed = sew.SewedShape()
+    exp = TopExp_Explorer(sewed, TopAbs_SHELL)
+    if not exp.More():
+        return None
+    shell = TopoDS.Shell_s(exp.Current())
+    solid = BRepBuilderAPI_MakeSolid(shell).Solid()
+    fx = ShapeFix_Solid(solid)
+    fx.Perform()
+    solid = fx.Solid()
+    if not BRepCheck_Analyzer(solid).IsValid():
+        return None
+    out = cq.Shape.cast(solid)
+    if out.Volume() <= 0:
+        return None
+    return cq.Workplane('XY').newObject([out])
+
+
+def _snap_rings_to(rings, ref_rings, tol):
+    """Copy primitives of `ref_rings` onto `rings` where they coincide
+    within 2*tol (circles: centre and radius; chains: matched primitives'
+    endpoints, centres and radii)."""
+    band = 2 * tol
+    out = []
+    for o, hs in rings:
+        o2 = _snap_ring_to(o, ref_rings, band)
+        out.append((o2, [_snap_ring_to(h, ref_rings, band) for h in hs]))
+    return out
+
+
+def _snap_ring_to(ring, ref_rings, band):
+    refs = [r for o, hs in ref_rings for r in [o] + hs]
+    if isinstance(ring, dict):
+        for r in refs:
+            if isinstance(r, dict) and abs(r['r'] - ring['r']) < band \
+                    and np.linalg.norm(np.asarray(r['center']) - np.asarray(ring['center'])) < band:
+                c = dict(ring)
+                c['center'] = np.asarray(r['center'], float).copy()
+                c['r'] = float(r['r'])
+                return c
+        return ring
+    for r in refs:
+        if isinstance(r, dict) or len(r) != len(ring):
+            continue
+        r_al = _align_ring(ring, r)
+        if _ring_types(r_al) != _ring_types(ring):
+            continue
+        close = all(np.linalg.norm(np.asarray(a['p0'], float) - np.asarray(b['p0'], float)) < band
+                    and np.linalg.norm(np.asarray(a['p1'], float) - np.asarray(b['p1'], float)) < band
+                    for a, b in zip(ring, r_al))
+        if close:
+            out = []
+            for a, b in zip(ring, r_al):
+                c = dict(a)
+                c['p0'] = np.asarray(b['p0'], float).copy()
+                c['p1'] = np.asarray(b['p1'], float).copy()
+                if a['type'] == 'arc':
+                    c['center'] = np.asarray(b['center'], float).copy()
+                    c['r'] = float(b['r'])
+                out.append(c)
+            return out
+    return ring
+
+
+def _lerp_rings(RA, RB, t):
+    """Interpolate/extrapolate whole fitted sections (list of (outer,
+    holes)); rings are aligned first so primitives correspond."""
+    out = []
+    for (oa, ha), (ob, hb) in zip(RA, RB):
+        ob = _align_ring(oa, ob)
+        o = _lerp_one(oa, ob, t)
+        hs = []
+        for x, y in zip(ha, hb):
+            y = _align_ring(x, y)
+            hs.append(_lerp_one(x, y, t))
+        out.append((o, hs))
+    return out
+
+
+def _lerp_one(a, b, t):
+    if isinstance(a, dict) and isinstance(b, dict):
+        c = dict(a)
+        c['center'] = (1 - t) * np.asarray(a['center'], float) + t * np.asarray(b['center'], float)
+        c['r'] = (1 - t) * a['r'] + t * b['r']
+        return c
+    if isinstance(a, dict) or isinstance(b, dict) or len(a) != len(b):
+        return a if t < 0.5 else b
+    return _lerp_ring(a, b, t)
+
+
+def _lerp_ring(ra, rb, t):
+    """Linear interpolation/extrapolation of two matched rings."""
+    out = []
+    for pa, pb in zip(ra, rb):
+        p = dict(pa)
+        for k in ('p0', 'p1'):
+            p[k] = (1 - t) * np.asarray(pa[k], float) + t * np.asarray(pb[k], float)
+        if pa['type'] == 'arc':
+            p['center'] = (1 - t) * np.asarray(pa['center'], float) + t * np.asarray(pb['center'], float)
+            p['r'] = (1 - t) * pa['r'] + t * pb['r']
+        out.append(p)
+    return out
+
+
+def _quad_face(A0, A1, B1, B0):
+    """Planar face through four (near-)coplanar points; the last two are
+    projected onto the plane of the first three so the face is exact."""
+    P = np.array([[v.x, v.y, v.z] for v in (A0, A1, B1, B0)])
+    c = P.mean(axis=0)
+    _, _, vt = np.linalg.svd(P - c)
+    n = vt[2]
+    dev = np.abs((P - c) @ n).max()
+    if dev > 0.05:
+        return None
+    Pp = P - np.outer((P - c) @ n, n)
+    pts = [cq.Vector(*q) for q in Pp]
+    wire = cq.Wire.makePolygon(pts + [pts[0]])
+    return cq.Face.makeFromWires(wire)
+
+
+def _cone_face(plane, pa, pb, za, zb, A0, A1, B0, B1):
+    """Conical (or cylindrical) face between two matched coaxial arcs."""
+    from OCP.Geom import Geom_ConicalSurface, Geom_CylindricalSurface
+    from OCP.gp import gp_Ax3, gp_Pnt, gp_Dir
+    from OCP.BRepBuilderAPI import BRepBuilderAPI_MakeFace
+    from OCP.ShapeFix import ShapeFix_Face
+    ca, ra = np.asarray(pa['center'], float), float(pa['r'])
+    cb, rb = np.asarray(pb['center'], float), float(pb['r'])
+    if np.linalg.norm(ca - cb) > 0.05:
+        return None
+    c = 0.5 * (ca + cb)
+    apex_pt = plane.toWorldCoords(cq.Vector(float(c[0]), float(c[1]), float(za)))
+    d = plane.zDir
+    ax3 = gp_Ax3(gp_Pnt(apex_pt.x, apex_pt.y, apex_pt.z), gp_Dir(d.x, d.y, d.z))
+    hh = zb - za
+    if abs(rb - ra) < 1e-6:
+        surf = Geom_CylindricalSurface(ax3, ra)
+    else:
+        semi = np.arctan2(rb - ra, hh)
+        surf = Geom_ConicalSurface(ax3, float(semi), ra)
+    # boundary wire: arc a, ruling A1->B1, arc b reversed, ruling B0->A0
+    ma = _arc_mid(pa)
+    mb = _arc_mid(pb)
+    MA = plane.toWorldCoords(cq.Vector(float(ma[0]), float(ma[1]), float(za)))
+    MB = plane.toWorldCoords(cq.Vector(float(mb[0]), float(mb[1]), float(zb)))
+    e1 = cq.Edge.makeThreePointArc(A0, MA, A1)
+    e2 = cq.Edge.makeLine(A1, B1)
+    e3 = cq.Edge.makeThreePointArc(B1, MB, B0)
+    e4 = cq.Edge.makeLine(B0, A0)
+    wire = cq.Wire.assembleEdges([e1, e2, e3, e4])
+    mk = BRepBuilderAPI_MakeFace(surf, wire.wrapped, True)
+    if not mk.IsDone():
+        return None
+    face = mk.Face()
+    fx = ShapeFix_Face(face)
+    fx.Perform()
+    return cq.Face(fx.Face())
+
+
+def _cap_face(plane, ring, z):
+    """Planar cap bounded by the ring at height z."""
+    def W(x, y):
+        return plane.toWorldCoords(cq.Vector(float(x), float(y), float(z)))
+    edges = []
+    for p in ring:
+        A, B = W(*p['p0']), W(*p['p1'])
+        if p['type'] == 'line':
+            edges.append(cq.Edge.makeLine(A, B))
+        else:
+            m = _arc_mid(p)
+            edges.append(cq.Edge.makeThreePointArc(A, W(*m), B))
+    wire = cq.Wire.assembleEdges(edges)
+    return cq.Face.makeFromWires(wire)
+
+
+# Fuzzy tolerance for Booleans between fitted slabs. Consecutive slabs share
+# an end plane, but their boundary curves differ by fit noise; below this
+# OCC sees two touching solids and leaves both end faces inside the fuse.
+FUZZY = 1e-4
+
+
+def finish_solid(solid, verbose=True):
+    """Cleanliness pass on a CadQuery Workplane solid: make sure it is ONE
+    solid (re-fuse with a coarser fuzzy value if not), drop micro-edges,
+    unify same-domain faces (guarded: must stay valid and keep volume),
+    check validity."""
+    from OCP.BRepCheck import BRepCheck_Analyzer
+    from OCP.ShapeFix import ShapeFix_Wireframe
+    from OCP.ShapeUpgrade import ShapeUpgrade_UnifySameDomain
+    shape = solid.val()
+    solids = shape.Solids()
+    if len(solids) > 1:
+        # touching pieces that the per-slab fuse left apart
+        merged = solids[0].fuse(*solids[1:], tol=1e-3).clean()
+        if len(merged.Solids()) == 1 and abs(merged.Volume() - shape.Volume()) < 1e-6 * max(1.0, shape.Volume()):
+            shape = merged
+        elif verbose:
+            print(f"[build] warning: result holds {len(solids)} touching solids "
+                  f"that would not fuse")
+    vol0 = shape.Volume()
+    # micro-edges from junction solving / Booleans
+    try:
+        wf = ShapeFix_Wireframe(shape.wrapped)
+        wf.SetPrecision(1e-4)
+        wf.SetMaxTolerance(1e-3)
+        wf.ModeDropSmallEdges = True
+        wf.FixSmallEdges()
+        wf.FixWireGaps()
+        fixed = cq.Shape.cast(wf.Shape())
+        if BRepCheck_Analyzer(fixed.wrapped).IsValid() and abs(fixed.Volume() - vol0) < 1e-4 * max(1.0, vol0):
+            shape = fixed
+    except Exception:
+        pass
+    try:
+        up = ShapeUpgrade_UnifySameDomain(shape.wrapped, True, True, True)
+        up.SetLinearTolerance(1e-4)
+        up.SetAngularTolerance(1e-4)
+        up.Build()
+        uni = cq.Shape.cast(up.Shape())
+        if (BRepCheck_Analyzer(uni.wrapped).IsValid()
+                and abs(uni.Volume() - vol0) < 1e-4 * max(1.0, vol0)
+                and len(uni.Faces()) <= len(shape.Faces())):
+            shape = uni
+    except Exception:
+        pass
+    if verbose and not BRepCheck_Analyzer(shape.wrapped).IsValid():
+        print('[build] warning: solid failed BRepCheck validation')
+    return cq.Workplane('XY').newObject([shape])
+
+
+def _slab_vertices_2d(mesh, axis, basis, slab, eps=1e-6):
+    """Mesh vertices whose height lies in the slab, projected into the
+    section frame (used to refine arc radii/centres)."""
+    V = mesh.vertices
+    h = V @ np.asarray(axis, float)
+    sel = (h >= slab['z0'] - eps) & (h <= slab['z1'] + eps)
+    if not sel.any():
+        return None
+    P = V[sel]
+    return np.column_stack([P @ basis[:3, 0], P @ basis[:3, 1]])
+
+
+def _drop_degenerate(ring, eps=1e-6):
+    """Remove zero-length lines / zero-sweep arcs left by junction solving."""
+    keep = []
+    for p in ring:
+        L = np.linalg.norm(np.asarray(p['p1'], float) - np.asarray(p['p0'], float))
+        if L > eps:
+            keep.append(p)
+    if len(keep) != len(ring):
+        ring[:] = keep
+        # re-close after dropping
+        for prev, cur in zip(ring, ring[1:] + ring[:1]):
+            cur['p0'] = np.asarray(prev['p1'], float).copy()
+
+
+def _ring_signature(ring, nd=4):
+    if isinstance(ring, dict):
+        return ('circle', tuple(np.round(ring['center'], nd)), round(ring['r'], nd))
+    out = []
+    for p in ring:
+        if p['type'] == 'line':
+            out.append(('L', tuple(np.round(p['p0'], nd)), tuple(np.round(p['p1'], nd))))
+        else:
+            out.append(('A', tuple(np.round(p['center'], nd)), round(p['r'], nd),
+                        tuple(np.round(p['p0'], nd)), tuple(np.round(p['p1'], nd))))
+    return tuple(out)
+
+
+def _slab_signature(rings):
+    return tuple(sorted((repr(_ring_signature(o)),
+                         tuple(sorted(repr(_ring_signature(h)) for h in hs)))
+                        for o, hs in rings))
+
+
+def _merge_equal_slabs(slabs, fitted, lofts=None, gap_tol=1e-6):
+    """Consecutive extruded slabs with identical fitted profiles become one
+    extrusion. Lofted slabs are never merged."""
+    lofts = lofts or [None] * len(slabs)
+    out = []
+    for slab, rings, loft in zip(slabs, fitted, lofts):
+        sig = _slab_signature(rings) if loft is None else object()
+        if (loft is None and out and out[-1][4] is None and out[-1][3] == sig
+                and abs(out[-1][1] - slab['z0']) < gap_tol):
+            z0, _, r, _, _ = out[-1]
+            out[-1] = (z0, slab['z1'], r, sig, None)
+        else:
+            out.append((slab['z0'], slab['z1'], rings, sig, loft))
+    return [(z0, z1, rings, loft) for z0, z1, rings, _, loft in out]
 
 
 def _iter_arcs(fitted):
@@ -53,9 +554,9 @@ def _iter_arcs(fitted):
 
 
 def _global_snap(fitted, radius_tol=0.12, center_tol=0.35):
-    fitted_rings_ref = [fitted]
     """Cluster radii and centers across ALL slabs and snap to cluster means.
-    This turns facet-noise families like 5.242..5.257 into one radius."""
+    This turns facet-noise families like 5.242..5.257 into one radius.
+    Junctions are re-solved afterwards by the caller."""
     arcs = list(_iter_arcs(fitted))
     if not arcs:
         return
@@ -77,7 +578,9 @@ def _global_snap(fitted, radius_tol=0.12, center_tol=0.35):
             cluster = [arcs[i]]
     clusters.append(cluster)
     for cl in clusters:
-        r = float(np.mean([a['r'] for a in cl]))
+        # refined (vertex-fitted) radii are trusted more than chord fits
+        ref = [a['r'] for a in cl if a.get('refined')]
+        r = float(np.mean(ref if ref else [a['r'] for a in cl]))
         rr = round(r, 1)
         if abs(rr - r) < 0.02:      # snap to 0.1mm grid only when very close
             r = rr
@@ -94,41 +597,23 @@ def _global_snap(fitted, radius_tol=0.12, center_tol=0.35):
                     arcs[j]['center'] - a['center']) < center_tol:
                 grp.append(arcs[j])
                 done[j] = True
-        c = np.mean([g['center'] for g in grp], axis=0)
+        ref = [g['center'] for g in grp if g.get('refined')]
+        c = np.mean(ref if ref else [g['center'] for g in grp], axis=0)
         for g in grp:
             g['center'] = c
-    # project arc endpoints onto their snapped circles, then re-close
-    # each ring chain (threePointArc refits through points, so endpoints
-    # must lie exactly on the snapped circle to preserve the radius)
-    for rings in fitted_rings_ref[0]:
-        for outer, holes in rings:
-            for ring in [outer] + holes:
-                if not isinstance(ring, list):
-                    continue
-                for p in ring:
-                    if p['type'] == 'arc':
-                        for key in ('p0', 'p1'):
-                            v = np.asarray(p[key]) - p['center']
-                            L = np.linalg.norm(v)
-                            if L > 1e-9:
-                                p[key] = p['center'] + v / L * p['r']
-                for prev, cur in zip(ring, ring[1:] + ring[:1]):
-                    if cur['type'] == 'arc':
-                        # arcs own their endpoints; move the line to meet it
-                        prev['p1'] = np.asarray(cur['p0'])
-                    else:
-                        cur['p0'] = np.asarray(prev['p1'])
 
 
-def _fit_ring(coords, tol):
+def _fit_ring(coords, tol, pts2d=None):
     """Ring of 2D coords -> full circle dict or list of line/arc prims."""
     pts = np.array(coords)
     if np.allclose(pts[0], pts[-1]):
         pts = pts[:-1]
     circ = try_full_circle(pts, tol)
     if circ:
+        refine_arcs_with_points([circ], pts2d, tol)
         return circ
     prims = segment_polyline(pts, tol=tol, closed=True)
+    refine_arcs_with_points(prims, pts2d, tol)
     return snap_profile(prims)
 
 
@@ -184,12 +669,38 @@ def _axis_basis(axis):
     return T
 
 
-def write_step(shapes, path):
-    """Write one or more OCC solids to a single AP214 STEP file.
+# Face colours by surface type (RGB 0-1): a quick visual audit in any CAD
+# viewer of what was recognised analytically vs left faceted/free-form.
+SURFACE_COLOURS = {
+    'plane': (0.80, 0.80, 0.82),
+    'cylinder': (0.25, 0.55, 0.95),
+    'cone': (0.95, 0.60, 0.15),
+    'sphere': (0.30, 0.75, 0.35),
+    'torus': (0.65, 0.35, 0.85),
+    'other': (0.90, 0.25, 0.25),
+}
 
-    Several solids go into one compound, so a multi-body part imports as
-    multiple bodies of one component (Fusion, FreeCAD, Onshape all do this)
-    rather than as separate files. Explicit MANIFOLD_SOLID_BREP per solid.
+
+def _surface_kind(face):
+    from OCP.GeomAdaptor import GeomAdaptor_Surface
+    from OCP.BRep import BRep_Tool
+    from OCP.GeomAbs import (GeomAbs_Plane, GeomAbs_Cylinder, GeomAbs_Cone,
+                             GeomAbs_Sphere, GeomAbs_Torus)
+    t = GeomAdaptor_Surface(BRep_Tool.Surface_s(face)).GetType()
+    return {GeomAbs_Plane: 'plane', GeomAbs_Cylinder: 'cylinder',
+            GeomAbs_Cone: 'cone', GeomAbs_Sphere: 'sphere',
+            GeomAbs_Torus: 'torus'}.get(t, 'other')
+
+
+def write_step(shapes, path, names=None, colours=True, schema='AP214'):
+    """Write one or more OCC solids to a single STEP file.
+
+    With `names` (one per shape) the file is written through XDE so each
+    body carries its name and every face a colour by surface type; without,
+    the plain writer is used. Several solids go into one compound / one
+    assembly, so a multi-body part imports as multiple bodies of one
+    component (Fusion, FreeCAD, Onshape all do this). Explicit
+    MANIFOLD_SOLID_BREP per solid.
     """
     from OCP.TopoDS import TopoDS_Compound
     from OCP.BRep import BRep_Builder
@@ -198,6 +709,13 @@ def write_step(shapes, path):
     shapes = list(shapes)
     if not shapes:
         raise ValueError('nothing to write')
+    if names:
+        try:
+            _write_step_xde(shapes, path, names, colours, schema)
+            return
+        except Exception as e:      # never fail an export over metadata
+            print(f"[out] named STEP export failed ({type(e).__name__}: {e}); "
+                  f"writing plain STEP")
     if len(shapes) == 1:
         shape = shapes[0]
     else:
@@ -207,8 +725,44 @@ def write_step(shapes, path):
         for s in shapes:
             b.Add(shape, s)
     w = STEPControl_Writer()
-    Interface_Static.SetCVal_s('write.step.schema', 'AP214')
+    Interface_Static.SetCVal_s('write.step.schema', schema)
     w.Transfer(shape, STEPControl_ManifoldSolidBrep)
+    w.Write(path)
+
+
+def _write_step_xde(shapes, path, names, colours, schema):
+    from OCP.TDocStd import TDocStd_Document
+    from OCP.TCollection import TCollection_ExtendedString, TCollection_AsciiString
+    from OCP.XCAFDoc import XCAFDoc_DocumentTool, XCAFDoc_ColorSurf
+    from OCP.TDataStd import TDataStd_Name
+    from OCP.STEPCAFControl import STEPCAFControl_Writer
+    from OCP.STEPControl import STEPControl_AsIs
+    from OCP.Interface import Interface_Static
+    from OCP.Quantity import Quantity_Color, Quantity_TOC_RGB
+    from OCP.TopExp import TopExp_Explorer
+    from OCP.TopAbs import TopAbs_FACE
+    from OCP.TopoDS import TopoDS
+    doc = TDocStd_Document(TCollection_ExtendedString('stl2prism'))
+    shape_tool = XCAFDoc_DocumentTool.ShapeTool_s(doc.Main())
+    color_tool = XCAFDoc_DocumentTool.ColorTool_s(doc.Main())
+    for shape, name in zip(shapes, names):
+        label = shape_tool.AddShape(shape, False)
+        TDataStd_Name.Set_s(label, TCollection_ExtendedString(str(name)))
+        if colours:
+            exp = TopExp_Explorer(shape, TopAbs_FACE)
+            while exp.More():
+                face = TopoDS.Face_s(exp.Current())
+                rgb = SURFACE_COLOURS[_surface_kind(face)]
+                sub = shape_tool.AddSubShape(label, face)
+                if not sub.IsNull():
+                    color_tool.SetColor(sub, Quantity_Color(*rgb, Quantity_TOC_RGB),
+                                        XCAFDoc_ColorSurf)
+                exp.Next()
+    Interface_Static.SetCVal_s('write.step.schema', schema)
+    w = STEPCAFControl_Writer()
+    w.SetColorMode(bool(colours))
+    w.SetNameMode(True)
+    w.Transfer(doc, STEPControl_AsIs)
     w.Write(path)
 
 
@@ -301,11 +855,155 @@ def faceted_fallback(mesh, path, angular_tol=5e-3, min_face_frac=0.5,
     return stats
 
 
-def faceted_solid(mesh, angular_tol=5e-3, min_face_frac=0.5, verbose=True):
-    """Sew triangles into a solid and unify coplanar faces; nothing written.
+def planar_groups(mesh, angle_tol=1e-3):
+    """Coplanar-connected face groups (list of index arrays), via the
+    face-adjacency graph restricted to adjacencies with a dihedral below
+    angle_tol (radians)."""
+    import networkx as nx
+    adj = mesh.face_adjacency
+    ang = np.abs(mesh.face_adjacency_angles)
+    G = nx.Graph()
+    G.add_nodes_from(range(len(mesh.faces)))
+    G.add_edges_from(adj[ang <= angle_tol])
+    return [np.array(sorted(c)) for c in nx.connected_components(G)]
 
-    Returns (TopoDS_Shape, stats). Raises FacetedError rather than returning
-    a fragment that would pass as a valid solid.
+
+def _group_loops(mesh, faces):
+    """Boundary loops (lists of vertex indices) of a face group; None if the
+    boundary is not a set of simple closed loops."""
+    fset = set(faces.tolist())
+    tri = mesh.faces[faces]
+    # boundary edges: appear once among the group's directed edges
+    edges = np.vstack([tri[:, [0, 1]], tri[:, [1, 2]], tri[:, [2, 0]]])
+    key = np.sort(edges, axis=1)
+    _, idx, cnt = np.unique(key, axis=0, return_index=True, return_counts=True)
+    bnd = edges[idx[cnt == 1]]                     # directed, consistent with face winding
+    if len(bnd) < 3:
+        return None
+    nxt = {}
+    for a, b in bnd:
+        if a in nxt:
+            return None                             # vertex with two outgoing edges: not simple
+        nxt[int(a)] = int(b)
+    loops = []
+    seen = set()
+    for start in list(nxt):
+        if start in seen:
+            continue
+        loop = [start]
+        seen.add(start)
+        cur = nxt[start]
+        while cur != start:
+            if cur in seen or cur not in nxt:
+                return None
+            loop.append(cur)
+            seen.add(cur)
+            cur = nxt[cur]
+        if len(loop) >= 3:
+            loops.append(loop)
+    return loops
+
+
+def _planar_face_from_group(mesh, faces, normal):
+    """One planar OCC face (with holes) for a coplanar face group, or None."""
+    from OCP.gp import gp_Pnt, gp_Pln, gp_Dir, gp_Vec
+    from OCP.BRepBuilderAPI import BRepBuilderAPI_MakePolygon, BRepBuilderAPI_MakeFace
+    from OCP.ShapeFix import ShapeFix_Face
+    from OCP.BRepCheck import BRepCheck_Analyzer
+    loops = _group_loops(mesh, faces)
+    if not loops:
+        return None
+    V = mesh.vertices
+    # areas (projected on the plane) to find the outer loop
+    n = np.array(normal, float)
+    n = n / np.linalg.norm(n)
+    b0 = np.cross([0, 1, 0], n)
+    if np.linalg.norm(b0) < 1e-6:
+        b0 = np.cross([1, 0, 0], n)
+    b0 /= np.linalg.norm(b0)
+    b1 = np.cross(n, b0)
+
+    def area2d(loop):
+        P = V[loop]
+        u, v = P @ b0, P @ b1
+        return 0.5 * np.sum(u * np.roll(v, -1) - np.roll(u, -1) * v)
+    loops.sort(key=lambda l: -abs(area2d(l)))
+    outer, inners = loops[0], loops[1:]
+
+    def wire(loop):
+        mp = BRepBuilderAPI_MakePolygon()
+        for vi in loop:
+            mp.Add(gp_Pnt(*map(float, V[vi])))
+        mp.Close()
+        return mp.Wire()
+    c = V[outer].mean(axis=0)
+    pln = gp_Pln(gp_Pnt(*map(float, c)), gp_Dir(*map(float, n)))
+    mk = BRepBuilderAPI_MakeFace(pln, wire(outer), True)
+    if not mk.IsDone():
+        return None
+    for il in inners:
+        mk.Add(wire(il))
+    face = mk.Face()
+    fx = ShapeFix_Face(face)
+    fx.Perform()
+    face = fx.Face()
+    if not BRepCheck_Analyzer(face).IsValid():
+        return None
+    return face
+
+
+def reduce_mesh(mesh, reduce_tol, verbose=True, targets=(0.5, 0.7, 0.85, 0.93, 0.97)):
+    """Tolerance-driven decimation (Fusion 'Reduce by Tolerance'): the
+    strongest QEM reduction whose deviation from the original stays within
+    reduce_tol (both directions, p95 and max) and that stays watertight.
+    Returns (mesh, info)."""
+    try:
+        import fast_simplification as fs
+    except ImportError:
+        return mesh, {'reduced': False, 'reason': 'fast_simplification not installed'}
+    if reduce_tol <= 0 or len(mesh.faces) < 200:
+        return mesh, {'reduced': False}
+    from .pipeline import SAMPLE_SEED
+    best = None
+    ref_pts = mesh.sample(min(20000, max(4000, len(mesh.faces))), seed=SAMPLE_SEED)
+    for t in targets:
+        try:
+            v, f = fs.simplify(mesh.vertices, mesh.faces, target_reduction=t)
+        except Exception:
+            break
+        if len(f) >= 0.98 * len(mesh.faces):
+            break                                  # decimator made no progress
+        d = trimesh.Trimesh(v, f, process=True)
+        if len(d.faces) < 12 or not d.is_watertight or d.body_count != mesh.body_count:
+            break
+        # deviation both ways
+        _, d1, _ = trimesh.proximity.closest_point(d, ref_pts)
+        pts2 = d.sample(min(20000, max(4000, len(d.faces))), seed=SAMPLE_SEED)
+        _, d2, _ = trimesh.proximity.closest_point(mesh, pts2)
+        mx = max(d1.max(), d2.max())
+        if mx <= reduce_tol and abs(d.volume - mesh.volume) <= 0.005 * abs(mesh.volume):
+            best = (d, t, mx)
+        else:
+            break
+    if best is None:
+        return mesh, {'reduced': False}
+    d, t, mx = best
+    if verbose:
+        print(f"[reduce] {len(mesh.faces)} -> {len(d.faces)} triangles "
+              f"(max deviation {mx:.3f} mm <= {reduce_tol})")
+    return d, {'reduced': True, 'faces_before': int(len(mesh.faces)),
+               'faces_after': int(len(d.faces)), 'max_dev': float(mx)}
+
+
+def faceted_solid(mesh, angular_tol=5e-3, min_face_frac=0.5, verbose=True,
+                  merge_planar=True):
+    """Sew the mesh into a solid; nothing written.
+
+    Coplanar triangle groups become ONE planar face each (with holes)
+    before sewing — far fewer OCC faces than one-per-triangle, and no
+    reliance on UnifySameDomain to merge them afterwards; curved regions
+    stay triangles. Returns (TopoDS_Shape, stats). Raises FacetedError
+    rather than returning a fragment that would pass as a valid solid.
     """
     from OCP.gp import gp_Pnt
     from OCP.BRepBuilderAPI import (BRepBuilderAPI_MakePolygon,
@@ -316,7 +1014,19 @@ def faceted_solid(mesh, angular_tol=5e-3, min_face_frac=0.5, verbose=True):
     sew = BRepBuilderAPI_Sewing(1e-3)
     V = mesh.vertices
     n_added = 0
-    for tri in mesh.faces:
+    n_planar_faces = 0
+    as_triangles = np.ones(len(mesh.faces), bool)
+    if merge_planar:
+        for grp in planar_groups(mesh):
+            if len(grp) < 3:                       # pairs (quads) are left to unify
+                continue
+            f = _planar_face_from_group(mesh, grp, mesh.face_normals[grp[0]])
+            if f is not None:
+                sew.Add(f)
+                n_added += 1
+                n_planar_faces += 1
+                as_triangles[grp] = False
+    for tri in mesh.faces[as_triangles]:
         p = BRepBuilderAPI_MakePolygon()
         for vi in tri:
             p.Add(gp_Pnt(*map(float, V[vi])))
@@ -377,6 +1087,7 @@ def faceted_solid(mesh, angular_tol=5e-3, min_face_frac=0.5, verbose=True):
               f"is an open shell, not a closed solid")
 
     return solid2, {
-        'faces_in': n_added, 'faces_out': faces2, 'shells': n_shells,
+        'faces_in': int(len(mesh.faces)), 'faces_out': faces2, 'shells': n_shells,
         'free_edges': free_edges, 'naked_edges': naked2, 'volume': vol,
+        'planar_faces_merged': n_planar_faces,
         'is_solid': bool(valid and naked2 == 0)}
