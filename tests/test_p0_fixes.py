@@ -199,3 +199,22 @@ def test_jittered_dense_mesh_is_a_scan(tmp_path):
     m = load_mesh(p)
     assert mean_dihedral_deg(m) < 8 and coplanar_fraction(m) < 0.02
     assert classify(m, verbose=False, scan_min_faces=1000) is True
+
+
+def test_real_scans_with_some_coplanar_pairs_are_scans():
+    """Regression: the two real scans measure 3.6% and 4.3% coplanar pairs
+    (mean dihedral 3.4/4.1 deg). A 2% cutoff sent Mesh_90p (2.17M faces)
+    down the CAD path — no repair/reduce, a 40+ minute run. The cutoff must
+    sit between the scans (~4%) and the CAD exports (30-66%)."""
+    from stl2prism.mesh_prep import (SCAN_MAX_COPLANAR_FRAC, SCAN_DIHEDRAL_DEG,
+                                     SCAN_MIN_FACES)
+    measured_scans = [(2166597, 4.1, 0.0434), (709546, 3.4, 0.0358)]
+    measured_cad = [(4200, 11.2, 0.664), (1644, 25.1, 0.468), (301220, 6.5, 0.303),
+                    (25180, 30.0, 0.500)]
+    for n, dih, cop in measured_scans:
+        assert n > SCAN_MIN_FACES and dih < SCAN_DIHEDRAL_DEG
+        assert cop < SCAN_MAX_COPLANAR_FRAC, 'real scan would be treated as CAD'
+    for n, dih, cop in measured_cad:
+        assert cop >= SCAN_MAX_COPLANAR_FRAC or dih >= SCAN_DIHEDRAL_DEG \
+            or n <= SCAN_MIN_FACES
+    assert 2 * 0.0434 < SCAN_MAX_COPLANAR_FRAC < 0.303 / 2, 'keep margin both ways'

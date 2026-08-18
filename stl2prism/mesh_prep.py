@@ -216,10 +216,13 @@ def _load_scaled(path, units, verbose):
 
 
 # Fraction of face adjacencies that are exactly coplanar (< 0.06 deg). CAD
-# exporters triangulate every planar face, so a CAD export has many; a scan
-# has essentially none. Used with the dihedral mean and the face count so a
-# very finely tessellated CAD part is not mistaken for a scan.
-SCAN_MAX_COPLANAR_FRAC = 0.02
+# exporters triangulate every planar face, so a CAD export has many (30-66%
+# on the CAD samples, 50% on a very fine synthetic export); a scan has few
+# but not none (Mesh_90p 4.3%, rc2-clean-controller 3.6%: flat scanned
+# regions do produce some pairs within 1e-3 rad). Used with the dihedral
+# mean and the face count so a very finely tessellated CAD part is not
+# mistaken for a scan. 0.02 misrouted both real scans to the CAD path.
+SCAN_MAX_COPLANAR_FRAC = 0.10
 
 
 def coplanar_fraction(m, cap=400000, tol_rad=1e-3):
@@ -359,7 +362,9 @@ def split_bodies(m, is_scan, verbose=True):
     if verbose:
         msg = f"[bodies] {len(parts)} connected bodies"
         if dropped:
-            lost = total - sum(len(p.faces) for p in kept)
+            # count what was dropped directly: split() can re-process parts,
+            # so 'total minus kept' is not exact
+            lost = sum(len(p.faces) for p in parts if sliver(p))
             msg += (f"; dropping {dropped} sliver(s) with no volume "
                     f"({lost} faces, {lost / total:.2%} of the mesh)")
         n_voids = sum(len(b.voids) for b in bodies)
