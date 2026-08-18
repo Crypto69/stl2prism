@@ -1,26 +1,30 @@
 # stl2prism
 
-Convert STL or OBJ meshes into **prismatic STEP solids** — clean BREP with true
-planes and cylinders you can sketch on, dimension against, and constrain —
-replicating the core of Fusion 360's paid "Prismatic" mesh conversion.
-Guaranteed output: when a mesh isn't prismatic, the tool falls back to a
-faceted (but valid, manifold, coplanar-merged) STEP solid instead of failing.
+Convert STL / OBJ (also PLY, OFF, 3MF, GLB) meshes into **prismatic STEP
+solids** — clean BREP with true planes, cylinders and cones you can sketch
+on, dimension against, and constrain — replicating the core of Fusion 360's
+paid "Prismatic" mesh conversion, plus something Fusion does not give you: an
+**editable CadQuery script** of the sketches and extrudes it recognised.
+Guaranteed output: when part of a mesh isn't prismatic, that region is
+patched with exact faceted geometry; when none of it is, the tool falls back
+to a faceted (valid, manifold, coplanar-merged, tolerance-reduced) STEP solid
+instead of failing.
 
 ## Install
 
 ```bash
 pip install .            # core
-pip install .[scan]      # + pymeshlab, for 3D-scan repair (Poisson)
+pip install .[scan]      # + pymeshlab, for 3D-scan repair (Poisson; Linux x86_64)
 ```
 
 ## Usage
 
 ```bash
-stl2prism part.stl                 # -> part.step
-stl2prism part.obj                 # OBJ works the same way
-stl2prism part.stl out.step --tol 0.05
+stl2prism part.stl                 # -> part.step  (+ part.py CadQuery script)
 stl2prism part.obj --units cm      # file is in cm (Fusion's OBJ default); scale to mm
-stl2prism scan.stl --force-prismatic   # attempt prismatic on scan input
+stl2prism part.stl out.step --tol 0.05 --accept-max 0.3 --accept-vol-pct 3
+stl2prism scan.stl --reduce-tol 0.1     # faceted output: simplify curved regions within 0.1 mm
+stl2prism scan.stl --force-prismatic    # attempt prismatic on scan input
 ```
 
 Or from Python:
@@ -28,18 +32,19 @@ Or from Python:
 ```python
 from stl2prism import run
 result = run("part.stl", "part.step")
-print(result["mode"], result["metrics"])   # 'prismatic' | 'faceted'
+print(result["mode"], result["metrics"], result["script"])   # 'prismatic' | 'faceted' | 'mixed'
 ```
 
 Exit code 0 on success. The log reports which mode produced the output and
-the measured fidelity (surface deviation, volume error) of prismatic results.
+the measured fidelity (surface deviation both ways, volume error) of
+prismatic results.
 
 ## Web app
 
-A browser UI for the same pipeline: drag an STL or OBJ in, inspect it in 3D,
-set the acceptance tolerances, convert, and download the STEP with a
-fidelity report (mode, surface deviation vs. your limits, volume error,
-face counts and surface types for both files).
+A browser UI for the same pipeline: drag a mesh in, inspect it in 3D, set
+the acceptance tolerances, convert, and download the STEP (and the CadQuery
+script) with a fidelity report (mode, surface deviation vs. your limits,
+volume error, face counts and surface types, patched regions).
 
 ### Run locally (dev)
 
@@ -69,102 +74,122 @@ The pipeline implements the classical reverse-engineering architecture
 (segmentation -> primitive fitting -> constraint solving -> rebuild), using
 the *extrusion-cylinder* decomposition strategy rather than free surface
 stitching — which sidesteps the brittle face-intersection/topology problem
-that makes general mesh-to-BREP hard.
+that makes general mesh-to-BREP hard — extended with lofts, cross-axis
+features and local patching so that one axis need not explain everything.
 
-1. **Prep** (`mesh_prep`) — load, merge, repair. Input is STL or OBJ
-   (geometry only: OBJ per-corner normals/UVs are merged away, `.mtl`
-   materials are ignored, quads/n-gons are triangulated, and multiple
-   objects are combined into one mesh). Neither format records units and
-   the pipeline works in mm, so `--units cm|in|m` (UI: "Input units")
-   scales the mesh on load. Scan-like input (dense
-   tessellation, identified by a low mean dihedral angle) is rebuilt via
-   screened Poisson reconstruction and decimated with topology preservation.
-   Being non-watertight is treated as *needs repair*, not as *is a scan*: a
-   CAD export with an unstitched seam is repaired and still gets the
-   prismatic treatment.
+1. **Prep** (`mesh_prep`) — load, weld, repair. Vertices closer than 1e-6 of
+   the bounding box are welded (exporters leave micron cracks that split a
+   part), duplicate/degenerate faces dropped, OBJ per-corner normals/UVs
+   merged away. Units (`--units mm|cm|in|ft|m`) scale the mesh on load; the UI
+   suggests a unit from the bounding box. Connected shells are split into
+   bodies; a shell *inside* another is an internal cavity and is attached to
+   its body as a void, so a hollow part becomes one hollow solid. Scan-like
+   input (dense, low dihedral, no exactly-coplanar facets) is rebuilt via the
+   pymeshlab repair ladder and decimated with topology preservation.
 2. **Axis discovery** (`extrusion`) — face normals are clustered on the
-   Gaussian sphere; the top candidate axes (snapped to global XYZ within
-   5°) are each *scored* by the volume fraction of the part that has a
-   constant cross-section along them. Best axis wins. This is what lets a
-   part whose largest face is tilted still be recognised as an extrusion
-   along a different direction.
-3. **Slab decomposition** — planar faces perpendicular to the axis vote
-   for discrete height levels; between consecutive levels the mesh is
-   cross-sectioned (several times per slab, to verify constancy) yielding
-   profile polygons with holes.
-4. **Profile fitting** (`profile_fit`) — each polygon ring is segmented
-   into **lines and circular arcs** by greedy split: fit one primitive to
-   a span, split at max-deviation point if over tolerance, recurse.
-   Circles use the Taubin algebraic fit (bias-corrected, noise-robust).
-   Full-circle rings are detected directly.
-5. **Constraint snapping** (GlobFit-lite, `rebuild._global_snap`) —
-   near-axis-aligned lines are squared up; radii and centers are clustered
-   *globally across all slabs* and snapped to cluster means, then arc
-   endpoints are re-projected onto the snapped circles and each ring chain
-   re-closed. This is what turns facet-noise families like
-   r = 5.242..5.257 into a single r = 5.24 design radius.
-6. **Cross-axis features** (`features`) — cylindrical bores not parallel
-   to the main axis (e.g. screw holes through a side wall) are recovered
-   independently: curved facet regions are clustered, the cylinder axis is
-   taken from the null-space of the region's normal covariance (all
-   cylinder normals are perpendicular to its axis), radius/center from a
-   Taubin fit in the perpendicular plane, verified by radial-normal
-   alignment, coaxial fragments merged — then boolean-subtracted.
-7. **Rebuild + gate** (`rebuild`, `pipeline`) — slabs are extruded with
-   CadQuery/OpenCascade and unioned. The result is *validated against the
-   input mesh* (sampled surface deviation + volume error); only if it
-   passes (default: p95 <= 0.25 mm, volume within 2%) is the prismatic
-   solid written. Otherwise the tool falls back to the faceted converter
-   (triangle sewing -> manifold solid -> coplanar-face unification ->
-   AP214 STEP with an explicit MANIFOLD_SOLID_BREP).
-8. **Multi-body files** — a mesh holding several disconnected bodies (an
-   assembly export, a controller with knobs and sticks) is split into
-   bodies first; steps 2-7 run per body, and every body is written into
-   the *one* STEP as a separate solid, so CAD imports it as multiple
-   bodies of one component. The result reports `mixed` when some bodies
-   went prismatic and others faceted, with a per-body table. Bodies that
-   cannot be closed (under 4 triangles; on scan input also stray blobs
-   under 100 triangles and 0.1% of the mesh) are dropped and counted.
+   Gaussian sphere; each candidate axis is offered raw *and* snapped to
+   global XYZ (when within 5°) and *scored* by the volume fraction of the
+   part that has a constant (or linearly varying) cross-section along it,
+   with the perpendicular-face area as a tie-breaker. Snapping is a
+   hypothesis, not a decision: a part tilted 3° keeps its true axis.
+3. **Slab decomposition** — planar faces perpendicular to the axis vote for
+   height levels; each slab is cross-sectioned at several heights *and* just
+   inside its ends. Where the section starts or stops changing (a chamfer,
+   countersink or boss top) or its topology changes, a level is inserted by
+   bisection and snapped to a mesh-vertex height. Constancy compares section
+   *shapes* (IoU + boundary distance), not just areas.
+4. **Profile fitting** (`profile_fit`) — each polygon ring is segmented into
+   **lines and circular arcs**: recursive split (at real corners first),
+   Taubin circle fits with deviation measured against the whole polyline
+   (chord interiors included, so a big circle through the ends of a straight
+   wall cannot pass), a cyclic merge pass, boundary refinement between
+   neighbours, arc radii/centres re-fitted on the mesh vertices (which lie
+   exactly on the CAD surface — section vertices sit on chords), and
+   junction solving: line/line at their intersection, tangent line/arc
+   fillets solved exactly, lines squared to the dominant frame.
+5. **Constraint snapping** (GlobFit-lite, `rebuild._global_snap`) — radii and
+   centres are clustered *globally across all slabs* and snapped to cluster
+   means. This turns facet-noise families like r = 5.242..5.257 into a
+   single design radius.
+6. **Rebuild** (`rebuild`) — constant slabs are extruded; slabs whose section
+   varies linearly (drafts, chamfers, countersinks, tapered ribs) are
+   **lofted with analytic faces** — planes between matched lines, cones /
+   cylinders between matched arcs and circles. Equal consecutive slabs are
+   merged, Booleans use a fuzzy tolerance, and a finishing pass drops
+   micro-edges, unifies same-domain faces and checks validity.
+7. **Cross-axis features** (`features`) — curved facet regions are split
+   into coaxial primitives and classified: **cylinders** (bores not parallel
+   to the main axis, radius/axis refined by least squares on the vertices,
+   blind ends kept blind) and **cones** (countersinks, chamfered hole
+   mouths) are subtracted as analytic features.
+8. **Validate + gate** (`pipeline`) — deterministic, *symmetric* deviation
+   (mesh → solid on area-uniform samples plus every vertex; solid → mesh),
+   bore deviation, volume error. Passing → prismatic. Failing locally →
+   **hybrid patch** (`hybrid`): the deviating regions are boxed and replaced
+   by the exact faceted geometry, `(P − B) ∪ (F ∩ B)`, and re-checked.
+   Failing everywhere → faceted route: coplanar triangles merged into single
+   planar faces *before* sewing, curved regions decimated within
+   `--reduce-tol`, sewn into a manifold solid.
+9. **Export** — one STEP (AP214) with **named bodies and faces coloured by
+   surface type**, plus a **CadQuery script** (`<out>.py`) that rebuilds the
+   recognised sketches, extrudes, lofts and feature cuts with named
+   parameters (radii `R_n`, heights `H_n`) — edit a value, re-run, get a new
+   STEP.
 
 ### Research basis
 
 The architecture follows the standard two-phase scan-to-BREP paradigm
 (segmentation + fitting) established by Schnabel et al.'s Efficient RANSAC
 (2007) and surveyed in recent literature; the extrusion-cylinder
-decomposition is the classical analogue of Point2Cyl (CVPR 2022); global
-constraint snapping follows GlobFit (Li et al.); validation-gated output
-with honest fallback is our own addition. Neural pipelines (Point2CAD,
-ParseNet, CAD-Recode) were evaluated and rejected for this tool: they
-need GPU inference stacks and mostly carry non-commercial licenses.
+decomposition is the classical analogue of Point2Cyl (CVPR 2022) / PrismCAD;
+global constraint snapping follows GlobFit (Li et al.); validation-gated
+output with honest fallback and local patching is our own addition. See
+[DEEP-REVIEW.md](DEEP-REVIEW.md) for the full review, comparison with Fusion
+360 / commercial reverse-engineering tools and the roadmap; the working
+to-do list is [FIX-PLAN.md](FIX-PLAN.md).
 
-## Measured results (v0.1)
+## Measured results (v0.2)
 
-| part | mode | faces (vs faceted) | p95 dev | max dev | vol err |
+Default gates (fit tol 0.08 mm, p95 ≤ 0.25, max ≤ 0.26, bore ≤ 0.10 mm,
+volume ≤ 2 %). "faces" = ADVANCED_FACE count in the STEP.
+
+| part | triangles | mode | faces | max dev | vol err |
 |---|---|---|---|---|---|
-| servo_bracket_1 | prismatic | 76 (was 470)  | 0.023 mm | 0.10 mm | 0.14% |
-| servo_bracket_2 | prismatic | 35 (was 582)  | 0.021 mm | 0.19 mm | 0.36% |
-| frame           | prismatic | 70 (was 646)  | 0.103 mm | 1.95 mm | 1.29% |
-| Mesh_90p (scan) | faceted   | ~40k          | —        | —       | —      |
+| servo_bracket_1 | 1,644 | prismatic | 60 (was 76) | 0.066 mm | 0.03 % |
+| servo_bracket_2 | 1,712 | prismatic | 28 (was 35) | 0.035 mm | 0.07 % |
+| top_arm_1 | 3,896 | prismatic (chamfered bosses as cones) | 45 (was 1,245 faceted) | 0.071 mm | 0.18 % |
+| top_arm_2 | 3,816 | prismatic | 41 (was 1,213 faceted) | 0.074 mm | 0.18 % |
+| joystick_claw_1 | 2,134 | prismatic, fillet region patched | 671 (was 817 faceted) | 0.050 mm | 0.09 % |
+| joystick_claw_2 | 1,902 | faceted (reduced) | 341 (was 811) | — | 0.05 % |
+| frame | 4,200 | faceted (reduced) — complex blends | 516 (was 646) | — | 0.01 % |
+| Mesh_90p (scan) | — | faceted | — | — | — |
 
-## Limitations (v0.1)
+Synthetic CAD parts (see `tests/test_matrix.py`): plates with holes/fillets,
+obround slots, hex pockets, stepped shafts, cross and blind holes, hollow
+parts, drafted blocks, chamfers, countersinks, small interior steps, tilted
+and rotated parts, tiny (3 mm) and huge (1.5 m) parts all convert to the
+exact face count with sub-0.1 mm deviation.
 
-* **Single primary axis per body.** One extrusion direction per body (plus
-  cross-axis cylindrical holes). Bodies needing several extrusion
-  directions for solid material (not just holes) get the faceted fallback.
-* **Tapered/lofted features** — gussets, draft angles, chamfered ribs —
-  are approximated by their mid-height section. Deviation shows in the
-  report; the frame's 1.95 mm max is its countersink cones.
-* **Countersinks/cones, spheres, tori, fillets between slabs** are not
-  fitted as analytic surfaces yet. Fillets *within* a profile plane are
-  captured (they're arcs).
-* Scan input defaults to faceted; `--force-prismatic` overrides.
+## Limitations (v0.2)
 
-## Roadmap ideas
+* **Single primary axis per body** for solid material (plus cross-axis
+  cylindrical holes and conical countersinks). Bodies needing several
+  extrusion directions for material get a local faceted patch, or the
+  faceted fallback.
+* **Spheres, tori (edge fillets), free-form blends** are not fitted as
+  analytic surfaces; they are patched with exact facets when local, and
+  cause a faceted fallback when they dominate.
+* Scan input defaults to faceted (`--force-prismatic` overrides); the scan
+  repair ladder needs pymeshlab (Linux x86_64).
+* The CadQuery script reproduces the recognised extrusion structure; patched
+  regions are not in the script.
 
-Multi-region decomposition (per-region axes + boolean assembly), cone
-fitting for countersinks, sketch-constraint export (tangency, symmetry),
-and emitting the CadQuery build script itself so the output is not just a
-STEP but an editable parametric program.
+## Roadmap
+
+A segmentation-first "face-group engine" (regions → plane/cylinder/cone/
+sphere/torus fits → sewn B-rep) for multi-direction parts, sphere/torus
+features, hole/fillet feature recognition on the solid, and a Fusion 360
+script export — see [FIX-PLAN.md](FIX-PLAN.md).
 
 ## License
 
