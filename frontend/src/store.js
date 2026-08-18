@@ -6,11 +6,13 @@ export const UNITS = [
   { key: 'mm', label: 'millimetres', scale: 1 },
   { key: 'cm', label: 'centimetres', scale: 10 },
   { key: 'in', label: 'inches', scale: 25.4 },
+  { key: 'ft', label: 'feet', scale: 304.8 },
   { key: 'm', label: 'metres', scale: 1000 },
 ]
 
 export const DEFAULT_PARAMS = {
   units: 'mm',
+  reduce_tol: 0.05,
   tol: 0.08,
   accept_p95: 0.25,
   accept_max: 0.26,
@@ -43,6 +45,14 @@ export const useConvertStore = defineStore('convert', {
     downloadUrl: (s) =>
       s.status === 'done' && s.result?.ok
         ? `/api/jobs/${s.jobId}/download`
+        : null,
+    scriptUrl: (s) =>
+      s.status === 'done' && s.result?.ok && s.result?.has_script
+        ? `/api/jobs/${s.jobId}/script`
+        : null,
+    fusionScriptUrl: (s) =>
+      s.status === 'done' && s.result?.ok && s.result?.has_script
+        ? `/api/jobs/${s.jobId}/fusion-script`
         : null,
   },
 

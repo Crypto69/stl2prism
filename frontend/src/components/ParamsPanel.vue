@@ -1,5 +1,5 @@
 <script setup>
-import { ref } from 'vue'
+import { computed, ref } from 'vue'
 import { useConvertStore, DEFAULT_PARAMS, UNITS } from '../store'
 
 const store = useConvertStore()
@@ -35,8 +35,17 @@ const fields = [
     lower: 'Stricter overall shape check.',
     higher: 'More forgiving — rarely needs changing either way.',
   },
+  {
+    key: 'reduce_tol', label: 'Faceted reduce tolerance', unit: 'mm', step: 0.01,
+    blurb: 'Only used for the faceted copy (when a clean solid is not possible, or for scans). Curved regions are simplified — fewer triangles — as long as the simplified surface stays within this distance of the original. Like Fusion’s “Reduce by tolerance”. Set to 0 to keep every triangle.',
+    lower: 'Keeps more triangles; the faceted copy is closer to the original mesh.',
+    higher: 'Fewer triangles and a smaller STEP; small details may be smoothed.',
+  },
 ]
 
+const suggestion = computed(() => store.inputStats?.units_suggestion || null)
+const longest = computed(() =>
+  store.inputStats ? Math.max(...store.inputStats.bbox_mm).toFixed(2) : '')
 const openInfo = ref(null)
 const toggleInfo = (key) => { openInfo.value = openInfo.value === key ? null : key }
 const isDefault = (key) => store.params[key] === DEFAULT_PARAMS[key]
@@ -65,9 +74,13 @@ const isDefault = (key) => store.params[key] === DEFAULT_PARAMS[key]
       </select>
     </div>
     <div v-if="openInfo === 'units'" class="explain">
-      <p>STL and OBJ files do not say what unit they are in — they are just numbers. Every program guesses. This tool works in millimetres, so tell it what the file meant and it scales the mesh before doing anything else. All the limits below are in mm.</p>
+      <p>Mesh files do not say what unit they are in — they are just numbers. Every program guesses. This tool works in millimetres, so tell it what the file meant and it scales the mesh before doing anything else. All the limits below are in mm.</p>
       <p><span class="dir">Tip:</span> Fusion 360 assumes centimetres for OBJ. If a part looks 10× too small here but right in Fusion, pick cm.</p>
     </div>
+    <p v-if="suggestion && suggestion !== store.params.units" class="hint">
+      This file looks like it might be in <b>{{ suggestion }}</b> (its longest side is
+      {{ longest }} units). <button class="link" @click="store.params.units = suggestion">Use {{ suggestion }}</button>
+    </p>
 
     <header class="head gate">
       <h2 class="micro">Acceptance gate</h2>
@@ -115,6 +128,8 @@ const isDefault = (key) => store.params[key] === DEFAULT_PARAMS[key]
 
 <style scoped>
 .params { display: flex; flex-direction: column; gap: 10px; }
+.hint { font-size: 12px; opacity: 0.85; }
+.link { background: none; border: none; color: var(--accent, #5ad2ea); cursor: pointer; text-decoration: underline; padding: 0; font: inherit; }
 .head { display: flex; justify-content: space-between; align-items: baseline; }
 .reset {
   background: none;

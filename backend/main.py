@@ -3,7 +3,10 @@ import os
 import re
 from typing import Literal
 
+from contextlib import asynccontextmanager
+
 from fastapi import FastAPI, HTTPException, UploadFile
+from fastapi.concurrency import run_in_threadpool
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
@@ -17,7 +20,19 @@ from .analysis import sanitize, mesh_stats
 _EXT_RE = re.compile(r'\.(' + '|'.join(e.lstrip('.') for e in SUPPORTED_EXTS)
                      + r')$', re.IGNORECASE)
 
-app = FastAPI(title='stl2prism')
+@asynccontextmanager
+async def _lifespan(app):
+    os.makedirs(jobs.DATA_DIR, exist_ok=True)
+    jobs.cleanup_old()
+    yield
+
+
+app = FastAPI(title='stl2prism', lifespan=_lifespan)
+
+
+def _write_preview(src, dst):
+    from stl2prism.mesh_prep import load_mesh
+    load_mesh(src).export(dst)
 
 # Dev convenience: the Vite dev server runs on another port. In production
 # the frontend is served from this same app, so this allows nothing new.
@@ -39,14 +54,10 @@ class ConvertParams(BaseModel):
     accept_vol_pct: float = Field(2.0, gt=0, le=50,
                                   description='max volume error, %')
     force_prismatic: bool = False
+    reduce_tol: float = Field(0.05, ge=0, le=5,
+                              description='faceted output: decimate curved regions within this deviation, mm (0 = off)')
     # STL/OBJ carry no units; this says what the file's numbers mean.
-    units: Literal['mm', 'cm', 'm', 'in'] = 'mm'
-
-
-@app.on_event('startup')
-def _startup():
-    os.makedirs(jobs.DATA_DIR, exist_ok=True)
-    jobs.cleanup_old()
+    units: Literal['mm', 'cm', 'm', 'in', 'ft'] = 'mm'
 
 
 @app.post('/api/jobs')
@@ -66,7 +77,12 @@ async def create_job(file: UploadFile):
                 raise HTTPException(413, 'file too large')
             out.write(chunk)
     try:
-        stats = mesh_stats(os.path.join(d, input_name))
+        stats = await run_in_threadpool(mesh_stats, os.path.join(d, input_name))
+        if not input_name.endswith(('.stl', '.obj')):
+            # the browser viewer parses STL/OBJ itself; other formats get a
+            # server-side STL preview
+            await run_in_threadpool(_write_preview, os.path.join(d, input_name),
+                                    os.path.join(d, 'preview.stl'))
     except Exception as e:
         raise HTTPException(400, f'could not read mesh: {e}')
     with jobs._lock:
@@ -95,6 +111,44 @@ def job_state(job_id: str):
     if state is None:
         raise HTTPException(404, 'unknown job')
     return state
+
+
+@app.get('/api/jobs/{job_id}/preview')
+def preview(job_id: str):
+    job = jobs.get(job_id)
+    if job is None:
+        raise HTTPException(404, 'unknown job')
+    path = os.path.join(jobs.job_dir(job_id), 'preview.stl')
+    if not os.path.exists(path):
+        raise HTTPException(404, 'no preview')
+    return FileResponse(path, media_type='model/stl')
+
+
+@app.get('/api/jobs/{job_id}/script')
+def script(job_id: str):
+    """The CadQuery script that rebuilds the recognised extrusion structure."""
+    job = jobs.get(job_id)
+    if job is None:
+        raise HTTPException(404, 'unknown job')
+    path = os.path.join(jobs.job_dir(job_id), 'output.py')
+    if not os.path.exists(path):
+        raise HTTPException(404, 'no script')
+    stem = _EXT_RE.sub('', job.get('filename') or 'part')
+    safe = re.sub(r'[^\w.-]+', '_', stem) or 'part'
+    return FileResponse(path, media_type='text/x-python', filename=f'{safe}.py')
+
+
+@app.get('/api/jobs/{job_id}/fusion-script')
+def fusion_script(job_id: str):
+    job = jobs.get(job_id)
+    if job is None:
+        raise HTTPException(404, 'unknown job')
+    path = os.path.join(jobs.job_dir(job_id), 'output_fusion.py')
+    if not os.path.exists(path):
+        raise HTTPException(404, 'no script')
+    stem = _EXT_RE.sub('', job.get('filename') or 'part')
+    safe = re.sub(r'[^\w.-]+', '_', stem) or 'part'
+    return FileResponse(path, media_type='text/x-python', filename=f'{safe}_fusion.py')
 
 
 @app.get('/api/jobs/{job_id}/download')

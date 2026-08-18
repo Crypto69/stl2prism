@@ -28,10 +28,13 @@ def main():
                 accept_vol_pct=params['accept_vol_pct'],
                 force_prismatic=params['force_prismatic'],
                 units=params.get('units', 'mm'),
+                reduce_tol=params.get('reduce_tol', 0.05),
                 verbose=True)
         # Pass the whole pipeline result through (mode, metrics, and for
         # multi-body files the per-body list and counts).
         result.update(r, ok=True, output_stats=step_stats(out_path))
+        result['has_script'] = bool(r.get('script'))
+        result.pop('script', None)     # server path; the API serves it by job id
     except Exception as e:
         traceback.print_exc()
         result['error'] = f'{type(e).__name__}: {e}'

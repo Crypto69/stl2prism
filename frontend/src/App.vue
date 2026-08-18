@@ -10,19 +10,31 @@ const buffer = shallowRef(null)
 const dragOver = ref(false)
 const fileInput = ref(null)
 
-const ACCEPT = ['stl', 'obj']
+const ACCEPT = ['stl', 'obj', 'ply', 'off', '3mf', 'glb', 'gltf']
 
 async function takeFile(file) {
   const kind = file?.name.split('.').pop().toLowerCase()
   if (!file || !ACCEPT.includes(kind)) {
     store.$patch({
       status: 'error',
-      error: `That is not a ${ACCEPT.map((e) => '.' + e).join(' or ')} file.`,
+      error: `That is not one of ${ACCEPT.map((e) => '.' + e).join(', ')}.`,
     })
     return
   }
-  buffer.value = markRaw({ data: await file.arrayBuffer(), kind })
-  store.upload(file)
+  if (kind === 'stl' || kind === 'obj') {
+    buffer.value = markRaw({ data: await file.arrayBuffer(), kind })
+    store.upload(file)
+    return
+  }
+  // other formats: the server converts them to an STL preview on upload
+  buffer.value = null
+  await store.upload(file)
+  if (store.jobId) {
+    try {
+      const res = await fetch(`/api/jobs/${store.jobId}/preview`)
+      if (res.ok) buffer.value = markRaw({ data: await res.arrayBuffer(), kind: 'stl' })
+    } catch (e) { /* preview is optional */ }
+  }
 }
 
 function onDrop(e) {
@@ -62,7 +74,7 @@ const canConvert = computed(
                     stroke="var(--line)" stroke-width="1" />
             </svg>
           </div>
-          <p class="big">Drop an STL or OBJ here</p>
+          <p class="big">Drop an STL, OBJ, PLY, OFF, 3MF or GLB here</p>
           <p class="sub">or</p>
           <button class="browse" @click="fileInput.click()">Choose a file</button>
         </div>
@@ -72,7 +84,7 @@ const canConvert = computed(
           @click="fileInput.click()"
         >Replace file</button>
         <input
-          ref="fileInput" type="file" accept=".stl,.obj" hidden
+          ref="fileInput" type="file" accept=".stl,.obj,.ply,.off,.3mf,.glb,.gltf" hidden
           @change="takeFile($event.target.files[0]); $event.target.value = ''"
         />
       </div>

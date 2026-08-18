@@ -19,10 +19,11 @@ def mesh_stats(path):
     # Same loader as the pipeline, so watertight/vertex/volume numbers here
     # describe the geometry the conversion will actually see (an OBJ with
     # per-corner normals would otherwise report as open with 4x the vertices).
-    from stl2prism.mesh_prep import load_mesh
+    from stl2prism.mesh_prep import load_mesh, suggest_units
     m = load_mesh(path)
     ext = m.bounding_box.primitive.extents
     stats = {
+        'units_suggestion': suggest_units(m),
         'file_size': os.path.getsize(path),
         'triangles': int(len(m.faces)),
         'vertices': int(len(m.vertices)),
@@ -62,7 +63,7 @@ def step_stats(path):
             name = m.group(1)
             if name == 'ADVANCED_FACE':
                 faces += 1
-            elif name == 'MANIFOLD_SOLID_BREP':
+            elif name in ('MANIFOLD_SOLID_BREP', 'BREP_WITH_VOIDS'):
                 solids += 1
             elif name in kinds:
                 kinds[name] += 1

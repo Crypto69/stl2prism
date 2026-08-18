@@ -94,9 +94,13 @@ const gates = computed(() => {
   const m = r.metrics
   const p = r.params
   const rows = [
-    { name: 'Surface deviation p95', value: m.dev_p95, limit: p.accept_p95, unit: 'mm' },
-    { name: 'Surface deviation max', value: m.dev_max, limit: p.accept_max, unit: 'mm' },
+    { name: 'Surface deviation p95 (mesh → solid)', value: m.dev_p95, limit: p.accept_p95, unit: 'mm' },
+    { name: 'Surface deviation max (mesh → solid)', value: m.dev_max, limit: p.accept_max, unit: 'mm' },
   ]
+  if (m.symmetric && m.rev_dev_p95 != null) {
+    rows.push({ name: 'Surface deviation p95 (solid → mesh)', value: m.rev_dev_p95, limit: p.accept_p95, unit: 'mm' })
+    rows.push({ name: 'Surface deviation max (solid → mesh)', value: m.rev_dev_max, limit: p.accept_max, unit: 'mm' })
+  }
   if (m.hole_dev_p95 != null) {
     rows.push({ name: `Bore deviation p95 (${m.holes_checked} bore${m.holes_checked === 1 ? '' : 's'})`,
                 value: m.hole_dev_p95, limit: p.accept_hole_max, unit: 'mm' })
@@ -105,6 +109,27 @@ const gates = computed(() => {
     rows.push({ name: 'Volume error', value: m.vol_err_pct, limit: p.accept_vol_pct, unit: '%' })
   }
   return rows.map((g) => ({ ...g, pass: g.value <= g.limit }))
+})
+
+// Extra facts about how the solid was made (patched regions, unverified volume).
+const notes = computed(() => {
+  const r = store.result
+  if (!r?.ok || bodies.value) return []
+  const m = r.metrics || {}
+  const out = []
+  if (r.mode === 'prismatic' && m.patched) {
+    out.push(`${m.patches} small region${m.patches === 1 ? '' : 's'} could not be expressed with planes, cylinders or cones and ${m.patches === 1 ? 'was' : 'were'} replaced by exact faceted geometry (about ${(100 * (m.bad_frac || 0)).toFixed(1)}% of the surface). The rest is clean.`)
+  }
+  if (m.vol_verified === false) {
+    out.push('The input mesh was not closed, so the volume check could not run; only the surface deviation was verified.')
+  }
+  if (r.mode === 'faceted' && m.reduce?.reduced) {
+    out.push(`Curved regions were simplified from ${m.reduce.faces_before.toLocaleString()} to ${m.reduce.faces_after.toLocaleString()} triangles within ${r.params?.reduce_tol} mm.`)
+  }
+  if (m.voids) {
+    out.push(`${m.voids} internal cavit${m.voids === 1 ? 'y was' : 'ies were'} recognised and subtracted, so the solid is hollow like the mesh.`)
+  }
+  return out
 })
 
 const outputRows = computed(() => {
@@ -207,7 +232,19 @@ const reduction = computed(() => {
         </tbody>
       </table>
 
+      <ul v-if="notes.length" class="notes">
+        <li v-for="(n, i) in notes" :key="i">{{ n }}</li>
+      </ul>
       <a class="download" :href="store.downloadUrl" download>Download STEP</a>
+      <a v-if="store.scriptUrl" class="download secondary" :href="store.scriptUrl" download>
+        Download CadQuery script (.py)
+      </a>
+      <a v-if="store.fusionScriptUrl" class="download secondary" :href="store.fusionScriptUrl" download>
+        Download Fusion 360 script (.py) — experimental
+      </a>
+      <p v-if="store.scriptUrl" class="hint">
+        The script rebuilds the recognised sketches and extrudes as an editable program — change a radius or height and re-run it to get a new STEP.
+      </p>
     </section>
 
     <section v-if="store.error" ref="verdictEl" class="errorbox">
@@ -223,6 +260,10 @@ const reduction = computed(() => {
 </template>
 
 <style scoped>
+.notes { margin: 8px 0; padding-left: 18px; font-size: 13px; opacity: 0.9; }
+.notes li { margin: 4px 0; }
+.download.secondary { opacity: 0.85; margin-top: 6px; }
+.hint { font-size: 12px; opacity: 0.8; }
 .report { display: flex; flex-direction: column; gap: 16px; }
 h2 { margin-bottom: 6px; }
 table { width: 100%; border-collapse: collapse; font-size: 13px; }
