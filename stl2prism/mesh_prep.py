@@ -12,15 +12,30 @@ class PrepError(RuntimeError):
 # Input formats accepted at the user-facing entry points (CLI, web upload).
 # trimesh picks the reader from the extension, so keep this list to formats
 # it reads without optional dependencies.
-SUPPORTED_EXTS = ('.stl', '.obj')
+SUPPORTED_EXTS = ('.stl', '.obj', '.ply', '.off', '.3mf', '.glb', '.gltf')
 
-# Neither STL nor OBJ records units; the pipeline works in millimetres (all
-# tolerances are mm), so input in another unit is scaled on load. Multiply
-# file coordinates by this to get mm.
-UNIT_SCALE = {'mm': 1.0, 'cm': 10.0, 'm': 1000.0, 'in': 25.4}
+# Mesh formats record no units (3MF/glTF nominally do, but exporters are
+# inconsistent); the pipeline works in millimetres (all tolerances are mm),
+# so input in another unit is scaled on load. Multiply file coordinates by
+# this to get mm. Same set as Fusion's Insert Mesh.
+UNIT_SCALE = {'mm': 1.0, 'cm': 10.0, 'm': 1000.0, 'in': 25.4, 'ft': 304.8}
 
 
-def load_mesh(path):
+def suggest_units(m):
+    """Guess the file's unit from its bounding box: a mechanical part is a
+    few mm to a metre or so. Returns one of UNIT_SCALE's keys; a hint for
+    the UI, never applied silently."""
+    ext = float(np.max(m.bounding_box.primitive.extents)) if len(m.vertices) else 0.0
+    if ext <= 0:
+        return 'mm'
+    if ext < 3.0:          # a 3 mm-max part is unlikely; probably metres or inches
+        return 'm' if ext < 0.5 else 'in'
+    if ext > 5000.0:       # 5 m in mm? more likely a micron/point export — keep mm
+        return 'mm'
+    return 'mm'
+
+
+def load_mesh(path, weld_tol=None):
     """Read an STL or OBJ into one clean, geometry-only Trimesh.
 
     OBJ exporters commonly write per-corner normals (`vn`) and UVs (`vt`);
@@ -29,6 +44,12 @@ def load_mesh(path):
     part reads as non-watertight with no face adjacency at all. We only care
     about geometry, so merge on position alone. Multiple `o`/`g` objects are
     concatenated by force='mesh'; a missing .mtl is only a warning.
+
+    Vertices closer than `weld_tol` (default: 1e-6 of the bounding-box
+    diagonal, at least 1e-4 model units) are welded. Exporters that
+    tessellate faces independently leave cracks of ~1e-5 between faces that
+    exact merging cannot close; without welding such a part splits into
+    several open bodies.
     """
     ext = os.path.splitext(path)[1].lower()
     if ext not in SUPPORTED_EXTS:
@@ -36,10 +57,60 @@ def load_mesh(path):
             f"unsupported input format '{ext or '(none)'}'; "
             f"expected one of: {', '.join(SUPPORTED_EXTS)}")
     m = trimesh.load(path, force='mesh')
+    return clean_mesh(m, weld_tol=weld_tol)
+
+
+def clean_mesh(m, weld_tol=None):
+    """Weld near-duplicate vertices, drop degenerate/duplicate faces."""
     m.merge_vertices(merge_tex=True, merge_norm=True)
+    weld_vertices(m, weld_tol)
     m.update_faces(m.nondegenerate_faces())
+    m.update_faces(m.unique_faces())
     m.remove_unreferenced_vertices()
     return m
+
+
+def weld_tolerance(m):
+    """Default welding tolerance: relative to size, with an absolute floor."""
+    diag = float(np.linalg.norm(m.bounding_box.primitive.extents)) \
+        if len(m.vertices) else 0.0
+    return max(1e-4, 1e-6 * diag)
+
+
+def weld_vertices(m, tol=None):
+    """Merge vertices within `tol` of each other (union-find over KD-tree
+    pairs), in place. Unlike grid rounding this cannot miss pairs that
+    straddle a rounding boundary."""
+    if len(m.vertices) < 2:
+        return
+    tol = weld_tolerance(m) if tol is None else float(tol)
+    if tol <= 0:
+        return
+    from scipy.spatial import cKDTree
+    V = m.vertices.view(np.ndarray)
+    pairs = cKDTree(V).query_pairs(tol, output_type='ndarray')
+    if len(pairs) == 0:
+        return
+    parent = np.arange(len(V))
+
+    def find(i):
+        while parent[i] != i:
+            parent[i] = parent[parent[i]]
+            i = parent[i]
+        return i
+    for a, b in pairs:
+        ra, rb = find(a), find(b)
+        if ra != rb:
+            parent[max(ra, rb)] = min(ra, rb)
+    roots = np.array([find(i) for i in range(len(V))])
+    uniq, inv = np.unique(roots, return_inverse=True)
+    newV = np.zeros((len(uniq), 3))
+    counts = np.bincount(inv, minlength=len(uniq)).astype(float)
+    for k in range(3):
+        newV[:, k] = np.bincount(inv, weights=V[:, k], minlength=len(uniq)) / counts
+    faces = inv[m.faces]
+    m.vertices = newV
+    m.faces = faces
 
 
 # Mean dihedral angle (degrees) below which geometry is treated as a scan.
@@ -85,36 +156,48 @@ def load_and_prep(path, target_faces=40000, verbose=True,
 def load_and_prep_bodies(path, target_faces=40000, verbose=True,
                          scan_dihedral_deg=SCAN_DIHEDRAL_DEG,
                          scan_min_faces=SCAN_MIN_FACES, units='mm'):
-    """Like load_and_prep, but one prepared mesh per connected body.
+    """Like load_and_prep, but one prepared `Body` per solid.
 
     Returns (bodies, is_scan, n_dropped). Bodies are sorted largest first.
     Sliver bodies (see split_bodies) are dropped and counted; a body whose
     scan repair fails is dropped with a log line rather than failing the
-    whole file. Single-body files take exactly the load_and_prep path.
+    whole file. Internal voids are repaired like their bodies.
     """
     m = _load_scaled(path, units, verbose)
     is_scan = classify(m, verbose, scan_dihedral_deg, scan_min_faces)
-    parts, n_dropped = split_bodies(m, is_scan, verbose)
-    if len(parts) == 1:
-        return [repair(parts[0], is_scan, target_faces, verbose)], is_scan, n_dropped
+    groups, n_dropped = split_bodies(m, is_scan, verbose)
+    if len(groups) == 1 and not groups[0].voids:
+        return [Body(repair(groups[0].mesh, is_scan, target_faces, verbose))], \
+            is_scan, n_dropped
 
     if is_scan:
         _require_pymeshlab()   # fail once, loudly, not once per body
-    total = sum(len(p.faces) for p in parts)
+    total = sum(g.n_faces_total for g in groups)
     bodies = []
-    for i, p in enumerate(parts):
+    for i, g in enumerate(groups):
         # Share the decimation budget by size, with a floor so small bodies
         # keep enough facets to stay recognisable.
-        budget = max(1000, int(target_faces * len(p.faces) / total))
+        budget = max(1000, int(target_faces * len(g.mesh.faces) / total))
         if verbose and is_scan:
-            print(f"[body {i + 1}/{len(parts)}] repairing {len(p.faces)} faces "
-                  f"(watertight={p.is_watertight}, budget {budget})")
+            print(f"[body {i + 1}/{len(groups)}] repairing {len(g.mesh.faces)} faces "
+                  f"(watertight={g.mesh.is_watertight}, budget {budget})")
         try:
-            bodies.append(repair(p, is_scan, budget, verbose))
+            outer = repair(g.mesh, is_scan, budget, verbose)
         except PrepError as e:
             if verbose:
                 print(f"[body {i + 1}] repair failed ({e}); body dropped")
             n_dropped += 1
+            continue
+        voids = []
+        for v in g.voids:
+            vb = max(1000, int(target_faces * len(v.faces) / total))
+            try:
+                voids.append(repair(v, is_scan, vb, verbose))
+            except PrepError as e:
+                if verbose:
+                    print(f"[body {i + 1}] void repair failed ({e}); void dropped")
+                n_dropped += 1
+        bodies.append(Body(outer, voids))
     if not bodies:
         raise PrepError('no body survived preparation')
     return bodies, is_scan, n_dropped
@@ -132,14 +215,40 @@ def _load_scaled(path, units, verbose):
     return m
 
 
+# Fraction of face adjacencies that are exactly coplanar (< 0.06 deg). CAD
+# exporters triangulate every planar face, so a CAD export has many; a scan
+# has essentially none. Used with the dihedral mean and the face count so a
+# very finely tessellated CAD part is not mistaken for a scan.
+SCAN_MAX_COPLANAR_FRAC = 0.02
+
+
+def coplanar_fraction(m, cap=400000, tol_rad=1e-3):
+    a = m.face_adjacency_angles
+    if len(a) == 0:
+        return 0.0
+    if len(a) > cap:
+        a = a[np.linspace(0, len(a) - 1, cap).astype(np.int64)]
+    return float((np.abs(a) < tol_rad).mean())
+
+
 def classify(m, verbose=True, scan_dihedral_deg=SCAN_DIHEDRAL_DEG,
-             scan_min_faces=SCAN_MIN_FACES):
-    """Decide scan vs CAD export for the whole file (and log the verdict)."""
+             scan_min_faces=SCAN_MIN_FACES,
+             scan_max_coplanar_frac=SCAN_MAX_COPLANAR_FRAC):
+    """Decide scan vs CAD export for the whole file (and log the verdict).
+
+    Scan = many faces AND small mean dihedral AND (almost) no exactly
+    coplanar facet pairs. Each test alone misfires: a dense CAD export has a
+    low dihedral mean but plenty of coplanar pairs; a decimated scan has few
+    faces but no coplanar pairs either — that one is treated as CAD, which
+    only costs a (gated) prismatic attempt.
+    """
     dih = mean_dihedral_deg(m)
-    is_scan = len(m.faces) > scan_min_faces and dih < scan_dihedral_deg
+    cop = coplanar_fraction(m)
+    is_scan = (len(m.faces) > scan_min_faces and dih < scan_dihedral_deg
+               and cop < scan_max_coplanar_frac)
     if verbose:
         print(f"[prep] {len(m.faces)} faces, watertight={m.is_watertight}, "
-              f"mean dihedral {dih:.1f}deg, "
+              f"mean dihedral {dih:.1f}deg, coplanar pairs {cop:.1%}, "
               f"treating as {'scan' if is_scan else 'CAD export'}"
               f"{'' if m.is_watertight else ' (needs repair)'}")
     return is_scan
@@ -186,17 +295,56 @@ def is_sliver(p, is_scan=False, total_faces=None):
                 and n < SCAN_SLIVER_FRAC * total_faces)
 
 
-def split_bodies(m, is_scan, verbose=True):
-    """Split into connected bodies, largest first; drop slivers.
+class Body:
+    """One solid to convert: an outer shell plus the shells of any internal
+    voids (cavities). Each is a watertight-ish Trimesh; voids are converted
+    as positive solids and subtracted from the outer solid."""
 
-    Returns (bodies, n_dropped). CAD input keeps every body that could be a
-    closed solid, however small — a washer is a part. Scan input additionally
-    sheds blobs under SCAN_SLIVER_FACES that are also under SCAN_SLIVER_FRAC
-    of the mesh, since those are repair noise, not geometry.
+    def __init__(self, mesh, voids=None):
+        self.mesh = mesh
+        self.voids = list(voids or [])
+
+    @property
+    def faces(self):
+        return self.mesh.faces
+
+    @property
+    def is_watertight(self):
+        return bool(self.mesh.is_watertight)
+
+    @property
+    def n_faces_total(self):
+        return len(self.mesh.faces) + sum(len(v.faces) for v in self.voids)
+
+    def volume(self):
+        """Enclosed material volume (outer minus voids); NaN if not closed."""
+        if not self.mesh.is_watertight:
+            return float('nan')
+        v = abs(float(self.mesh.volume))
+        for h in self.voids:
+            if not h.is_watertight:
+                return float('nan')
+            v -= abs(float(h.volume))
+        return v
+
+
+def split_bodies(m, is_scan, verbose=True):
+    """Split into connected bodies, largest first; drop slivers; nest voids.
+
+    Returns (bodies, n_dropped) where each body is a `Body`. CAD input keeps
+    every body that could be a closed solid, however small — a washer is a
+    part. Scan input additionally sheds blobs under SCAN_SLIVER_FACES that
+    are also under SCAN_SLIVER_FRAC of the mesh, since those are repair
+    noise, not geometry.
+
+    A shell that lies inside another (odd nesting depth) is a cavity, not a
+    part: it is attached to its container as a void so the result is one
+    hollow solid rather than two overlapping positive solids. A shell inside
+    a cavity (even depth) is a separate part again.
     """
     parts = m.split(only_watertight=False)
     if len(parts) <= 1:
-        return [m], 0
+        return [Body(m)], 0
     total = len(m.faces)
 
     def sliver(p):
@@ -205,16 +353,73 @@ def split_bodies(m, is_scan, verbose=True):
     kept = sorted((p for p in parts if not sliver(p)),
                   key=lambda p: len(p.faces), reverse=True)
     dropped = len(parts) - len(kept)
+    if not kept:
+        raise PrepError('every body is a sliver; nothing to convert')
+    bodies = nest_shells(kept)
     if verbose:
         msg = f"[bodies] {len(parts)} connected bodies"
         if dropped:
             lost = total - sum(len(p.faces) for p in kept)
             msg += (f"; dropping {dropped} sliver(s) with no volume "
                     f"({lost} faces, {lost / total:.2%} of the mesh)")
-        print(msg + f"; converting {len(kept)}")
-    if not kept:
-        raise PrepError('every body is a sliver; nothing to convert')
-    return kept, dropped
+        n_voids = sum(len(b.voids) for b in bodies)
+        if n_voids:
+            msg += f"; {n_voids} internal void(s) attached to their bodies"
+        print(msg + f"; converting {len(bodies)}")
+    return bodies, dropped
+
+
+def nest_shells(parts):
+    """Group shells into Bodies by containment.
+
+    `parts` are Trimesh shells sorted largest first. Shell j contains shell i
+    if j is watertight, j's bounding box contains i's, and a vertex of i is
+    inside j. Depth = number of containers; odd depth => void of the deepest
+    container; even depth => positive body.
+    """
+    n = len(parts)
+    if n == 1:
+        return [Body(parts[0])]
+    lo = [p.bounds[0] for p in parts]
+    hi = [p.bounds[1] for p in parts]
+    containers = [[] for _ in range(n)]
+    for j, pj in enumerate(parts):
+        if not pj.is_watertight or len(pj.faces) < 4:
+            continue
+        cand = [i for i in range(n) if i != j
+                and np.all(lo[i] >= lo[j] - 1e-9) and np.all(hi[i] <= hi[j] + 1e-9)]
+        if not cand:
+            continue
+        # one probe point per candidate: a vertex of i pushed a hair inward
+        # along its own (outward) normal is robust even if surfaces touch
+        pts = []
+        for i in cand:
+            pi = parts[i]
+            k = 0
+            v = pi.vertices[k] - 1e-6 * pi.vertex_normals[k] \
+                if len(pi.vertex_normals) else pi.vertices[k]
+            pts.append(v)
+        try:
+            inside = pj.contains(np.array(pts))
+        except Exception:
+            continue
+        for i, ok in zip(cand, inside):
+            if ok:
+                containers[i].append(j)
+    depth = [len(c) for c in containers]
+    bodies = {}
+    for i in range(n):
+        if depth[i] % 2 == 0:
+            bodies[i] = Body(parts[i])
+    for i in range(n):
+        if depth[i] % 2 == 1:
+            # deepest container = the one with the largest depth
+            parent = max(containers[i], key=lambda j: depth[j])
+            if parent in bodies:
+                bodies[parent].voids.append(parts[i])
+            else:                      # should not happen; keep as a part
+                bodies[i] = Body(parts[i])
+    return [bodies[i] for i in sorted(bodies)]
 
 
 def _pymeshlab_worker(src, dst, target_faces, method, arg):
