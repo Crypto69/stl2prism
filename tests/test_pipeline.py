@@ -190,10 +190,19 @@ def test_units_scale_on_load(tmp_path):
 
 def test_unsupported_extension_rejected(tmp_path):
     from stl2prism.mesh_prep import load_mesh, PrepError
-    p = tmp_path / 'part.ply'
-    trimesh.creation.box().export(str(p))
+    p = tmp_path / 'part.xyz'
+    p.write_text('0 0 0\n1 0 0\n0 1 0\n')
     with pytest.raises(PrepError, match='unsupported'):
         load_mesh(str(p))
+
+
+@pytest.mark.parametrize('ext', ['ply', 'off', 'glb', '3mf'])
+def test_other_mesh_formats_load(tmp_path, ext):
+    from stl2prism.mesh_prep import load_mesh
+    p = tmp_path / f'box.{ext}'
+    trimesh.creation.box((20, 10, 5)).export(str(p))
+    m = load_mesh(str(p))
+    assert m.is_watertight and m.volume == pytest.approx(1000.0)
 
 
 def test_dji_obj_sample_loads_and_is_scan():
@@ -356,6 +365,7 @@ def test_faceted_export_refuses_fragments(tmp_path):
 @pytest.mark.slow
 @pytest.mark.parametrize('name', SCANS)
 def test_scan_endtoend_produces_real_solid(tmp_path, name):
+    pytest.importorskip('pymeshlab')          # scan repair ladder: Linux x86_64 only
     from stl2prism.pipeline import run
     out = str(tmp_path / 'scan.step')
     r = run(_sample(name), out, verbose=False)
