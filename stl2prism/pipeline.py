@@ -6,9 +6,56 @@ import trimesh
 
 from .mesh_prep import UNIT_SCALE
 
+# Deterministic surface sampling: the verdict for a given file must not
+# depend on the random state, or parts near a gate flip mode between runs.
+SAMPLE_SEED = 20240817
 
-def validate(solid, mesh, n_samples=5000, cyls=None, hole_band=0.15):
-    """Sample source mesh surface, measure distance to rebuilt solid mesh.
+
+def tessellate_solid(solid, tolerance=0.02, angular=0.1):
+    """Triangulate a CadQuery Workplane/Shape in memory (no STL round trip)."""
+    import cadquery as cq
+    shape = solid.val() if hasattr(solid, 'val') else solid
+    if not isinstance(shape, cq.Shape):
+        shape = cq.Shape.cast(shape)
+    verts, tris = shape.tessellate(tolerance, angular)
+    V = np.array([(v.x, v.y, v.z) for v in verts], dtype=float)
+    F = np.array(tris, dtype=np.int64).reshape(-1, 3)
+    return trimesh.Trimesh(V, F, process=False)
+
+
+def sample_points(mesh, n_samples=None, include_vertices=True, max_points=200000):
+    """Points on `mesh` for deviation measurement.
+
+    Returns (pts, n_uniform): the first n_uniform rows are a seeded,
+    area-proportional surface sample (used for percentiles — they measure
+    surface *area*); the rest are the mesh vertices (features live at
+    vertices; used for the max only, since they cluster on curved faces
+    and would bias a percentile)."""
+    area = float(mesh.area)
+    if n_samples is None:
+        n_samples = int(np.clip(area / 2.0, 5000, 60000))
+    pts = mesh.sample(int(n_samples), seed=SAMPLE_SEED)
+    n_uniform = len(pts)
+    if include_vertices and len(mesh.vertices):
+        V = mesh.vertices
+        if len(V) > max_points:
+            idx = np.linspace(0, len(V) - 1, max_points).astype(np.int64)
+            V = V[idx]
+        pts = np.vstack([pts, V])
+    return pts, n_uniform
+
+
+def validate(solid, mesh, n_samples=None, cyls=None, hole_band=0.15,
+             symmetric=True):
+    """Measure the rebuilt solid against the source mesh.
+
+    Forward deviation: points on the source mesh (all vertices + a seeded
+    sample) to the rebuilt surface — catches missing/misplaced material.
+    Reverse deviation: points on the rebuilt surface to the source mesh —
+    catches material the rebuild *added* (a filled pocket, a bulging arc)
+    that forward sampling cannot see. The reverse direction is only
+    meaningful when the source is closed; a leaky mesh is measured forward
+    only and flagged as unverified.
 
     Deviation is reported globally and, separately, restricted to points
     lying on cylindrical bores. A millimetre of error on a flat outer wall is
@@ -22,30 +69,39 @@ def validate(solid, mesh, n_samples=5000, cyls=None, hole_band=0.15):
     is still caught, because the band selects points by the *mesh* fit and
     the deviation is measured against the *rebuilt* wall.
     """
-    import cadquery as cq
-    import tempfile, os
-    with tempfile.TemporaryDirectory() as td:
-        p = os.path.join(td, 's.stl')
-        cq.exporters.export(solid, p, tolerance=0.02)
-        rb = trimesh.load(p)
-    pts = mesh.sample(n_samples)
+    rb = tessellate_solid(solid)
+    pts, n_uni = sample_points(mesh, n_samples)
     _, dist, _ = trimesh.proximity.closest_point(rb, pts)
-    vol_mesh = mesh.volume if mesh.is_watertight else float('nan')
-    vol_solid = solid.val().Volume()
+    uni = dist[:n_uni]
+    closed = bool(mesh.is_watertight)
+    vol_mesh = mesh.volume if closed else float('nan')
+    shape = solid.val() if hasattr(solid, 'val') else solid
+    vol_solid = float(shape.Volume())
     worst = int(np.argmax(dist))
     out = {
         'dev_max': float(dist.max()),
-        'dev_p95': float(np.percentile(dist, 95)),
-        'dev_mean': float(dist.mean()),
+        'dev_p95': float(np.percentile(uni, 95)),
+        'dev_mean': float(uni.mean()),
         'dev_max_xyz': [round(float(v), 2) for v in pts[worst]],
+        'rev_dev_max': float('nan'),
+        'rev_dev_p95': float('nan'),
         'vol_mesh': vol_mesh,
         'vol_solid': vol_solid,
         'vol_err_pct': abs(vol_solid - vol_mesh) / vol_mesh * 100
-                       if vol_mesh == vol_mesh else float('nan'),
+                       if vol_mesh == vol_mesh and vol_mesh > 0 else float('nan'),
+        'vol_verified': bool(vol_mesh == vol_mesh and vol_mesh > 0),
+        'symmetric': False,
         'hole_dev_max': float('nan'),
         'hole_dev_p95': float('nan'),
         'holes_checked': 0,
+        'n_samples': int(len(pts)),
     }
+    if symmetric and closed:
+        rpts, _ = sample_points(rb, max(2000, n_uni // 2), include_vertices=False)
+        _, rdist, _ = trimesh.proximity.closest_point(mesh, rpts)
+        out['rev_dev_max'] = float(rdist.max())
+        out['rev_dev_p95'] = float(np.percentile(rdist, 95))
+        out['symmetric'] = True
     on_hole = np.zeros(len(pts), bool)
     for c in (cyls or []):
         axis, (bx, by) = c['axis'], c['basis']
@@ -65,16 +121,28 @@ def validate(solid, mesh, n_samples=5000, cyls=None, hole_band=0.15):
     return out
 
 
+def gate_values(metrics):
+    """The numbers the acceptance gate compares: worst of both directions."""
+    p95 = metrics['dev_p95']
+    mx = metrics['dev_max']
+    if metrics.get('symmetric'):
+        p95 = max(p95, metrics['rev_dev_p95'])
+        mx = max(mx, metrics['rev_dev_max'])
+    return p95, mx
+
+
 def run(in_path, out_path, tol=0.08, accept_p95=0.25, accept_vol_pct=2.0,
         accept_max=0.26, accept_hole_max=0.10,
-        force_prismatic=False, verbose=True, units='mm'):
+        force_prismatic=False, verbose=True, units='mm', reduce_tol=0.05,
+        write_script=True):
     """Convert one mesh file to one STEP file.
 
     Every connected body is converted on its own — prismatic where it passes
     the gate, faceted otherwise — and all of them are written into a single
-    STEP as separate solids. A single-body file returns
-    {'mode': 'prismatic'|'faceted', 'metrics': {...}}; a multi-body file adds
-    a per-body list and reports mode 'mixed' when the bodies disagree.
+    STEP as separate solids. Internal cavities are subtracted from their
+    body. A single-body file returns {'mode': 'prismatic'|'faceted',
+    'metrics': {...}}; a multi-body file adds a per-body list and reports
+    mode 'mixed' when the bodies disagree.
     """
     from .mesh_prep import load_and_prep_bodies
     from .rebuild import write_step
@@ -82,27 +150,33 @@ def run(in_path, out_path, tol=0.08, accept_p95=0.25, accept_vol_pct=2.0,
     bodies, is_scan, n_dropped = load_and_prep_bodies(
         in_path, verbose=verbose, units=units)
     gates = dict(tol=tol, accept_p95=accept_p95, accept_max=accept_max,
-                 accept_hole_max=accept_hole_max, accept_vol_pct=accept_vol_pct)
+                 accept_hole_max=accept_hole_max, accept_vol_pct=accept_vol_pct,
+                 reduce_tol=reduce_tol)
 
     if len(bodies) == 1:
-        shape, mode, metrics = _convert_body(
+        shape, mode, metrics = _convert_group(
             bodies[0], is_scan, force_prismatic, verbose, **gates)
-        write_step([shape], out_path)
+        write_step([shape], out_path, names=[_body_name(in_path, 1, 1)])
         if verbose:
             print(f"[out] {mode} solid -> {out_path}")
+        script = _write_script([metrics.pop('build', {'mode': mode})], out_path,
+                               write_script, verbose)
         return {'mode': mode, 'metrics': metrics,
-                'n_bodies': 1, 'n_written': 1, 'n_dropped': n_dropped}
+                'n_bodies': 1, 'n_written': 1, 'n_dropped': n_dropped,
+                'script': script}
 
     per_body, shapes = [], []
     for i, body in enumerate(bodies):
         tag = f"[body {i + 1}/{len(bodies)}]"
         if verbose:
-            print(f"{tag} converting {len(body.faces)} faces")
-        entry = {'index': i, 'faces': int(len(body.faces)),
-                 'watertight': bool(body.is_watertight),
+            print(f"{tag} converting {len(body.mesh.faces)} faces"
+                  + (f" (+{len(body.voids)} void(s))" if body.voids else ""))
+        entry = {'index': i, 'faces': int(len(body.mesh.faces)),
+                 'watertight': bool(body.mesh.is_watertight),
+                 'voids': len(body.voids),
                  'mode': None, 'metrics': None, 'error': None}
         try:
-            shape, mode, metrics = _convert_body(
+            shape, mode, metrics = _convert_group(
                 body, is_scan, force_prismatic, verbose, **gates)
             shapes.append(shape)
             entry.update(mode=mode, metrics=metrics)
@@ -119,7 +193,13 @@ def run(in_path, out_path, tol=0.08, accept_p95=0.25, accept_vol_pct=2.0,
         raise RuntimeError(
             f"none of the {len(bodies)} bodies could be converted; "
             f"see the per-body log lines above")
-    write_step(shapes, out_path)
+    names = [_body_name(in_path, b['index'] + 1, len(bodies)) for b in per_body if b['mode']]
+    write_step(shapes, out_path, names=names)
+    builds = []
+    for b in per_body:
+        if b['metrics'] is not None:
+            builds.append(b['metrics'].pop('build', {'mode': b['mode']}))
+    script = _write_script(builds, out_path, write_script, verbose)
 
     n_pr = sum(1 for b in per_body if b['mode'] == 'prismatic')
     n_fa = sum(1 for b in per_body if b['mode'] == 'faceted')
@@ -133,7 +213,43 @@ def run(in_path, out_path, tol=0.08, accept_p95=0.25, accept_vol_pct=2.0,
               + f") -> {out_path}")
     return {'mode': mode, 'metrics': _aggregate(per_body), 'bodies': per_body,
             'n_bodies': len(bodies), 'n_written': len(shapes),
-            'n_dropped': n_dropped}
+            'n_dropped': n_dropped, 'script': script}
+
+
+def _body_name(in_path, i, n):
+    import os
+    stem = os.path.splitext(os.path.basename(in_path))[0]
+    return stem if n == 1 else f'{stem}_body{i}'
+
+
+def _write_script(builds, out_path, write_script, verbose):
+    """Write the CadQuery script next to the STEP (same stem, .py)."""
+    if not write_script:
+        return None
+    try:
+        from .script_export import emit_script
+        import os
+        py_path = os.path.splitext(out_path)[0] + '.py'
+        text = emit_script(builds, os.path.basename(out_path))
+        with open(py_path, 'w') as f:
+            f.write(text)
+        if verbose:
+            print(f"[out] CadQuery script -> {py_path}")
+        try:
+            from .fusion_export import emit_fusion_script
+            fpath = os.path.splitext(out_path)[0] + '_fusion.py'
+            with open(fpath, 'w') as f:
+                f.write(emit_fusion_script(builds))
+            if verbose:
+                print(f"[out] Fusion 360 script -> {fpath}")
+        except Exception as e:
+            if verbose:
+                print(f"[out] Fusion script export failed ({type(e).__name__}: {e})")
+        return py_path
+    except Exception as e:
+        if verbose:
+            print(f"[out] script export failed ({type(e).__name__}: {e})")
+        return None
 
 
 def _aggregate(per_body):
@@ -157,8 +273,49 @@ def _aggregate(per_body):
     }
 
 
+def _convert_group(body, is_scan, force_prismatic, verbose, **gates):
+    """Convert a Body (outer shell + voids) into one TopoDS_Shape.
+
+    The outer shell and each void are converted independently (each with its
+    own gate and fallback); void solids are then subtracted. Metrics are the
+    outer shell's, with the volume error recomputed for the hollow result.
+    """
+    shape, mode, metrics = _convert_body(
+        body.mesh, is_scan, force_prismatic, verbose, **gates)
+    if not body.voids:
+        return shape, mode, metrics
+    import cadquery as cq
+    outer = cq.Shape.cast(shape)
+    void_modes = []
+    void_builds = []
+    for k, v in enumerate(body.voids):
+        if verbose:
+            print(f"[void {k + 1}/{len(body.voids)}] converting {len(v.faces)} faces")
+        vshape, vmode, vmet = _convert_body(v, is_scan, force_prismatic, verbose, **gates)
+        void_modes.append(vmode)
+        void_builds.append(vmet.get('build', {'mode': vmode}))
+        outer = outer.cut(cq.Shape.cast(vshape), tol=1e-4)
+    metrics = dict(metrics)
+    metrics['voids'] = len(body.voids)
+    metrics['void_modes'] = void_modes
+    if 'build' in metrics:
+        metrics['build'] = dict(metrics['build'], voids=void_builds)
+    vol_mesh = body.volume()
+    vol_solid = float(outer.Volume())
+    metrics['vol_mesh'] = vol_mesh
+    metrics['vol_solid'] = vol_solid
+    metrics['vol_err_pct'] = (abs(vol_solid - vol_mesh) / vol_mesh * 100
+                              if vol_mesh == vol_mesh and vol_mesh > 0
+                              else float('nan'))
+    metrics['vol_verified'] = bool(vol_mesh == vol_mesh and vol_mesh > 0)
+    if verbose:
+        print(f"[void] {len(body.voids)} cavity(ies) subtracted; hollow volume "
+              f"{vol_solid:.0f}mm^3, err {metrics['vol_err_pct']:.2f}%")
+    return outer.wrapped, mode, metrics
+
+
 def _convert_body(mesh, is_scan, force_prismatic, verbose, tol, accept_p95,
-                  accept_max, accept_hole_max, accept_vol_pct):
+                  accept_max, accept_hole_max, accept_vol_pct, reduce_tol=0.05):
     """Convert one closed body. Returns (TopoDS_Shape, mode, metrics).
 
     Tries the prismatic route and gates it against the mesh; anything that
@@ -166,7 +323,7 @@ def _convert_body(mesh, is_scan, force_prismatic, verbose, tol, accept_p95,
     faceted route, which has its own volume gate and raises if even that
     cannot represent the body.
     """
-    from .extrusion import dominant_axis, score_axis
+    from .extrusion import dominant_axis, score_axis, _axis_basis
     from .rebuild import build_solid
 
     # Before any axis work: scoring an axis means cross-sectioning the mesh
@@ -175,29 +332,33 @@ def _convert_body(mesh, is_scan, force_prismatic, verbose, tol, accept_p95,
         if verbose:
             print('[out] scan input: skipping prismatic attempt '
                   '(use --force-prismatic to override)')
-        return _faceted_body(mesh, verbose)
+        return _faceted_body(mesh, verbose, reduce_tol=reduce_tol)
 
     try:
         cands = dominant_axis(mesh)
         best = None
         for frac, ax in cands:
             sc, levels, slabs = score_axis(mesh, ax)
+            # perpendicular-face area is a strong prior for the extrusion
+            # direction (the 'base faces'); use it to break near-ties
+            rank = sc * (1.0 + 0.5 * frac)
             if verbose:
                 print(f"[axis] candidate {np.round(ax,3)} area {frac*100:.0f}% "
                       f"-> constancy score {sc:.2f} ({len(slabs)} slabs)")
-            if best is None or sc > best[0]:
-                best = (sc, ax, levels, slabs)
-        score, axis, levels, slabs = best
+            if best is None or rank > best[0] + 1e-9:
+                best = (rank, ax, levels, slabs, sc)
+        _, axis, levels, slabs, score = best
         if verbose:
             print(f"[axis] selected {np.round(axis,3)} "
                   f"(constant-volume score {score:.2f})")
-            print(f"[slabs] levels along axis: {[round(l,2) for l in levels]}")
+            print(f"[slabs] levels along axis: "
+                  f"{[round(float(l), 2) for l in levels]}")
         nonconst = [s for s in slabs if not s['constant']]
         if verbose and nonconst:
             print(f"[slabs] warning: {len(nonconst)} slab(s) have varying "
                   f"cross-section; prismatic fit may be poor there")
 
-        solid, rep = build_solid(slabs, axis, tol=tol, verbose=verbose)
+        solid, rep = build_solid(slabs, axis, tol=tol, verbose=verbose, mesh=mesh)
         from .features import find_cross_cylinders, subtract_cylinders
         # Concave regions are holes; convex ones are bosses/fillets, which
         # must be neither subtracted (that would carve away material) nor
@@ -207,14 +368,26 @@ def _convert_body(mesh, is_scan, force_prismatic, verbose, tol, accept_p95,
         all_cyls = find_cross_cylinders(mesh, axis, exclude_parallel=False)
         holes = [c for c in all_cyls if c['concave']]
         cyls = [c for c in holes if not c['parallel']]
-        if cyls:
-            solid = subtract_cylinders(solid, cyls, verbose=verbose)
+        from .features import find_cross_cones, subtract_cones
+        cones = [c for c in find_cross_cones(mesh, axis) if c['concave']]
+        if cyls or cones:
+            from .rebuild import finish_solid
+            if cyls:
+                solid = subtract_cylinders(solid, cyls, mesh=mesh, verbose=verbose)
+            if cones:
+                solid = subtract_cones(solid, cones, mesh=mesh, verbose=verbose)
+            solid = finish_solid(solid, verbose=verbose)
         metrics = validate(solid, mesh, cyls=holes)
+        g_p95, g_max = gate_values(metrics)
         if verbose:
             print(f"[check] p95 dev {metrics['dev_p95']:.3f}mm, "
                   f"max {metrics['dev_max']:.3f}mm at "
-                  f"{metrics['dev_max_xyz']}, "
-                  f"volume err {metrics['vol_err_pct']:.2f}%")
+                  f"{metrics['dev_max_xyz']}"
+                  + (f"; reverse p95 {metrics['rev_dev_p95']:.3f}, "
+                     f"max {metrics['rev_dev_max']:.3f}"
+                     if metrics['symmetric'] else "; reverse n/a (open mesh)")
+                  + (f", volume err {metrics['vol_err_pct']:.2f}%"
+                     if metrics['vol_verified'] else ", volume unverified"))
             if metrics['holes_checked']:
                 print(f"[check] bore dev p95 {metrics['hole_dev_p95']:.3f}mm, "
                       f"max {metrics['hole_dev_max']:.3f}mm "
@@ -223,17 +396,17 @@ def _convert_body(mesh, is_scan, force_prismatic, verbose, tol, accept_p95,
         # sample by the same amount, so p95 catches it just as surely,
         # while a single edge/chamfer outlier cannot fail a good hole.
         hole_p95 = metrics['hole_dev_p95']
-        ok = (metrics['dev_p95'] <= accept_p95 and
-              metrics['dev_max'] <= accept_max and
+        ok = (g_p95 <= accept_p95 and
+              g_max <= accept_max and
               (hole_p95 != hole_p95 or hole_p95 <= accept_hole_max) and
               (metrics['vol_err_pct'] <= accept_vol_pct or
                metrics['vol_err_pct'] != metrics['vol_err_pct']))
         if verbose and not ok:
             why = []
-            if metrics['dev_p95'] > accept_p95:
-                why.append(f"p95 {metrics['dev_p95']:.3f} > {accept_p95}")
-            if metrics['dev_max'] > accept_max:
-                why.append(f"max {metrics['dev_max']:.3f} > {accept_max} "
+            if g_p95 > accept_p95:
+                why.append(f"p95 {g_p95:.3f} > {accept_p95}")
+            if g_max > accept_max:
+                why.append(f"max {g_max:.3f} > {accept_max} "
                            f"at {metrics['dev_max_xyz']}")
             if hole_p95 == hole_p95 and hole_p95 > accept_hole_max:
                 why.append(f"bore p95 {hole_p95:.3f} > {accept_hole_max}")
@@ -242,8 +415,41 @@ def _convert_body(mesh, is_scan, force_prismatic, verbose, tol, accept_p95,
                 why.append(f"volume {metrics['vol_err_pct']:.2f}% "
                            f"> {accept_vol_pct}%")
             print(f"[check] rejected: {'; '.join(why)}")
+        metrics['build'] = {'axis': np.asarray(axis, float).tolist(),
+                            'xdir': _axis_basis(axis)[:3, 0].tolist(),
+                            'slabs': rep, 'cross_cyls': cyls, 'cones': cones,
+                            'mode': 'prismatic'}
         if ok:
             return solid.val().wrapped, 'prismatic', metrics
+        # Not all-or-nothing: patch the regions that fail with the exact
+        # faceted geometry and re-check (Fusion keeps the converted face
+        # groups too). Small local misfits — a countersink, a taper, a
+        # fillet the profile fitter cannot express — no longer cost the
+        # whole body its clean faces.
+        if True:
+            from .hybrid import try_hybrid
+            patched, info = try_hybrid(solid, mesh, metrics, accept_max, tol,
+                                       verbose=verbose)
+            if patched is not None:
+                m2 = validate(patched, mesh, cyls=holes)
+                p95b, maxb = gate_values(m2)
+                hole_b = m2['hole_dev_p95']
+                ok2 = (p95b <= accept_p95 and maxb <= accept_max and
+                       (hole_b != hole_b or hole_b <= accept_hole_max) and
+                       (m2['vol_err_pct'] <= accept_vol_pct or
+                        m2['vol_err_pct'] != m2['vol_err_pct']))
+                if verbose:
+                    print(f"[patch] after patching: p95 {p95b:.3f}, max {maxb:.3f}, "
+                          f"volume err {m2['vol_err_pct']:.2f}% -> "
+                          f"{'accepted' if ok2 else 'still rejected'}")
+                if ok2:
+                    m2['patched'] = True
+                    m2['patches'] = info['patches']
+                    m2['patch_boxes'] = info.get('boxes', [])
+                    m2['bad_frac'] = info['bad_frac']
+                    m2['build'] = dict(metrics['build'], note='patched: the script '
+                                       'rebuilds the unpatched extrusion structure')
+                    return patched.val().wrapped, 'prismatic', m2
         if verbose:
             print("[out] prismatic fit rejected by tolerance check; "
                   "falling back to faceted")
@@ -251,25 +457,35 @@ def _convert_body(mesh, is_scan, force_prismatic, verbose, tol, accept_p95,
         if verbose:
             print(f"[out] prismatic rebuild failed ({type(e).__name__}: {e}); "
                   f"falling back to faceted")
-    return _faceted_body(mesh, verbose)
+    return _faceted_body(mesh, verbose, reduce_tol=reduce_tol)
 
 
-def _faceted_body(mesh, verbose, accept_vol_pct=5.0):
+def _faceted_body(mesh, verbose, accept_vol_pct=5.0, reduce_tol=0.05):
     """Faceted solid for one body, checked against the mesh it came from.
 
+    Curved regions are first decimated within `reduce_tol` (Fusion's
+    'Reduce by tolerance'); coplanar triangles become single planar faces.
     The prismatic path has a deviation/volume gate; without an equivalent here
     a fragmentary export reports success exactly as loudly as a good one.
     """
-    from .rebuild import faceted_solid
-    shape, stats = faceted_solid(mesh, verbose=verbose)
+    from .rebuild import faceted_solid, reduce_mesh
+    src = mesh
+    info = {'reduced': False}
+    if reduce_tol and reduce_tol > 0:
+        src, info = reduce_mesh(mesh, reduce_tol, verbose=verbose)
+    shape, stats = faceted_solid(src, verbose=verbose)
+    stats['reduce'] = info
+    stats['faces_in'] = int(len(mesh.faces))
     vol_mesh = mesh.volume if mesh.is_watertight else float('nan')
     vol_err = (abs(stats['volume'] - vol_mesh) / vol_mesh * 100
                if vol_mesh == vol_mesh and vol_mesh > 0 else float('nan'))
     stats['vol_err_pct'] = vol_err
+    stats['vol_verified'] = bool(vol_mesh == vol_mesh and vol_mesh > 0)
     if verbose:
         print(f"[check] faceted {stats['faces_out']} faces from "
               f"{stats['faces_in']}, volume {stats['volume']:.0f}mm^3"
-              + (f", volume err {vol_err:.2f}%" if vol_err == vol_err else ""))
+              + (f", volume err {vol_err:.2f}%" if vol_err == vol_err
+                 else ", volume unverified"))
     if vol_err == vol_err and vol_err > accept_vol_pct:
         raise RuntimeError(
             f"faceted solid volume differs from the mesh by {vol_err:.1f}% "
@@ -293,6 +509,11 @@ def main():
                     help='max single-point surface deviation, mm (default 0.26)')
     ap.add_argument('--accept-hole-max', type=float, default=0.10,
                     help='max deviation on cylindrical bores, mm (default 0.10)')
+    ap.add_argument('--accept-vol-pct', type=float, default=2.0,
+                    help='max volume error in percent (default 2.0)')
+    ap.add_argument('--reduce-tol', type=float, default=0.05,
+                    help='faceted output: decimate curved regions within this '
+                         'deviation in mm (0 disables; default 0.05)')
     ap.add_argument('--force-prismatic', action='store_true',
                     help='attempt prismatic fit even for scan-like input')
     ap.add_argument('--units', choices=sorted(UNIT_SCALE), default='mm',
@@ -305,8 +526,9 @@ def main():
         r = run(args.input, out, tol=args.tol, accept_p95=args.accept_p95,
                 accept_max=args.accept_max,
                 accept_hole_max=args.accept_hole_max,
+                accept_vol_pct=args.accept_vol_pct,
                 force_prismatic=args.force_prismatic, verbose=not args.quiet,
-                units=args.units)
+                units=args.units, reduce_tol=args.reduce_tol)
     except Exception as e:
         # A crash must not look like a success to a calling script.
         print(f"[error] {type(e).__name__}: {e}", file=sys.stderr)
