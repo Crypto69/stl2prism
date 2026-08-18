@@ -24,6 +24,14 @@ RUN pip install --no-cache-dir '.[scan]' fastapi 'uvicorn[standard]' python-mult
 COPY backend/ backend/
 COPY --from=webbuild /build/dist frontend/dist
 
+# Build identity, shown top-right in the web UI and at /api/version so a
+# tester can tell which commit is running. Set by deploy.sh (or pass
+# --build-arg GIT_SHA=... BUILD_TIME=... by hand); defaults say 'unknown'.
+ARG GIT_SHA=unknown
+ARG BUILD_TIME=unknown
+ENV STL2PRISM_BUILD_SHA=$GIT_SHA
+ENV STL2PRISM_BUILD_TIME=$BUILD_TIME
+
 ENV STL2PRISM_DATA=/data
 VOLUME /data
 EXPOSE 8000

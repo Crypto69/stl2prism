@@ -30,6 +30,16 @@ async def _lifespan(app):
 app = FastAPI(title='stl2prism', lifespan=_lifespan)
 
 
+@app.get('/api/version')
+def version():
+    """Package version plus the git commit / time the image was built from
+    (set via Docker build args; 'unknown' when run from a checkout)."""
+    from stl2prism import __version__
+    return {'version': __version__,
+            'commit': os.environ.get('STL2PRISM_BUILD_SHA', 'unknown'),
+            'built': os.environ.get('STL2PRISM_BUILD_TIME', 'unknown')}
+
+
 def _write_preview(src, dst):
     from stl2prism.mesh_prep import load_mesh
     load_mesh(src).export(dst)

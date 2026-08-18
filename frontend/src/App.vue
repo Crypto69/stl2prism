@@ -1,5 +1,5 @@
 <script setup>
-import { computed, markRaw, ref, shallowRef } from 'vue'
+import { computed, markRaw, onMounted, ref, shallowRef } from 'vue'
 import MeshViewer from './components/MeshViewer.vue'
 import ParamsPanel from './components/ParamsPanel.vue'
 import ReportPanel from './components/ReportPanel.vue'
@@ -11,6 +11,16 @@ const dragOver = ref(false)
 const fileInput = ref(null)
 
 const ACCEPT = ['stl', 'obj', 'ply', 'off', '3mf', 'glb', 'gltf']
+
+// Which build is running: package version + git commit + build time from
+// /api/version, so a tester can match the browser to a commit at a glance.
+const build = ref(null)
+onMounted(async () => {
+  try {
+    const res = await fetch('/api/version')
+    if (res.ok) build.value = await res.json()
+  } catch (e) { /* badge is optional */ }
+})
 
 async function takeFile(file) {
   const kind = file?.name.split('.').pop().toLowerCase()
@@ -54,6 +64,10 @@ const canConvert = computed(
         <span class="stl">STL</span><span class="arrow">▸</span><span class="prism">PRISM</span>
       </div>
       <p class="tag micro">Mesh in · machined solid out</p>
+      <p v-if="build" class="build micro" :title="'built ' + build.built">
+        v{{ build.version }} · {{ build.commit }}
+        <span v-if="build.built !== 'unknown'" class="when">· {{ build.built }}</span>
+      </p>
     </header>
 
     <main class="grid">
@@ -125,6 +139,14 @@ const canConvert = computed(
   letter-spacing: 0.14em;
   font-stretch: 125%;
 }
+.build {
+  margin-left: auto;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  color: var(--edge);
+  opacity: 0.85;
+  white-space: nowrap;
+}
+.build .when { opacity: 0.7; }
 .wordmark .arrow { color: var(--edge); margin: 0 4px; }
 .wordmark .prism { color: var(--edge); }
 

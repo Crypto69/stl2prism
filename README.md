@@ -58,6 +58,8 @@ cd frontend && npm install && npm run dev           # UI on :5173, proxies /api
 
 ```bash
 docker compose up --build        # then open http://localhost:8321
+./deploy.sh                      # same, but stamps the image with the git commit,
+                                 # shown top-right in the UI and at /api/version
 ```
 
 For deployment on the x86_64 NAS (clone on the NAS, build
