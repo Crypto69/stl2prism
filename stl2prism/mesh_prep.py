@@ -291,7 +291,8 @@ def is_sliver(p, is_scan=False, total_faces=None):
     if n < MIN_BODY_FACES:
         return True
     if p.is_watertight:
-        vol, area = abs(float(p.volume)), float(p.area)
+        with np.errstate(divide='ignore', invalid='ignore'):   # zero-volume shells
+            vol, area = abs(float(p.volume)), float(p.area)
         if area <= 0 or 2 * vol / area < MIN_BODY_THICKNESS:
             return True
     return bool(is_scan and total_faces and n < SCAN_SLIVER_FACES
@@ -441,6 +442,15 @@ def _pymeshlab_worker(src, dst, target_faces, method, arg):
     mid = dst + '.mid.ply'
     ms = pymeshlab.MeshSet()
     ms.load_new_mesh(src)
+    if method == 'decimate':
+        # Pre-repair reduction only: shrink a huge scan once so every repair
+        # rung below works on a fraction of the triangles. preservetopology
+        # keeps hole boundaries, so holes stay closable afterwards.
+        ms.meshing_decimation_quadric_edge_collapse(
+            targetfacenum=arg, preservetopology=True,
+            preservenormal=True, planarquadric=True)
+        ms.save_current_mesh(dst)
+        return
     if method == 'poisson':
         ms.generate_sampling_poisson_disk(samplenum=250000, exactnumflag=False)
         ms.compute_normal_for_point_clouds(k=12)
@@ -491,6 +501,14 @@ REPAIR_ATTEMPTS = (('close', 3000), ('close', 100000),
                    ('close_loose', 3000), ('close_loose', 100000),
                    ('poisson', 10), ('poisson', 9), ('poisson', 8))
 
+# Scans above this size are decimated once, before the ladder. Each rung
+# loads, repairs, splits and decimates the whole mesh; on a 2.2M-face scan
+# that is 2-3 minutes per rung (7 rungs = the better part of half an hour)
+# for a result that is 40k faces anyway. Poisson resamples to 250k points
+# regardless, and hole closing only looks at boundaries, so neither route
+# loses anything meaningful at 300k faces (0.4 mm edges on a 185 mm scan).
+PRE_REPAIR_FACES = 300000
+
 
 def _open_edges(d):
     """Count edges with only one adjacent face — how far from closed a mesh is.
@@ -517,9 +535,16 @@ def _require_pymeshlab():
             f"a system library is probably missing") from e
 
 
-def _poisson_rebuild(m, target_faces, verbose, attempts=REPAIR_ATTEMPTS):
-    """Rebuild a scan as a clean watertight mesh, trying each repair route."""
-    _require_pymeshlab()
+def _poisson_rebuild(m, target_faces, verbose, attempts=REPAIR_ATTEMPTS,
+                     pre_faces=PRE_REPAIR_FACES, worker=None):
+    """Rebuild a scan as a clean watertight mesh, trying each repair route.
+
+    `worker` is the child-process function (default `_pymeshlab_worker`);
+    tests substitute a pymeshlab-free stand-in.
+    """
+    if worker is None:
+        _require_pymeshlab()
+        worker = _pymeshlab_worker
 
     import multiprocessing as mp
     import tempfile, os
@@ -530,17 +555,32 @@ def _poisson_rebuild(m, target_faces, verbose, attempts=REPAIR_ATTEMPTS):
     best, best_open = None, float('inf')
     with tempfile.TemporaryDirectory() as td:
         src = os.path.join(td, 'in.stl')
+        n_in = len(m.faces)
         m.export(src)
         # Release the source mesh before the child starts: a 2M-face scan is
         # ~500MB in trimesh, and holding it while pymeshlab loads its own copy
         # doubles peak memory for no reason.
         del m
         gc.collect()
+        if pre_faces and n_in > pre_faces:
+            pre = os.path.join(td, 'pre.ply')
+            proc = ctx.Process(target=worker,
+                               args=(src, pre, target_faces, 'decimate', int(pre_faces)))
+            proc.start()
+            proc.join()
+            if os.path.exists(pre):
+                src = pre
+                if verbose:
+                    print(f"[prep] pre-reduced {n_in} -> ~{int(pre_faces)} faces "
+                          f"before repair")
+            elif verbose:
+                print(f"[prep] pre-reduction failed (exit {proc.exitcode}); "
+                      f"repairing at full size")
         for i, (method, arg) in enumerate(attempts):
             label = (f'poisson depth {arg}' if method == 'poisson'
                      else f'{method} holes<={arg}')
             dst = os.path.join(td, f'out{i}.ply')
-            proc = ctx.Process(target=_pymeshlab_worker,
+            proc = ctx.Process(target=worker,
                                args=(src, dst, target_faces, method, arg))
             proc.start()
             proc.join()

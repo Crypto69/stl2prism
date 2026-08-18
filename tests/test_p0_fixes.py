@@ -218,3 +218,52 @@ def test_real_scans_with_some_coplanar_pairs_are_scans():
         assert cop >= SCAN_MAX_COPLANAR_FRAC or dih >= SCAN_DIHEDRAL_DEG \
             or n <= SCAN_MIN_FACES
     assert 2 * 0.0434 < SCAN_MAX_COPLANAR_FRAC < 0.303 / 2, 'keep margin both ways'
+
+
+# --- scan repair ladder: pre-reduce once, not per rung ------------------------------
+
+def _fake_scan_worker(src, dst, target_faces, method, arg):
+    """Stand-in for `_pymeshlab_worker` (runs in a spawned child, so it must
+    be importable by name). Logs what it was asked to do and the input size,
+    then does a cheap version of the job with trimesh/fast_simplification."""
+    import os
+    import trimesh as tm
+    import fast_simplification as fs
+    m = tm.load(src, force='mesh')
+    with open(os.environ['STL2PRISM_FAKE_LOG'], 'a') as fh:
+        fh.write(f'{method} {arg} {len(m.faces)}\n')
+    if method == 'decimate':
+        v, f = fs.simplify(m.vertices, m.faces, target_count=int(arg))
+        tm.Trimesh(v, f).export(dst)
+        return
+    tm.repair.fill_holes(m)
+    v, f = fs.simplify(m.vertices, m.faces, target_count=int(target_faces))
+    tm.Trimesh(v, f).export(dst)
+
+
+def test_scan_ladder_pre_reduces_once(tmp_path, monkeypatch):
+    from stl2prism.mesh_prep import _poisson_rebuild
+    log = tmp_path / 'log.txt'
+    monkeypatch.setenv('STL2PRISM_FAKE_LOG', str(log))
+    m = trimesh.load(synth.scan_like_cube(str(tmp_path / 'scan.stl')), force='mesh')
+    n_in = len(m.faces)                                   # ~49k
+    out = _poisson_rebuild(m, target_faces=2000, verbose=False,
+                           attempts=(('close', 3000),), pre_faces=10000,
+                           worker=_fake_scan_worker)
+    calls = [line.split() for line in log.read_text().splitlines()]
+    assert calls[0][0] == 'decimate' and int(calls[0][2]) == n_in
+    assert calls[1][0] == 'close' and int(calls[1][2]) <= 10000, \
+        'repair rung ran on the full-size mesh'
+    assert out.is_watertight and len(out.faces) <= 2000
+
+
+def test_scan_ladder_skips_pre_reduce_for_small_scans(tmp_path, monkeypatch):
+    from stl2prism.mesh_prep import _poisson_rebuild
+    log = tmp_path / 'log.txt'
+    monkeypatch.setenv('STL2PRISM_FAKE_LOG', str(log))
+    m = trimesh.load(synth.scan_like_cube(str(tmp_path / 'scan.stl')), force='mesh')
+    _poisson_rebuild(m, target_faces=2000, verbose=False,
+                     attempts=(('close', 3000),), pre_faces=300000,
+                     worker=_fake_scan_worker)
+    calls = [line.split() for line in log.read_text().splitlines()]
+    assert [c[0] for c in calls] == ['close']
