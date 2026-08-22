@@ -261,9 +261,20 @@ spherical face) come out exact through the face-group engine.
 
 ## Roadmap
 
-Face-group engine v2: torus fits (edge fillets around corners),
-surface–surface intersection edges instead of chords, region growing for
-scans; hole/fillet feature recognition on the solid.
+In rough priority order:
+
+- **Clean intersection edges on face-group solids.** Today each analytic face
+  is bounded by the mesh's own polyline edges. First via a Fusion 360 script
+  that recreates the fitted surfaces oversized and lets Fusion's Boundary
+  Fill compute the true edges; later natively in the STEP.
+- **Torus fitting for corner blends** — the rolling-ball corners where two
+  fillets meet are still kept as facets, which is most of the face count on
+  filleted parts.
+- **Named features in the generated script** — `hole()`, counterbores and
+  `fillet()` calls instead of raw cylinder cuts.
+- **Region growing for 3D scans** — real faces on scanned parts instead of a
+  faceted solid.
+- **Faster conversions** — warm worker process, bodies converted in parallel.
 
 ## License
 
