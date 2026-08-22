@@ -1,0 +1,22 @@
+services:
+  stl2prism:
+    image: stl2prism:latest
+    build:
+      context: .
+      args:
+        # deploy.sh fills these in from git; a plain `docker compose build`
+        # leaves them 'unknown'
+        GIT_SHA: ${GIT_SHA:-unknown}
+        BUILD_TIME: ${BUILD_TIME:-unknown}
+    ports:
+      - "8321:8000"
+    volumes:
+      - ./data:/data
+    environment:
+      # jobs older than this many seconds are deleted automatically
+      STL2PRISM_JOB_TTL: "86400"
+      # conversions run one at a time; scan repair can peak at several GB
+      STL2PRISM_CONCURRENCY: "1"
+    # keep a runaway conversion from starving the NAS's other services
+    mem_limit: 12g
+    restart: unless-stopped

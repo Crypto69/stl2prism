@@ -1,0 +1,69 @@
+:root {
+  --ink: #14171c;
+  --panel: #1d2229;
+  --panel-2: #232932;
+  --line: #313945;
+  --text: #d6dce4;
+  --muted: #8b95a3;
+  --edge: #5ad2ea;      /* CAD edge cyan: actions, geometry */
+  --pass: #6fdc8c;      /* gate verdicts only */
+  --fail: #ff6b5e;
+  --font-ui: 'Archivo Variable', system-ui, sans-serif;
+  --font-data: ui-monospace, 'SF Mono', Menlo, Consolas, monospace;
+}
+
+* { box-sizing: border-box; margin: 0; padding: 0; }
+
+html, body, #app { height: 100%; }
+
+body {
+  background: var(--ink);
+  color: var(--text);
+  font-family: var(--font-ui);
+  font-size: 14px;
+  line-height: 1.45;
+}
+
+.micro {
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+
+.num { font-family: var(--font-data); font-variant-numeric: tabular-nums; }
+
+button {
+  font-family: var(--font-ui);
+  cursor: pointer;
+}
+
+input[type='number'],
+select {
+  font-family: var(--font-data);
+  background: var(--ink);
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  color: var(--text);
+  padding: 5px 8px;
+  width: 90px;
+  font-size: 13px;
+}
+select { width: auto; max-width: 170px; }
+
+input[type='number']:focus-visible,
+select:focus-visible,
+button:focus-visible,
+input[type='checkbox']:focus-visible,
+summary:focus-visible {
+  outline: 2px solid var(--edge);
+  outline-offset: 2px;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation-duration: 0.01ms !important;
+    transition-duration: 0.01ms !important;
+  }
+}

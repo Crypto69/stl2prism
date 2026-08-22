@@ -1,0 +1,35 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "stl2prism"
+version = "0.3.1"
+description = "Convert STL/OBJ meshes into prismatic STEP solids via extrusion-structure recognition, with a faceted-BREP fallback"
+readme = "README.md"
+license = "PolyForm-Noncommercial-1.0.0"
+license-files = ["LICENSE"]
+requires-python = ">=3.10"
+dependencies = [
+    "numpy",
+    "trimesh",
+    "shapely",
+    "networkx",
+    "rtree",
+    "scipy",
+    "cadquery",
+    "lxml",
+    "fast-simplification",
+]
+
+[project.optional-dependencies]
+scan = ["pymeshlab"]
+
+[project.scripts]
+stl2prism = "stl2prism.pipeline:main"
+
+[tool.setuptools.packages.find]
+include = ["stl2prism*"]
+
+[tool.pytest.ini_options]
+markers = ["slow: end-to-end runs over large sample meshes"]
