@@ -37,3 +37,6 @@ frontend/dist/
 
 # Generated conversions
 /output/
+
+# Internal hand-off notes — never published
+/HANDOFF*.md
