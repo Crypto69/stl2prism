@@ -1,0 +1,39 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+*.egg
+build/
+dist/
+.eggs/
+
+# Environments
+.venv/
+venv/
+env/
+
+# Tooling
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.ipynb_checkpoints/
+
+# OS / editor
+.DS_Store
+.idea/
+.vscode/
+
+# Output artifacts
+*.step
+*.STEP
+
+# Web app
+frontend/node_modules/
+frontend/dist/
+/data/
+
+# Local test input — never published
+/samples/
+
+# Generated conversions
+/output/
