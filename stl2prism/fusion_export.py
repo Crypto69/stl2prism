@@ -94,11 +94,41 @@ def emit_fusion_script(bodies_info, design_name='stl2prism'):
         '',
         '',
         'def _plane(root, origin, normal):',
-        '    """Construction plane through origin (cm) with the given normal."""',
-        '    inp = root.constructionPlanes.createInput()',
-        '    inp.setByPlane(adsk.core.Plane.create(adsk.core.Point3D.create(*origin),',
-        '                                          adsk.core.Vector3D.create(*normal)))',
-        '    return root.constructionPlanes.add(inp)',
+        '    """Construction plane through origin (cm) with the given normal.',
+        '    In a direct-modelling design any plane can be set directly; a',
+        '    parametric design only accepts planes defined from geometry, so',
+        '    there the plane is an offset of the origin plane perpendicular',
+        '    to the normal (the normal must then be along X, Y or Z). Returns',
+        '    (plane, sign): sign is -1 when the plane normal points against',
+        '    `normal`, so extrude distances must be negated."""',
+        '    planes = root.constructionPlanes',
+        '    design = root.parentDesign',
+        '    if design.designType == adsk.fusion.DesignTypes.DirectDesignType:',
+        '        inp = planes.createInput()',
+        '        inp.setByPlane(adsk.core.Plane.create(adsk.core.Point3D.create(*origin),',
+        '                                              adsk.core.Vector3D.create(*normal)))',
+        '        return planes.add(inp), 1.0',
+        '    mags = [abs(c) for c in normal]',
+        '    k = mags.index(max(mags))',
+        '    if mags[k] < 0.9999:',
+        "        raise RuntimeError('the extrusion axis %s is not along X, Y or Z; switch the design '",
+        "                           'to direct modelling (Design Settings > Do not capture design '",
+        "                           'history) and run the script again' % (tuple(round(c, 4) for c in normal),))",
+        '    base = (root.yZConstructionPlane, root.xZConstructionPlane, root.xYConstructionPlane)[k]',
+        '    target = sum(o * n for o, n in zip(origin, normal))     # signed distance along normal',
+        '    for off in (target, -target):',
+        '        inp = planes.createInput()',
+        '        inp.setByOffset(base, adsk.core.ValueInput.createByReal(off))',
+        '        pl = planes.add(inp)',
+        '        g = pl.geometry',
+        '        o = g.origin',
+        '        d = (o.x * normal[0] + o.y * normal[1] + o.z * normal[2]) - target',
+        '        if abs(d) < 1e-5:',
+        '            n = g.normal',
+        '            sign = 1.0 if (n.x * normal[0] + n.y * normal[1] + n.z * normal[2]) > 0 else -1.0',
+        '            return pl, sign',
+        '        pl.deleteMe()',
+        "    raise RuntimeError('could not place a construction plane at %s' % (origin,))",
         '',
         '',
         'def _pick(sketch, expected_cm2, rel=0.03):',
@@ -149,7 +179,7 @@ def emit_fusion_script(bodies_info, design_name='stl2prism'):
             z0, z1 = slab['z0'], slab['z1']
             h = z1 - z0
             L.append(f"{ind}# slab {si}: {z0:.3f} .. {z1:.3f} mm ({slab.get('kind', 'extrude')})")
-            L.append(f"{ind}pl = _plane(root, ({_cm(axis[0] * z0)}, {_cm(axis[1] * z0)}, {_cm(axis[2] * z0)}), AXIS)")
+            L.append(f"{ind}pl, sgn = _plane(root, ({_cm(axis[0] * z0)}, {_cm(axis[1] * z0)}, {_cm(axis[2] * z0)}), AXIS)")
             L.append(f"{ind}sk = root.sketches.add(pl)")
             if slab.get('kind') == 'loft' and slab.get('loft'):
                 ra, rb = slab['loft'][0], slab['loft'][1]
@@ -157,7 +187,7 @@ def emit_fusion_script(bodies_info, design_name='stl2prism'):
                     L += _ring_lines(oa, ind, W_at(z0), 'sk')
                     for x in ha:
                         L += _ring_lines(x, ind, W_at(z0), 'sk')
-                L.append(f"{ind}pl2 = _plane(root, ({_cm(axis[0] * z1)}, {_cm(axis[1] * z1)}, {_cm(axis[2] * z1)}), AXIS)")
+                L.append(f"{ind}pl2, _ = _plane(root, ({_cm(axis[0] * z1)}, {_cm(axis[1] * z1)}, {_cm(axis[2] * z1)}), AXIS)")
                 L.append(f"{ind}sk2 = root.sketches.add(pl2)")
                 for (ob, hb) in rb:
                     L += _ring_lines(ob, ind, W_at(z1), 'sk2')
@@ -179,7 +209,7 @@ def emit_fusion_script(bodies_info, design_name='stl2prism'):
                         L += _ring_lines(hring, ind, W_at(z0), 'sk')
                 L.append(f"{ind}profs = _pick(sk, {_material_areas_cm2(slab['rings'])})")
                 L.append(f"{ind}ei = extrudes.createInput(profs, newBody if first else join)")
-                L.append(f"{ind}ei.setDistanceExtent(False, adsk.core.ValueInput.createByReal({_cm(h)}))")
+                L.append(f"{ind}ei.setDistanceExtent(False, adsk.core.ValueInput.createByReal(sgn * {_cm(h)}))")
                 L.append(f"{ind}extrudes.add(ei)")
                 L.append(f"{ind}first = False")
         for c in info.get('cross_cyls', []):
@@ -192,12 +222,12 @@ def emit_fusion_script(bodies_info, design_name='stl2prism'):
             p0 = c3 + ax * (c['h0'] - e0)
             depth = (c['h1'] - c['h0']) + e0 + e1
             L.append(f"{ind}# cross-axis hole r={c['r']:.3f} mm")
-            L.append(f"{ind}pl = _plane(root, ({_cm(p0[0])}, {_cm(p0[1])}, {_cm(p0[2])}), ({ax[0]:.6f}, {ax[1]:.6f}, {ax[2]:.6f}))")
+            L.append(f"{ind}pl, sgn = _plane(root, ({_cm(p0[0])}, {_cm(p0[1])}, {_cm(p0[2])}), ({ax[0]:.6f}, {ax[1]:.6f}, {ax[2]:.6f}))")
             L.append(f"{ind}sk = root.sketches.add(pl)")
             L.append(f"{ind}sk.sketchCurves.sketchCircles.addByCenterRadius("
                      f"sk.modelToSketchSpace(adsk.core.Point3D.create({_cm(p0[0])}, {_cm(p0[1])}, {_cm(p0[2])})), {_cm(c['r'])})")
             L.append(f"{ind}ei = extrudes.createInput(sk.profiles.item(0), cut)")
-            L.append(f"{ind}ei.setDistanceExtent(False, adsk.core.ValueInput.createByReal({_cm(depth)}))")
+            L.append(f"{ind}ei.setDistanceExtent(False, adsk.core.ValueInput.createByReal(sgn * {_cm(depth)}))")
             L.append(f"{ind}extrudes.add(ei)")
         for c in info.get('cones', []):
             L.append(f"{ind}# cross-axis cone (countersink), half-angle {np.degrees(c['half_angle']):.1f} deg: "

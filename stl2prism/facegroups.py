@@ -1261,6 +1261,157 @@ def build_solid(mesh, regions, fit_tol=0.08, sew_tol=SEW_TOL, verbose=False):
     return solid, stats
 
 
+
+# --- export for downstream script generators -----------------------------------
+
+def _plane_basis_vectors(n):
+    """Two unit vectors spanning the plane with normal n."""
+    a = np.array([1.0, 0.0, 0.0]) if abs(n[0]) < 0.9 else np.array([0.0, 1.0, 0.0])
+    u = np.cross(n, a)
+    u /= np.linalg.norm(u)
+    return u, np.cross(n, u)
+
+
+def _angular_span(P, origin, axis, full_gap_deg=20.0):
+    """Angular range the points cover about the axis: (xref, a0, a1) with
+    angles in radians from xref by the right-hand rule, a1 > a0; a0 = a1 =
+    None when the points go (nearly) all the way round. The range starts
+    after the largest empty gap between the points' angles."""
+    xref, yref = _plane_basis_vectors(np.asarray(axis, float))
+    rel = P - origin
+    ang = np.sort(np.mod(np.arctan2(rel @ yref, rel @ xref), 2 * np.pi))
+    if len(ang) < 2:
+        return xref, None, None
+    gaps = np.diff(np.concatenate([ang, [ang[0] + 2 * np.pi]]))
+    k = int(np.argmax(gaps))
+    if gaps[k] < np.radians(full_gap_deg):
+        return xref, None, None
+    a0 = float(ang[(k + 1) % len(ang)])
+    a1 = a0 + float(2 * np.pi - gaps[k])
+    return xref, round(a0, 6), round(a1, 6)
+
+
+def _inside_points(mesh, rg, n_pts=4):
+    """A few points just inside the material next to this region: triangle
+    centroids pushed against the mesh normal (outward by convention), each
+    checked with mesh.contains. Used by the Fusion Boundary Fill script to
+    pick the cells that are material."""
+    F = mesh.faces[rg.faces]
+    areas = mesh.area_faces[rg.faces]
+    order = np.argsort(-areas)
+    if len(order) > n_pts:
+        stride = max(1, len(order) // n_pts)
+        order = np.concatenate([order[:1], order[1::stride][:n_pts - 1]])
+    cands, deltas = [], []
+    pr = rg.params
+    for k in order[:n_pts]:
+        c = mesh.vertices[F[k]].mean(axis=0)
+        nrm = mesh.face_normals[rg.faces[k]]
+        d = 0.3
+        if not rg.concave and rg.kind in ('cylinder', 'cone', 'sphere'):
+            # stay inside a convex round feature: never past its axis/centre
+            if rg.kind == 'sphere':
+                rl = float(pr['r'])
+            else:
+                o = pr['point'] if rg.kind == 'cylinder' else pr['apex']
+                rel = c - o
+                rl = float(np.linalg.norm(rel - (rel @ pr['axis']) * pr['axis']))
+            d = min(d, 0.45 * rl)
+        for dd in (d, 0.1, 0.03):
+            cands.append(c - nrm * dd)
+            deltas.append(dd)
+    if not cands:
+        return []
+    P = np.asarray(cands)
+    try:
+        ins = mesh.contains(P)
+    except Exception:
+        return []
+    out, seen = [], set()
+    for i in np.argsort(-np.asarray(deltas)):       # deepest first
+        if ins[i] and i // 3 not in seen:
+            seen.add(i // 3)
+            out.append(np.round(P[i], 4).tolist())
+    return out
+
+
+def export_regions(mesh, regions):
+    """Plain-dict description of every region's fitted surface (mm), with the
+    extent the region covers on it, for script generators that rebuild the
+    surfaces elsewhere (fusion_boundary_fill). Every region carries a fit
+    (single-seed regions are planes), so `built` only says whether the STEP
+    got an analytic face for it."""
+    from shapely.geometry import MultiPoint
+    out = []
+    V, F = mesh.vertices, mesh.faces
+    # Junctions: pairs of regions that share mesh edges, with the vertex ids
+    # on them (into mesh_vertices). The exporter merges neighbours that sit
+    # on the same surface, snaps tangent ones (fillet to plane) to exact
+    # tangency, and extends every tool far enough to cross each neighbour.
+    face_region = np.full(len(F), -1)
+    for rg in regions:
+        face_region[rg.faces] = rg.id
+    junction = {}
+    for (f0, f1), (v0, v1) in zip(mesh.face_adjacency, mesh.face_adjacency_edges):
+        a, b = int(face_region[f0]), int(face_region[f1])
+        if a == b or a < 0 or b < 0:
+            continue
+        junction.setdefault((a, b), set()).update((int(v0), int(v1)))
+        junction.setdefault((b, a), set()).update((int(v0), int(v1)))
+    for rg in regions:
+        pr = rg.params
+        vid = np.unique(F[rg.faces])
+        P = V[vid]
+        d = {'id': int(rg.id), 'kind': rg.kind, 'built': rg.built,
+             'n_faces': int(len(rg.faces)), 'area': round(float(rg.area), 4),
+             'concave': bool(rg.concave), 'resid': round(float(rg.resid), 5),
+             'inside': _inside_points(mesh, rg),
+             'adjacent': {b: sorted(vs) for (a, b), vs in junction.items() if a == rg.id}}
+        if rg.built != 'analytic':
+            # the STEP keeps this region as facets; the Fusion script does
+            # the same (the fit is there but was not good enough to trim)
+            d['faces'] = [int(i) for i in rg.faces]
+        if rg.kind == 'plane':
+            n = np.asarray(pr['normal'], float)
+            u, v = _plane_basis_vectors(n)
+            o = np.asarray(pr['point'], float)
+            rel = P - o
+            uv = np.c_[rel @ u, rel @ v]
+            hull = MultiPoint(uv).convex_hull
+            if hull.geom_type != 'Polygon':
+                # collinear/degenerate region: pad it to a thin strip
+                hull = hull.buffer(0.05, join_style=2)
+            xy = np.asarray(hull.exterior.coords)[:-1]
+            pts3 = o + np.outer(xy[:, 0], u) + np.outer(xy[:, 1], v)
+            d.update(normal=np.round(n, 7).tolist(), point=np.round(o, 5).tolist(),
+                     hull=np.round(pts3, 4).tolist())
+        elif rg.kind == 'cylinder':
+            ax = np.asarray(pr['axis'], float)
+            o = np.asarray(pr['point'], float)
+            h = (P - o) @ ax
+            xref, a0, a1 = _angular_span(P, o, ax)
+            d.update(axis=np.round(ax, 7).tolist(), point=np.round(o, 5).tolist(),
+                     r=round(float(pr['r']), 5),
+                     t0=round(float(h.min()), 4), t1=round(float(h.max()), 4),
+                     xref=np.round(xref, 7).tolist(), a0=a0, a1=a1)
+        elif rg.kind == 'cone':
+            ax = np.asarray(pr['axis'], float)
+            apex = np.asarray(pr['apex'], float)
+            h = (P - apex) @ ax
+            if abs(h.min()) > abs(h.max()):     # data on the negative side: flip
+                ax, h = -ax, -h
+            xref, a0, a1 = _angular_span(P, apex, ax)
+            d.update(axis=np.round(ax, 7).tolist(), apex=np.round(apex, 5).tolist(),
+                     half_angle=round(float(pr['half_angle']), 7),
+                     t0=round(float(h.min()), 4), t1=round(float(h.max()), 4),
+                     xref=np.round(xref, 7).tolist(), a0=a0, a1=a1)
+        elif rg.kind == 'sphere':
+            d.update(center=np.round(np.asarray(pr['center'], float), 5).tolist(),
+                     r=round(float(pr['r']), 5))
+        out.append(d)
+    return out
+
+
 def convert(mesh, tol=0.08, verbose=False):
     """segment → regularise → build → finish. Returns (TopoDS_Shape, stats);
     (None, stats) when the mesh is outside the engine's envelope; raises
@@ -1294,6 +1445,12 @@ def convert(mesh, tol=0.08, verbose=False):
         'faces_by_kind': dict(kinds),
         'resid_max': float(max(r.resid for r in regions)) if regions else 0.0,
         'volume': float(shape.Volume()),
+        'export': {'regions': export_regions(mesh, regions),
+                   'mesh_vertices': np.round(mesh.vertices, 4).tolist(),
+                   'mesh_faces': mesh.faces.tolist(),
+                   'mesh_volume': float(mesh.volume),
+                   'centroid': np.round(mesh.center_mass, 4).tolist(),
+                   'bbox': np.round(mesh.bounds, 4).tolist()},
     })
     if verbose:
         print(f"[fgroup] solid: {stats['faces_out']} faces "
