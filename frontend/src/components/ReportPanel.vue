@@ -258,8 +258,17 @@ const reduction = computed(() => {
       <a v-if="store.fusionScriptUrl" class="download secondary" :href="store.fusionScriptUrl" download>
         Download Fusion 360 script (.py) — experimental
       </a>
+      <a v-if="store.fusionBfillScriptUrl" class="download secondary" :class="{ risky: store.bfillCheck && !store.bfillCheck.ok }" :href="store.fusionBfillScriptUrl" download>
+        Download Fusion 360 script (Boundary Fill) — {{ store.bfillCheck && !store.bfillCheck.ok ? 'likely to fail' : 'experimental' }}
+      </a>
+      <p v-if="store.bfillCheck && !store.bfillCheck.ok" class="hint warn">
+        This one will probably not build in Fusion: {{ store.bfillCheck.reason }}. Fusion cannot resolve blends made of many small bands; the STEP is still fine.
+      </p>
       <p v-if="store.scriptUrl" class="hint">
         The script rebuilds the recognised sketches and extrudes as an editable program — change a radius or height and re-run it to get a new STEP.
+      </p>
+      <p v-if="store.fusionBfillScriptUrl" class="hint">
+        The Boundary Fill script rebuilds every fitted surface inside Fusion and lets Fusion compute the edges between them, so the face-group solid comes out without the mesh's zig-zag edges. Works on cleanly fitted parts; blends kept as many small bands (tori, tapered fillets) still defeat it. To run: put the .py in an empty folder, then in Fusion Utilities → Add-Ins → Scripts and Add-Ins → + → choose that folder → Run.
       </p>
     </section>
 
@@ -305,6 +314,8 @@ th { text-align: left; font-weight: 600; }
 .bodies td:first-child { color: var(--muted); }
 .bodies td.prismatic { color: var(--edge); font-weight: 600; }
 .bodies td.facegroup { color: var(--edge); }
+.download.risky { opacity: 0.7; }
+.hint.warn { color: var(--warn, #b26a00); }
 .bodies td.faceted { color: var(--text); }
 .bodies td.failed { color: var(--fail); font-weight: 600; }
 .bodies .detail { color: var(--muted); font-size: 12px; word-break: break-word; }

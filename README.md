@@ -81,6 +81,29 @@ Exit code 0 on success. The log reports which route produced the output
 deviation both ways, bore deviation, volume error) of prismatic and
 face-group results.
 
+Outputs next to the STEP: for prismatic results `<out>.py` (CadQuery) and
+`<out>_fusion.py` (Fusion 360 sketches + extrudes — verified: a fully
+parametric timeline you can edit); for face-group results
+`<out>_fusion_bfill.py` — an **experimental Fusion 360 Boundary Fill
+script**. It recreates every fitted plane, cylinder, cone and sphere
+slightly oversized as a temporary body, runs Boundary Fill, and keeps the
+cells that lie inside the original mesh (the mesh travels inside the
+script). Fusion's own kernel then computes the exact edges between the
+faces, so the solid comes out without the polyline edges of the STEP.
+
+To run either script in Fusion: put the `.py` in an empty folder of its
+own, then Utilities → Add-Ins → Scripts and Add-Ins → **+** → choose that
+folder → Run. Progress appears in the Text Commands panel (View → Show
+Text Commands).
+
+Boundary Fill status: verified on parts the engine fits cleanly (planes,
+cylinders, cones, spheres, fillets, holes — exact face counts). It fails
+where the engine keeps a blend as many short cylinder bands (torus blends,
+tapered corner fillets, pointed cones): the near-coincident sheets defeat
+Fusion's cell computation. Those blends are the next engine work (see
+Roadmap). Bodies with more than 200 regions get no script; `EXPAND` at the
+top of the script sets the oversize (1 mm by default).
+
 ## Web app
 
 A browser UI for the same pipeline: drag a mesh in, inspect it in 3D, set
@@ -246,9 +269,10 @@ spherical face) come out exact through the face-group engine.
 
 ## Limitations (v0.3)
 
-* The **CadQuery / Fusion script** only exists for prismatic results (the
-  extrusion engine is the only route that yields sketch + extrude structure);
-  face-group results are clean B-rep without a script.
+* The **CadQuery / Fusion sketch script** only exists for prismatic results
+  (the extrusion engine is the only route that yields sketch + extrude
+  structure); face-group results get the Boundary Fill script instead, which
+  works only on cleanly fitted parts (see Usage).
 * The face-group engine fits **planes, cylinders, cones and spheres**; tori
   (rolling-ball fillets around corners) and free-form blends keep their
   exact facets. It targets CAD exports (coplanar facet pairs); scans stay on
@@ -263,13 +287,14 @@ spherical face) come out exact through the face-group engine.
 
 In rough priority order:
 
+- **Torus fits and pointed cones in the face-group engine.** Rolling-ball
+  blends and tapered corner fillets are fitted as dozens of short cylinder
+  bands today; apex cones as planes. Fixing this cuts the STEP face count
+  and is what the Boundary Fill script needs to work on such parts.
 - **Clean intersection edges on face-group solids.** Today each analytic face
-  is bounded by the mesh's own polyline edges. First via a Fusion 360 script
-  that recreates the fitted surfaces oversized and lets Fusion's Boundary
-  Fill compute the true edges; later natively in the STEP.
-- **Torus fitting for corner blends** — the rolling-ball corners where two
-  fillets meet are still kept as facets, which is most of the face count on
-  filleted parts.
+  in the STEP is bounded by the mesh's own polyline edges. Done via the
+  Fusion 360 Boundary Fill script for cleanly fitted parts (experimental,
+  see Usage); still to do natively in the STEP.
 - **Named features in the generated script** — `hole()`, counterbores and
   `fillet()` calls instead of raw cylinder cuts.
 - **Region growing for 3D scans** — real faces on scanned parts instead of a

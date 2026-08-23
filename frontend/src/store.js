@@ -55,6 +55,11 @@ export const useConvertStore = defineStore('convert', {
       s.status === 'done' && s.result?.ok && s.result?.has_script
         ? `/api/jobs/${s.jobId}/fusion-script`
         : null,
+    bfillCheck: (s) => (s.status === 'done' && s.result?.ok ? s.result?.bfill_check || null : null),
+    fusionBfillScriptUrl: (s) =>
+      s.status === 'done' && s.result?.ok && s.result?.has_bfill_script
+        ? `/api/jobs/${s.jobId}/fusion-bfill-script`
+        : null,
   },
 
   actions: {

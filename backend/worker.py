@@ -36,6 +36,8 @@ def main():
         result.update(r, ok=True, output_stats=step_stats(out_path))
         result['has_script'] = bool(r.get('script'))
         result.pop('script', None)     # server path; the API serves it by job id
+        result['has_bfill_script'] = bool(r.get('bfill_script'))
+        result.pop('bfill_script', None)
     except Exception as e:
         traceback.print_exc()
         result['error'] = f'{type(e).__name__}: {e}'

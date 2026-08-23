@@ -164,6 +164,20 @@ def fusion_script(job_id: str):
     return FileResponse(path, media_type='text/x-python', filename=f'{safe}_fusion.py')
 
 
+@app.get('/api/jobs/{job_id}/fusion-bfill-script')
+def fusion_bfill_script(job_id: str):
+    """The Fusion 360 Boundary Fill script for face-group results."""
+    job = jobs.get(job_id)
+    if job is None:
+        raise HTTPException(404, 'unknown job')
+    path = os.path.join(jobs.job_dir(job_id), 'output_fusion_bfill.py')
+    if not os.path.exists(path):
+        raise HTTPException(404, 'no script')
+    stem = _EXT_RE.sub('', job.get('filename') or 'part')
+    safe = re.sub(r'[^\w.-]+', '_', stem) or 'part'
+    return FileResponse(path, media_type='text/x-python', filename=f'{safe}_fusion_bfill.py')
+
+
 @app.get('/api/jobs/{job_id}/download')
 def download(job_id: str):
     job = jobs.get(job_id)

@@ -163,11 +163,12 @@ def run(in_path, out_path, tol=0.08, accept_p95=0.25, accept_vol_pct=2.0,
         write_step([shape], out_path, names=[_body_name(in_path, 1, 1)])
         if verbose:
             print(f"[out] {mode} solid -> {out_path}")
-        script = _write_script([metrics.pop('build', {'mode': mode})], out_path,
-                               write_script, verbose)
+        script, bfill = _write_script([metrics.pop('build', {'mode': mode})], out_path,
+                                      write_script, verbose)
         return {'mode': mode, 'metrics': metrics,
                 'n_bodies': 1, 'n_written': 1, 'n_dropped': n_dropped,
-                'is_scan': bool(is_scan), 'script': script}
+                'is_scan': bool(is_scan), 'script': script, 'bfill_script': bfill,
+                'bfill_check': getattr(_write_bfill_script, 'last_check', None)}
 
     per_body, shapes = [], []
     for i, body in enumerate(bodies):
@@ -203,7 +204,7 @@ def run(in_path, out_path, tol=0.08, accept_p95=0.25, accept_vol_pct=2.0,
     for b in per_body:
         if b['metrics'] is not None:
             builds.append(b['metrics'].pop('build', {'mode': b['mode']}))
-    script = _write_script(builds, out_path, write_script, verbose)
+    script, bfill = _write_script(builds, out_path, write_script, verbose)
 
     n_pr = sum(1 for b in per_body if b['mode'] == 'prismatic')
     n_fg = sum(1 for b in per_body if b['mode'] == 'facegroup')
@@ -219,7 +220,9 @@ def run(in_path, out_path, tol=0.08, accept_p95=0.25, accept_vol_pct=2.0,
               + f") -> {out_path}")
     return {'mode': mode, 'metrics': _aggregate(per_body), 'bodies': per_body,
             'n_bodies': len(bodies), 'n_written': len(shapes),
-            'n_dropped': n_dropped, 'is_scan': bool(is_scan), 'script': script}
+            'n_dropped': n_dropped, 'is_scan': bool(is_scan), 'script': script,
+            'bfill_script': bfill,
+            'bfill_check': getattr(_write_bfill_script, 'last_check', None)}
 
 
 def _body_name(in_path, i, n):
@@ -229,15 +232,19 @@ def _body_name(in_path, i, n):
 
 
 def _write_script(builds, out_path, write_script, verbose):
-    """Write the CadQuery script next to the STEP (same stem, .py)."""
+    """Write the CadQuery script next to the STEP (same stem, .py), the
+    Fusion script for prismatic bodies (<stem>_fusion.py) and the Fusion
+    Boundary Fill script for face-group bodies (<stem>_fusion_bfill.py).
+    Returns (cadquery_script_path, bfill_script_path), each None if not written."""
     if not write_script:
-        return None
+        return None, None
+    bfill = _write_bfill_script(builds, out_path, verbose)
     if not any(b.get('mode') == 'prismatic' and 'slabs' in b for b in builds):
         # A script with no recognised bodies would be an empty program that
         # crashes on its first line; better no file than a broken one.
         if verbose:
             print('[out] no prismatic bodies; no script written')
-        return None
+        return None, bfill
     try:
         from .script_export import emit_script
         import os
@@ -257,11 +264,48 @@ def _write_script(builds, out_path, write_script, verbose):
         except Exception as e:
             if verbose:
                 print(f"[out] Fusion script export failed ({type(e).__name__}: {e})")
-        return py_path
+        return py_path, bfill
     except Exception as e:
         if verbose:
             print(f"[out] script export failed ({type(e).__name__}: {e})")
+        return None, bfill
+
+
+def _write_bfill_script(builds, out_path, verbose):
+    """Fusion 360 Boundary Fill script for face-group bodies. Returns the
+    path or None (no face-group body, or one too big for the script); the
+    outlook (will Fusion cope?) is left in `_write_bfill_script.last_check`."""
+    import os
+    _write_bfill_script.last_check = None
+    if not any(b.get('mode') == 'facegroup' and 'regions' in b for b in builds):
         return None
+    try:
+        from .fusion_boundary_fill import emit_boundary_fill_script, TooManyRegions, assess
+        stem = os.path.splitext(os.path.basename(out_path))[0]
+        text = emit_boundary_fill_script(builds, stem)
+        checks = [assess(b) for b in builds if b.get('mode') == 'facegroup' and 'regions' in b]
+        _write_bfill_script.last_check = {
+            'ok': all(c['ok'] for c in checks),
+            'bands': sum(c['bands'] for c in checks),
+            'unfitted': sum(c['unfitted'] for c in checks),
+            'tools': sum(c['tools'] for c in checks),
+            'reason': '; '.join(c['reason'] for c in checks if not c['ok']) or checks[0]['reason']}
+    except TooManyRegions as e:
+        if verbose:
+            print(f"[out] no Boundary Fill script: {e}")
+        return None
+    except Exception as e:
+        if verbose:
+            print(f"[out] Boundary Fill script export failed ({type(e).__name__}: {e})")
+        return None
+    fpath = os.path.splitext(out_path)[0] + '_fusion_bfill.py'
+    with open(fpath, 'w') as f:
+        f.write(text)
+    if verbose:
+        print(f"[out] Fusion 360 Boundary Fill script -> {fpath}")
+        c = _write_bfill_script.last_check
+        print(f"[out] Boundary Fill outlook: {'OK' if c['ok'] else 'LIKELY TO FAIL'} ({c['reason']})")
+    return fpath
 
 
 def _aggregate(per_body):
@@ -535,10 +579,15 @@ def _facegroup_body(mesh, verbose, tol, gates):
         if verbose:
             print(f"[check] face-group solid rejected: {'; '.join(why)}")
         return None
+    export = stats.pop('export', None)
     metrics['fgroup'] = {k: v for k, v in stats.items()
                          if k not in ('fallbacks',)}
     metrics['fgroup']['fallbacks'] = [list(f) for f in stats.get('fallbacks', [])][:20]
     metrics['faces_out'] = stats['faces_out']
+    if export is not None:
+        # the fitted surfaces, for the Fusion Boundary Fill script; popped
+        # out of the metrics by run() like the prismatic build record
+        metrics['build'] = dict(export, mode='facegroup')
     return shape, 'facegroup', metrics
 
 
