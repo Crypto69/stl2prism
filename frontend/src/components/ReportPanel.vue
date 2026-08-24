@@ -61,10 +61,10 @@ const verdict = computed(() => {
     if (r.mode === 'facegroup') {
       const fg = r.metrics?.fgroup || {}
       const bt = fg.by_type || {}
-      const kinds = [['plane', bt.plane], ['cylinder', bt.cylinder], ['cone', bt.cone], ['sphere', bt.sphere]]
-        .filter(([, n]) => n > 0).map(([k, n]) => `${n} ${k}${n === 1 ? '' : 's'}`).join(', ')
+      const kinds = [['plane', bt.plane], ['cylinder', bt.cylinder], ['cone', bt.cone], ['sphere', bt.sphere], ['torus', bt.torus]]
+        .filter(([, n]) => n > 0).map(([k, n]) => `${n} ${n === 1 ? k : (k === 'torus' ? 'tori' : k + 's')}`).join(', ')
       return { title: 'Face-group solid', cls: 'facegroup',
-               note: `The extrusion fit was rejected, so the mesh was grouped into surface regions and each got a real analytic face (${kinds || 'planes, cylinders, cones, spheres'}) — every gate below passed. No sketch+extrude script for this one.` }
+               note: `The extrusion fit was rejected, so the mesh was grouped into surface regions and each got a real analytic face (${kinds || 'planes, cylinders, cones, spheres, tori'}) — every gate below passed. No sketch+extrude script for this one.` }
     }
     return { title: 'Faceted solid', cls: 'faceted',
           note: r.is_scan && !r.params?.force_prismatic
@@ -268,7 +268,7 @@ const reduction = computed(() => {
         The script rebuilds the recognised sketches and extrudes as an editable program — change a radius or height and re-run it to get a new STEP.
       </p>
       <p v-if="store.fusionBfillScriptUrl" class="hint">
-        The Boundary Fill script rebuilds every fitted surface inside Fusion and lets Fusion compute the edges between them, so the face-group solid comes out without the mesh's zig-zag edges. Works on cleanly fitted parts; blends kept as many small bands (tori, tapered fillets) still defeat it. To run: put the .py in an empty folder, then in Fusion Utilities → Add-Ins → Scripts and Add-Ins → + → choose that folder → Run.
+        The Boundary Fill script rebuilds every fitted surface inside Fusion and lets Fusion compute the edges between them, so the face-group solid comes out without the mesh's zig-zag edges. Works on cleanly fitted parts (fillets around curved edges are one torus tool each); blends kept as many small bands (tapered corner fillets, pointed cones) still defeat it. To run: put the .py in an empty folder, then in Fusion Utilities → Add-Ins → Scripts and Add-Ins → + → choose that folder → Run.
       </p>
     </section>
 

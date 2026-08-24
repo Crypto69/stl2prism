@@ -32,6 +32,7 @@ CASES = [
     ('thin_ledge_0p15',    lambda: synth.flat_gentle_arc(0.15),  'prismatic', 13, 0.02),   # a 0.15 mm ledge is a level of its own, not merged away
     ('sphere_boss',        synth.sphere_boss,                    'facegroup', 7, 0.05),    # face-group engine: 6 planes + 1 analytic sphere
     ('fillet_top',         synth.fillet_top,                     'facegroup', 10, 0.05),   # face-group engine: 6 planes + 4 cylinders
+    ('boss_fillet_two',    synth.boss_fillet_two,                'facegroup', 12, 0.05),   # face-group engine: two rolling-ball blends -> 2 tori
 ]
 
 

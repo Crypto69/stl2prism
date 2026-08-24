@@ -20,8 +20,9 @@ on, dimension against, and constrain — replicating the core of Fusion 360's
 paid "Prismatic" mesh conversion, plus something Fusion does not give you: an
 **editable CadQuery script** of the sketches and extrudes it recognised.
 Guaranteed output: when a mesh isn't an extrusion, the **face-group engine**
-groups it into surface regions and gives each a real plane, cylinder, cone or
-sphere face (Fusion's face-group approach, in the open); regions nothing fits
+groups it into surface regions and gives each a real plane, cylinder, cone,
+sphere or torus face (Fusion's face-group approach, in the open; a
+rolling-ball fillet around a boss or a hole mouth is one torus face); regions nothing fits
 keep their exact facets; when even that fails, the tool falls back to a
 faceted (valid, manifold, coplanar-merged, tolerance-reduced) STEP solid
 instead of failing.
@@ -85,7 +86,7 @@ Outputs next to the STEP: for prismatic results `<out>.py` (CadQuery) and
 `<out>_fusion.py` (Fusion 360 sketches + extrudes — verified: a fully
 parametric timeline you can edit); for face-group results
 `<out>_fusion_bfill.py` — an **experimental Fusion 360 Boundary Fill
-script**. It recreates every fitted plane, cylinder, cone and sphere
+script**. It recreates every fitted plane, cylinder, cone, sphere and torus
 slightly oversized as a temporary body, runs Boundary Fill, and keeps the
 cells that lie inside the original mesh (the mesh travels inside the
 script). Fusion's own kernel then computes the exact edges between the
@@ -97,12 +98,13 @@ folder → Run. Progress appears in the Text Commands panel (View → Show
 Text Commands).
 
 Boundary Fill status: verified on parts the engine fits cleanly (planes,
-cylinders, cones, spheres, fillets, holes — exact face counts). It fails
-where the engine keeps a blend as many short cylinder bands (torus blends,
-tapered corner fillets, pointed cones): the near-coincident sheets defeat
-Fusion's cell computation. Those blends are the next engine work (see
-Roadmap). Bodies with more than 200 regions get no script; `EXPAND` at the
-top of the script sets the oversize (1 mm by default).
+cylinders, cones, spheres, fillets, holes — exact face counts). Torus blends
+(fillets around curved edges) are one torus tool each. It fails where the
+engine still keeps a blend as many short cylinder bands (tapered corner
+fillets, pointed cones): the near-coincident sheets defeat Fusion's cell
+computation. Those blends are the next engine work (see Roadmap). Bodies
+with more than 200 regions get no script; `EXPAND` at the top of the script
+sets the oversize (1 mm by default).
 
 ## Web app
 
@@ -200,8 +202,13 @@ features and local patching so that one axis need not explain everything.
      (simplest first) explains its **vertices** within a few microns and its
      facet interiors within the fit tolerance — the second test is what stops
      a wide plane and its first fillet strip from being fitted by an exact,
-     absurdly large cylinder. Directions, coaxial axes, coplanar offsets and
-     equal radii are then snapped within measurement uncertainty (reverted
+     absurdly large cylinder. A rolling-ball blend around a curved edge (a
+     boss-base fillet, a filleted hole mouth) comes out of growth as a chain
+     of short cylinder bands whose axes are all tangents of one circle; the
+     engine then fits a **torus** to each such chain (seeded from the bands'
+     own axes) and absorbs every neighbour it explains. Directions, coaxial
+     axes, coplanar offsets and equal radii are then snapped within
+     measurement uncertainty (reverted
      if a snap moves a surface off its vertices), and every region becomes
      one trimmed face on its fitted surface: boundary polylines projected
      onto the surface (a shared vertex table keeps both sides of every edge
@@ -241,13 +248,22 @@ volume ≤ 2 %). "faces" = ADVANCED_FACE count in the STEP.
 | servo_bracket_2 | 1,712 | prismatic | 19 (was 28) | 0.044 mm | 0.06 % |
 | top_arm_1 | 3,896 | prismatic (chamfered bosses as cones) | 44 (was 1,245 faceted) | 0.050 mm | 0.00 % |
 | top_arm_2 | 3,816 | prismatic | 40 (was 1,213 faceted) | 0.050 mm | 0.05 % |
-| joystick_claw_1 | 2,134 | face-group (63 cyl, 13 spheres, 6 cones) | 553 (was 671 patched) | 0.051 mm | 0.09 % |
-| joystick_claw_2 | 1,902 | face-group (43 cyl, 20 spheres, 5 cones) | 250 (was 341 faceted) | 0.050 mm | 0.10 % |
+| joystick_claw_1 | 2,134 | face-group (37 cyl, 8 spheres, 4 cones, 5 tori) | 514 (was 553 in v0.3.1, 671 patched) | 0.044 mm | 0.06 % |
+| joystick_claw_2 | 1,902 | face-group (20 cyl, 17 spheres, 5 cones, 5 tori) | 226 (was 250 in v0.3.1, 341 faceted) | 0.050 mm | 0.05 % |
 | frame | 4,200 | face-group (31 cyl, 5 cones) | 160 (was 516 faceted) | 0.022 mm | 0.01 % |
 | Mesh_90p (scan) | 2.17 M | faceted (scan route) | 39,575 | — | 0.00 % |
 
-The remaining planar faces on the face-group parts are blends (tori,
-free-form) that v1 keeps as exact facets.
+The remaining planar faces on the face-group parts are blends (tapered
+corner fillets, free-form) that v1 keeps as exact facets.
+
+v0.3.2 (torus fits): a rolling-ball blend around a curved edge is one torus
+face instead of a chain of short cylinder bands (boss-base fillet: 82 → 9
+faces; filleted hole mouth: 8 faces; the joystick claws lost 39 and 24
+faces). The band chains are found after region growing and the torus is
+seeded from the bands' own axes (every band axis is a tangent of the blend's
+centre circle), so parts without such chains are untouched. The Boundary
+Fill script emits one `createTorus` tool per blend. The frame's tapered pin
+is a cone with a rounded tip, not a torus — still bands (Roadmap).
 
 v0.3.1 (profile-fit fidelity): the prismatic profile fitter no longer lets
 one circle absorb an exactly straight wall next to a gentle arc (a flat
@@ -264,8 +280,10 @@ and blind holes, hollow parts, drafted blocks, chamfers, countersinks, small
 interior steps, tilted and rotated parts, tiny (3 mm) and huge (1.5 m) parts
 convert to the exact face count with sub-0.1 mm deviation on the prismatic
 route; a sphere boss (6 planes + 1 sphere), a top-edge-filleted box (6
-planes + 4 cylinders), a plate with a spherical dimple and an icosphere (one
-spherical face) come out exact through the face-group engine.
+planes + 4 cylinders), a plate with a spherical dimple, an icosphere (one
+spherical face), a boss with a filleted base (7 planes + 1 cylinder + 1
+torus) and a plate with a filleted hole mouth (6 + 1 + 1 torus) come out
+exact through the face-group engine.
 
 ## Limitations (v0.3)
 
@@ -273,11 +291,13 @@ spherical face) come out exact through the face-group engine.
   (the extrusion engine is the only route that yields sketch + extrude
   structure); face-group results get the Boundary Fill script instead, which
   works only on cleanly fitted parts (see Usage).
-* The face-group engine fits **planes, cylinders, cones and spheres**; tori
-  (rolling-ball fillets around corners) and free-form blends keep their
-  exact facets. It targets CAD exports (coplanar facet pairs); scans stay on
-  the faceted route. Face edges are the projected mesh polylines (chords),
-  not surface–surface intersection curves yet.
+* The face-group engine fits **planes, cylinders, cones, spheres and tori**
+  (constant-radius rolling-ball blends around curved edges); variable-radius
+  and free-form blends keep their exact facets or stay as short cylinder
+  bands, and a torus is only found where the blend spans at least three
+  such bands (about 10° of the ring). It targets CAD exports (coplanar facet
+  pairs); scans stay on the faceted route. Face edges are the projected mesh
+  polylines (chords), not surface–surface intersection curves yet.
 * Scan input defaults to faceted (`--force-prismatic` overrides); the scan
   repair ladder needs pymeshlab (Linux x86_64).
 * The CadQuery script reproduces the recognised extrusion structure; patched
@@ -287,10 +307,11 @@ spherical face) come out exact through the face-group engine.
 
 In rough priority order:
 
-- **Torus fits and pointed cones in the face-group engine.** Rolling-ball
-  blends and tapered corner fillets are fitted as dozens of short cylinder
-  bands today; apex cones as planes. Fixing this cuts the STEP face count
-  and is what the Boundary Fill script needs to work on such parts.
+- **Pointed cones and tapered corner fillets in the face-group engine.**
+  Apex cones are fitted as planes today and variable-radius corner fillets
+  as short cylinder bands. Fixing this cuts the STEP face count further and
+  is what the Boundary Fill script needs to work on such parts. (Torus fits
+  for rolling-ball blends landed in v0.3.2.)
 - **Clean intersection edges on face-group solids.** Today each analytic face
   in the STEP is bounded by the mesh's own polyline edges. Done via the
   Fusion 360 Boundary Fill script for cleanly fitted parts (experimental,

@@ -88,6 +88,36 @@ def fillet_top():
     return cq.Workplane('XY').box(40, 30, 10).edges('>Z').fillet(2)
 
 
+def boss_fillet():
+    """30x30x6 plate, D10 boss 8 tall, r1.5 fillet at the boss base: the
+    blend is a torus (concave side) -> 7 planes + 1 cylinder + 1 torus."""
+    plate = cq.Workplane('XY').box(30, 30, 6)
+    boss = cq.Workplane('XY').workplane(offset=3).circle(5).extrude(8)
+    return plate.union(boss).edges(cq.selectors.BoxSelector((-6, -6, 2.9), (6, 6, 3.1))).fillet(1.5)
+
+
+def boss_fillet_two():
+    """boss_fillet plus a second filleted boss on the +X face (a second
+    torus about another axis; no single extrusion axis, so the pipeline
+    takes the face-group route)."""
+    side = cq.Workplane('YZ').workplane(offset=15).circle(1.8).extrude(6)
+    part = boss_fillet().union(side)
+    return part.edges(cq.selectors.BoxSelector((14.9, -2.5, -2.5), (15.1, 2.5, 2.5))).fillet(0.8)
+
+
+def rounded_box():
+    """All 12 edges filleted: 6 planes + 12 cylinders + 8 spheres (the
+    corners are spheres, not tori)."""
+    return cq.Workplane('XY').box(30, 20, 10).edges().fillet(2)
+
+
+def filleted_hole():
+    """30x30x6 plate with a D8 through-hole whose top mouth is filleted
+    r1.5: the blend is a torus (convex side) -> 6 planes + 1 cylinder + 1 torus."""
+    plate = cq.Workplane('XY').box(30, 30, 6).faces('>Z').workplane().hole(8)
+    return plate.edges(cq.selectors.BoxSelector((-5, -5, 2.9), (5, 5, 3.1))).fillet(1.5)
+
+
 def small_step_inside():
     """Plate 100x100x8 with a 6 mm square, 0.4 mm-high pad in the middle of
     the top: too small (0.036 % of area) for the old level filter."""

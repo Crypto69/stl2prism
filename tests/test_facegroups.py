@@ -36,6 +36,28 @@ def test_fit_sphere_exact_and_noisy():
     assert fit_sphere((c + r * d)[:3]) is None
 
 
+def test_fit_torus_exact_and_noisy():
+    from stl2prism.features import fit_torus
+    rng = np.random.default_rng(1)
+    c, a, R, r = np.array([2.0, -1.0, 3.0]), np.array([0.0, 0.6, 0.8]), 6.5, 1.5
+    b0 = np.cross([1.0, 0.0, 0.0], a)
+    b0 /= np.linalg.norm(b0)
+    b1 = np.cross(a, b0)
+    # a quarter of the tube (a fillet's worth) all the way round the axis
+    u = rng.uniform(0, 2 * np.pi, 400)
+    v = rng.uniform(np.pi, 1.5 * np.pi, 400)
+    P = (c + np.outer((R + r * np.cos(v)) * np.cos(u), b0) + np.outer((R + r * np.cos(v)) * np.sin(u), b1)
+         + np.outer(r * np.sin(v), a))
+    # seed off by a few percent / degrees, as the band-chain seed is
+    a0 = a + np.array([0.03, -0.02, 0.0])
+    f = fit_torus(P, c + 0.2, a0, R * 1.05, r * 0.97)
+    assert np.allclose(f['center'], c, atol=1e-7) and abs(abs(f['axis'] @ a) - 1) < 1e-9
+    assert abs(f['R'] - R) < 1e-7 and abs(f['r'] - r) < 1e-7 and f['resid'] < 1e-7
+    f2 = fit_torus(P + rng.normal(0, 0.01, P.shape), c + 0.2, a0, R * 1.05, r * 0.97)
+    assert np.allclose(f2['center'], c, atol=0.01) and abs(f2['R'] - R) < 0.01 and abs(f2['r'] - r) < 0.01
+    assert fit_torus(P[:5], c, a, R, r) is None
+
+
 # --- segmentation -------------------------------------------------------------
 
 SEG_CASES = [
@@ -46,6 +68,10 @@ SEG_CASES = [
     ('fillet_top', synth.fillet_top, {'plane': 6, 'cylinder': 4}),
     ('plate_holes_fillets', synth.plate_holes_fillets, {'plane': 6, 'cylinder': 8}),
     ('stepped_shaft', synth.stepped_shaft, {'plane': 4, 'cylinder': 3}),
+    # rolling-ball blends: one torus each (concave boss base, convex hole mouth)
+    ('boss_fillet', synth.boss_fillet, {'plane': 7, 'cylinder': 1, 'torus': 1}),
+    ('filleted_hole', synth.filleted_hole, {'plane': 6, 'cylinder': 1, 'torus': 1}),
+    ('boss_fillet_two', synth.boss_fillet_two, {'plane': 8, 'cylinder': 2, 'torus': 2}),
 ]
 
 
@@ -88,6 +114,9 @@ ENGINE_CASES = [
     ('sphere_boss', synth.sphere_boss, 7, {'PLANE': 6, 'SPHERICAL_SURFACE': 1}),
     ('fillet_top', synth.fillet_top, 10, {'PLANE': 6, 'CYLINDRICAL_SURFACE': 4}),
     ('plate_holes_fillets', synth.plate_holes_fillets, 14, {'PLANE': 6, 'CYLINDRICAL_SURFACE': 8}),
+    ('boss_fillet', synth.boss_fillet, 9, {'PLANE': 7, 'CYLINDRICAL_SURFACE': 1, 'TOROIDAL_SURFACE': 1}),
+    ('filleted_hole', synth.filleted_hole, 8, {'PLANE': 6, 'CYLINDRICAL_SURFACE': 1, 'TOROIDAL_SURFACE': 1}),
+    ('boss_fillet_two', synth.boss_fillet_two, 12, {'PLANE': 8, 'CYLINDRICAL_SURFACE': 2, 'TOROIDAL_SURFACE': 2}),
 ]
 
 
@@ -133,6 +162,46 @@ def test_engine_reports_fitted_radius_exactly(tmp_path):
     assert len(radii) == 1 and abs(radii[0] - 8.0) < 1e-6, radii
 
 
+def test_engine_reports_torus_radii_exactly(tmp_path):
+    from OCP.BRep import BRep_Tool
+    from OCP.GeomAdaptor import GeomAdaptor_Surface
+    from OCP.GeomAbs import GeomAbs_Torus
+    from OCP.TopExp import TopExp_Explorer
+    from OCP.TopAbs import TopAbs_FACE
+    from OCP.TopoDS import TopoDS
+    from stl2prism import facegroups
+    m = _mesh(synth.boss_fillet(), tmp_path, 'boss_fillet')
+    shape, stats = facegroups.convert(m, tol=0.08)
+    assert stats['torus_merges'] == 1
+    tori = []
+    ex = TopExp_Explorer(shape, TopAbs_FACE)
+    while ex.More():
+        ad = GeomAdaptor_Surface(BRep_Tool.Surface_s(TopoDS.Face_s(ex.Current())))
+        if ad.GetType() == GeomAbs_Torus:
+            t = ad.Torus()
+            tori.append((t.MajorRadius(), t.MinorRadius(), t.Location().Z()))
+        ex.Next()
+    assert len(tori) == 1, tori
+    R, r, z = tori[0]
+    assert abs(R - 6.5) < 1e-6 and abs(r - 1.5) < 1e-6 and abs(z - 4.5) < 1e-6, tori
+    # the blend sits on the material side: concave, and exported as such
+    t = [g for g in stats['export']['regions'] if g['kind'] == 'torus'][0]
+    assert t['concave'] and t['R'] == 6.5 and t['r'] == 1.5 and t['a0'] is None
+    assert abs(t['v0'] - np.pi) < 0.02 and abs(t['v1'] - 1.5 * np.pi) < 0.02, t
+
+
+def test_rounded_box_corners_stay_spheres(tmp_path):
+    """Three fillets meeting at a box corner blend as a sphere, not a torus:
+    the band-chain merge must leave them alone (straight fillets are not
+    bands, and the corner has no band chain)."""
+    from stl2prism import facegroups
+    m = _mesh(synth.rounded_box(), tmp_path, 'rounded_box')
+    shape, stats = facegroups.convert(m, tol=0.08)
+    assert stats['torus_merges'] == 0 and stats['by_type'].get('torus', 0) == 0
+    assert stats['by_type']['sphere'] == 8 and stats['by_type']['plane'] == 6
+    assert stats['faces_by_kind']['sphere'] == 8 and stats['unfitted_regions'] == 0
+
+
 # --- guards -------------------------------------------------------------------
 
 def test_engine_steps_aside_on_scan_like_meshes(tmp_path):
@@ -169,6 +238,54 @@ def test_cone_tip_loops_are_refused_before_occ():
     assert not _loops_param_ok('cylinder', [list(range(6)) + [12]], vpos2, np.zeros(3), ax, 1.0)
     # a sphere cap around one pole is fine
     assert _loops_param_ok('sphere', [list(range(12))], vpos, np.zeros(3), ax, math.sqrt(2))
+
+
+def test_torus_loops_are_checked_in_both_periodic_directions():
+    """A torus is periodic round the axis (u) and round the tube (v): a
+    blend is a ring about the axis (two loops winding in u), a pipe elbow a
+    ring about the tube (two loops winding in v), or a patch; a loop that
+    winds both ways, three rings, or a chord jumping across the tube are
+    refused before OCC sees them."""
+    from stl2prism.facegroups import _loops_param_ok
+    R, r = 5.0, 1.5
+    c, ax = np.zeros(3), np.array([0.0, 0.0, 1.0])
+
+    def tp(u, v):
+        return np.array([(R + r * np.cos(v)) * np.cos(u), (R + r * np.cos(v)) * np.sin(u), r * np.sin(v)])
+
+    us = np.linspace(0, 2 * np.pi, 25)[:-1]
+    vs = np.linspace(0, 2 * np.pi, 13)[:-1]
+    ring_u = lambda v: np.array([tp(u, v) for u in us])          # noqa: E731
+    ring_v = lambda u: np.array([tp(u, v) for v in vs])          # noqa: E731
+    # fillet band: inner-lower quadrant, two rings about the axis
+    vpos = np.vstack([ring_u(np.pi), ring_u(1.5 * np.pi)])
+    assert _loops_param_ok('torus', [list(range(24)), list(range(24, 48))[::-1]], vpos, c, ax, R, r_minor=r)
+    # the same on the outer equator (v = 0 seam) is fine too
+    vpos = np.vstack([ring_u(0.0), ring_u(0.5 * np.pi)])
+    assert _loops_param_ok('torus', [list(range(24)), list(range(24, 48))[::-1]], vpos, c, ax, R, r_minor=r)
+    # one ring alone: a ring about the axis needs its partner
+    assert not _loops_param_ok('torus', [list(range(24))], vpos, c, ax, R, r_minor=r)
+    # pipe elbow: two rings about the tube, 90 deg apart in u
+    vpos = np.vstack([ring_v(0.0), ring_v(0.5 * np.pi)])
+    assert _loops_param_ok('torus', [list(range(12)), list(range(12, 24))[::-1]], vpos, c, ax, R, r_minor=r)
+    # three rings about the axis -> refuse
+    vpos = np.vstack([ring_u(np.pi), ring_u(1.25 * np.pi), ring_u(1.5 * np.pi)])
+    assert not _loops_param_ok('torus', [list(range(24)), list(range(24, 48)), list(range(48, 72))],
+                               vpos, c, ax, R, r_minor=r)
+    # a patch (60 deg of u, a quarter of v): one closed loop
+    uu = np.linspace(0, np.radians(60), 7)
+    vv = np.linspace(np.pi, 1.5 * np.pi, 5)
+    patch = np.vstack([[tp(u, vv[0]) for u in uu], [tp(uu[-1], v) for v in vv[1:]],
+                       [tp(u, vv[-1]) for u in uu[-2::-1]], [tp(uu[0], v) for v in vv[-2:0:-1]]])
+    assert _loops_param_ok('torus', [list(range(len(patch)))], patch, c, ax, R, r_minor=r)
+    # a loop that winds round the axis AND round the tube (a Villarceau-like
+    # helix closing on itself) is not a trimming loop
+    t = np.linspace(0, 2 * np.pi, 49)[:-1]
+    helix = np.array([tp(x, x) for x in t])
+    assert not _loops_param_ok('torus', [list(range(48))], helix, c, ax, R, r_minor=r)
+    # a chord jumping 180 deg across the tube -> refuse
+    bad = np.vstack([patch[:5], [tp(np.radians(40), 0.0)], patch[5:]])
+    assert not _loops_param_ok('torus', [list(range(len(bad)))], bad, c, ax, R, r_minor=r)
 
 
 def test_regularise_snaps_within_uncertainty_and_reverts_the_rest(tmp_path):
