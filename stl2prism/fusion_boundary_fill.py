@@ -24,11 +24,12 @@ Verified in Fusion 360 (2026-08-23) on six synthetic parts — planes,
 partial and full cylinders, tilted fillet cylinders, cones, a sphere,
 tangent fillets, through-holes: exact CAD face counts, volumes within 0.2%,
 clean tangent edges. Fails on parts where the face-group engine falls back
-to band clusters (a tapered corner fillet as short cylinder bands, an apex
-cone as 33 planes): Parasolid cannot resolve the near-coincident sheets and
-the main cell never closes. That is an engine limitation (apex cones —
-roadmap), not a script one. Rolling-ball blends around curved edges are one
-torus region each since the torus fit and become a single torus tool.
+to band clusters: Parasolid cannot resolve the near-coincident sheets and
+the main cell never closes. That is an engine limitation, not a script one.
+Rolling-ball blends around curved edges are one torus region each since the
+torus fit and become a single torus tool; apex cones (a pencil tip) and
+tapered pins are single cone regions since the cone merge — an apex-reaching
+cone emits one solid createCylinderOrCone tool.
 """
 import math
 import numpy as np
@@ -922,9 +923,13 @@ def _build(design, root, tbm, bd, log):
             tmp.append(b)
     if failed:
         log.append('{} surface(s) could not be created'.format(failed))
-    if len(tmp) < 4:
-        log.append('too few surfaces; skipped')
+    if not tmp:
+        log.append('no surfaces could be created; skipped')
         return []
+    # NOTE: no minimum count — closed tools (a sphere, a torus, a cone that
+    # reaches its apex) can bound cells with as little as one body, and a
+    # simple turned part is 3 tools (2026-08-24: the pencil part was skipped
+    # by an old "fewer than 4 sheets cannot close" rule)
 
     bodies = root.bRepBodies
     added = []
@@ -1080,8 +1085,8 @@ BAND_MAX_BANDS = 3      # more chained blend bands than this: Fusion is expected
 def assess(build):
     """Will Fusion's Boundary Fill cope with this body? The known failure
     signature is a blend the engine kept as a chain of short cylinder/cone
-    bands (torus blends, tapered corner fillets, pointed cones): their
-    near-coincident sheets defeat the cell computation. A band is a curved
+    bands (tapered corner fillets): their near-coincident sheets defeat the
+    cell computation. A band is a curved
     region shorter than its radius with a neighbour of the same kind, a
     similar radius and a nearby axis (length under 2.5 radii). Returns `ok`, `bands`,
     `unfitted`, `tools` and a one-line `reason`."""

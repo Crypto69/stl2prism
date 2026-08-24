@@ -118,6 +118,58 @@ def filleted_hole():
     return plate.edges(cq.selectors.BoxSelector((-5, -5, 2.9), (5, 5, 3.1))).fillet(1.5)
 
 
+def pencil():
+    """D8 shank 10 tall with a pointed cone tip (r4 -> 0 over 6): the tip is
+    an apex cone -> 1 plane + 1 cylinder + 1 cone with a degenerate apex."""
+    shank = cq.Workplane('XY').circle(4).extrude(10)
+    tip = cq.Solid.makeCone(4, 0, 6, cq.Vector(0, 0, 10), cq.Vector(0, 0, 1))
+    return shank.union(cq.Workplane(obj=tip))
+
+
+def _revolved_mesh(radius_fn, n_rings=13, dz=0.7, k=30):
+    """Watertight trimesh of a revolved profile with spiral tessellation
+    (each ring's vertices offset half a step): the ring misalignment mimics
+    real slicer/CAD exports and keeps growth from spanning the taper."""
+    zs = np.arange(0, n_rings) * dz
+    V, F = [], []
+    for j, z in enumerate(zs):
+        ang = (j % 2) * np.pi / k + np.arange(k) * 2 * np.pi / k
+        r = radius_fn(z)
+        V.append(np.column_stack([r * np.cos(ang), r * np.sin(ang), np.full(k, z)]))
+    V = np.vstack(V)
+    for j in range(n_rings - 1):
+        b0, b1 = j * k, (j + 1) * k
+        for i in range(k):
+            i2 = (i + 1) % k
+            F.append([b0 + i, b0 + i2, b1 + i])
+            F.append([b0 + i2, b1 + i2, b1 + i])
+    cb = len(V)
+    V = np.vstack([V, [[0, 0, zs[0]]], [[0, 0, zs[-1]]]])
+    top = (n_rings - 1) * k
+    for i in range(k):
+        i2 = (i + 1) % k
+        F.append([cb, i2, i])
+        F.append([cb + 1, top + i, top + i2])
+    return trimesh.Trimesh(np.asarray(V, float), np.asarray(F), process=True)
+
+
+def taper_pin_mesh():
+    """Two straight taper slopes (2.86 deg then 12.4 deg): with the fixed cone
+    seeding, growth alone fits exactly two cones. Mesh-level part (trimesh,
+    not a Workplane) for segment()-level tests."""
+    def radius(z):
+        return 3.0 - 0.05 * z if z <= 4.2 else 3.0 - 0.05 * 4.2 - 0.22 * (z - 4.2)
+    return _revolved_mesh(radius)
+
+
+def spiral_taper_mesh():
+    """Curved taper (slope 3.4 -> 14 deg): ring pairs fit spheres exactly, so
+    growth mints a stack of thin sphere bands — only the cone-chain merge
+    (which chains ring-like sphere bands) turns them into cones. Mesh-level
+    part (trimesh, not a Workplane) for segment()-level tests."""
+    return _revolved_mesh(lambda z: 3.0 - 0.06 * z - 0.012 * z * z)
+
+
 def small_step_inside():
     """Plate 100x100x8 with a 6 mm square, 0.4 mm-high pad in the middle of
     the top: too small (0.036 % of area) for the old level filter."""

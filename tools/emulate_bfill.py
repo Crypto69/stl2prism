@@ -95,9 +95,11 @@ def make(s):
         r1, r2 = max(1e-4, sl * ta), sl * tb
         p1 = [apex[i] + ta * ax[i] for i in range(3)]
         if sl * ta < 0.005:
+            # reaches the apex: the Fusion runtime builds a SOLID cone there
+            # (createCylinderOrCone), so keep the base disc too
             ax2, span = _ax2(p1, ax, xref, r1, None, None, slant)
-        else:
-            ax2, span = _ax2(p1, ax, xref, r1, a0, a1, slant)
+            return faces_of(BRepPrimAPI_MakeCone(ax2, r1, r2, tb - ta, span).Shape())
+        ax2, span = _ax2(p1, ax, xref, r1, a0, a1, slant)
         return faces_of(BRepPrimAPI_MakeCone(ax2, r1, r2, tb - ta, span).Shape(), True)
     if k == 'sphere':
         return faces_of(BRepPrimAPI_MakeSphere(gp_Pnt(*s[1]), s[2]).Shape())
