@@ -435,6 +435,43 @@ def _curved_face_mask(mesh, lo_deg=4.0, hi_deg=62.0, planar_min_faces=3,
     return in_band & ~planar_group[group_of]
 
 
+def fit_torus(pts, center0, axis0, R0, r0, max_nfev=200):
+    """Least-squares torus through 3-D points from an explicit seed: axis
+    (2 angles), centre (3), major radius R and minor radius r refined
+    jointly on the geometric residual hypot(rho - R, h) - r. Returns
+    {'center', 'axis', 'R', 'r', 'resid'} or None."""
+    pts = np.asarray(pts, float)
+    if len(pts) < 8:
+        return None
+    axis = np.asarray(axis0, float) / np.linalg.norm(axis0)
+    b0, b1 = _plane_basis(axis)
+
+    def unpack(x):
+        ax = axis + x[0] * b0 + x[1] * b1
+        ax /= np.linalg.norm(ax)
+        return ax, x[2:5], x[5], x[6]
+
+    def resid(x):
+        ax, c, R, r = unpack(x)
+        rel = pts - c
+        h = rel @ ax
+        rho = np.linalg.norm(rel - np.outer(h, ax), axis=1)
+        return np.hypot(rho - R, h) - r
+
+    x0 = np.r_[0.0, 0.0, np.asarray(center0, float), float(R0), float(r0)]
+    try:
+        from scipy.optimize import least_squares
+        sol = least_squares(resid, x0, method='lm', max_nfev=max_nfev)
+        x = sol.x
+    except Exception:
+        x = x0
+    ax, c, R, r = unpack(x)
+    if not (np.all(np.isfinite(x)) and R > 0 and r > 0):
+        return None
+    return {'center': np.array(c, float), 'axis': ax, 'R': float(R), 'r': float(r),
+            'resid': float(np.abs(resid(x)).max())}
+
+
 def _plane_basis(axis):
     x = np.cross([0, 1, 0], axis)
     if np.linalg.norm(x) < 1e-6:

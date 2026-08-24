@@ -24,10 +24,11 @@ Verified in Fusion 360 (2026-08-23) on six synthetic parts — planes,
 partial and full cylinders, tilted fillet cylinders, cones, a sphere,
 tangent fillets, through-holes: exact CAD face counts, volumes within 0.2%,
 clean tangent edges. Fails on parts where the face-group engine falls back
-to band clusters (a torus blend fitted as ~70 short cylinder bands, an apex
-cone as 33 planes, the frame sample's tapered pin): Parasolid cannot resolve
-the near-coincident sheets and the main cell never closes. That is an
-engine limitation (torus fits, apex cones — roadmap), not a script one.
+to band clusters (a tapered corner fillet as short cylinder bands, an apex
+cone as 33 planes): Parasolid cannot resolve the near-coincident sheets and
+the main cell never closes. That is an engine limitation (apex cones —
+roadmap), not a script one. Rolling-ball blends around curved edges are one
+torus region each since the torus fit and become a single torus tool.
 """
 import math
 import numpy as np
@@ -214,6 +215,8 @@ def _surface_record(rg):
                 _unit(rg.get('xref', (1, 0, 0))), rg.get('a0'), rg.get('a1'))
     if k == 'sphere':
         return ('sphere', _cm3(rg['center'], 9), _cm(rg['r'], 9))
+    if k == 'torus':
+        return ('torus', _cm3(rg['center'], 9), _unit(rg['axis']), _cm(rg['R'], 9), _cm(rg['r'], 9))
     raise ValueError(f"unknown region kind {k!r}")
 
 
@@ -246,6 +249,47 @@ def _snap_tangencies(regions, surfaces, penetrate_mm=0.0):
     order = sorted(range(len(regions)), key=lambda i: -regions[i]['area'])
     for i in order:
         r, s = regions[i], surfaces[i]
+        if s[0] == 'torus':
+            # a blend torus touches the plane perpendicular to its axis at
+            # r from its centre, and the coaxial cylinder it runs into at
+            # R = r_cyl +/- r: snap the centre along the axis / onto the
+            # cylinder's axis, and the major radius
+            c, ax, R, rad = np.asarray(s[1], float), np.asarray(s[2], float), s[3], s[4]
+            touched = []
+            for nid, vs in r.get('adjacent', {}).items():
+                if len(vs) < 2 or nid not in idx:
+                    continue
+                if nid in planes:
+                    o, n = planes[nid]
+                    if abs(ax @ n) < cos_tol:
+                        continue
+                    d = float((c - o) @ n)
+                    if abs(abs(d) - rad) <= gap_tol:
+                        c = c + (math.copysign(rad - pen, d) - d) * n
+                        touched.append(nid)
+                    continue
+                t = surfaces[idx[nid]]
+                if t[0] != 'cyl':
+                    continue
+                q, bx, rb = np.asarray(t[1], float), np.asarray(t[2], float), t[3]
+                if abs(ax @ bx) < cos_tol:
+                    continue
+                w = (c - q) - ((c - q) @ bx) * bx
+                if np.linalg.norm(w) > gap_tol:
+                    continue
+                for target, want in ((rb + rad, rb + rad - pen), (abs(rb - rad), abs(rb - rad) + pen)):
+                    if target > 0 and abs(R - target) <= gap_tol:
+                        c = c - w                       # onto the cylinder's axis
+                        R = want
+                        touched.append(nid)
+                        break
+            if touched:
+                for nid in touched:
+                    pairs.add((r['id'], nid))
+                    pairs.add((nid, r['id']))
+                surfaces[i] = ('torus', tuple(round(float(x), 9) for x in c), s[2],
+                               round(float(R), 9), rad)
+            continue
         if s[0] not in ('cyl', 'sphere'):
             continue
         p = np.asarray(s[1], float)
@@ -324,6 +368,10 @@ def _extensions(regions, surfaces, mesh_vertices, snapped):
             params[r['id']] = {'axis': np.asarray(r['axis'], float),
                                'apex': np.asarray(r['apex'], float),
                                'half_angle': float(r['half_angle'])}
+        elif k == 'torus':
+            params[r['id']] = {'center': np.asarray(r['center'], float),
+                               'axis': np.asarray(r['axis'], float),
+                               'R': float(r['R']), 'r': float(r['r'])}
         else:
             params[r['id']] = {'center': np.asarray(r['center'], float), 'r': float(r['r'])}
     for i, r in enumerate(regions):
@@ -341,6 +389,28 @@ def _extensions(regions, surfaces, mesh_vertices, snapped):
             reach = (np.abs(da) + np.abs(db)) / np.maximum(sin, 1e-3)
             need = max(need, float(reach.max()))
         emin = min(EXTEND_MAX_MM, EXTEND_FACTOR * need + 0.05)
+        # A blend torus tangent to both this cylinder and a plane (a boss base,
+        # a hole mouth) seals the cell between them only through tangent
+        # contacts, which Parasolid drops: the cylinder must reach through
+        # that plane itself, not stop at the fillet (verified in Fusion:
+        # the cell stays open otherwise).
+        if r['kind'] == 'cylinder':
+            ax = params[r['id']]['axis']
+            o = params[r['id']]['point']
+            for tid in r.get('adjacent', {}):
+                t = by_id.get(tid)
+                if t is None or t['kind'] != 'torus' or (r['id'], tid) not in snapped:
+                    continue
+                for pid in t.get('adjacent', {}):
+                    pl = by_id.get(pid)
+                    if pl is None or pl['kind'] != 'plane' or (tid, pid) not in snapped:
+                        continue
+                    n = params[pid]['normal']
+                    if abs(float(ax @ n)) < math.cos(math.radians(TANGENT_DEG)):
+                        continue
+                    tp = float((params[pid]['point'] - o) @ ax)
+                    beyond = max(r['t0'] - tp, tp - r['t1'], 0.0)
+                    emin = max(emin, min(EXTEND_MAX_MM, beyond + 0.1))
         s = surfaces[i]
         if s[0] == 'plane':
             surfaces[i] = s[:5] + (_cm(emin),) + s[6:]
@@ -429,6 +499,9 @@ def _drop_coincident_facets(regions):
                     continue
             elif k == 'sphere':
                 pr = {'center': np.asarray(t['center'], float), 'r': float(t['r'])}
+            elif k == 'torus':
+                pr = {'center': np.asarray(t['center'], float), 'axis': np.asarray(t['axis'], float),
+                      'R': float(t['R']), 'r': float(t['r'])}
             else:
                 continue
             if np.abs(DIST[k](P, pr)).max() < COINCIDENT_MM:
@@ -611,6 +684,34 @@ def _sphere_body(tbm, c, r):
     return tbm.createSphere(_pt(c), r)
 
 
+def _torus_body(tbm, c, ax, R, r):
+    """Whole torus (closed solid, like the sphere): a blend is a small part
+    of it, and cell selection keeps only the material side. createTorus in
+    Fusion does not honour the centre/axis arguments (2026-08-24: the torus
+    lands at the origin in the XY plane, radii correct), so build it there
+    on purpose and move it into place with an explicit transform."""
+    b = tbm.createTorus(_pt((0.0, 0.0, 0.0)), _vec((0.0, 0.0, 1.0)), R, r)
+    if b is None:
+        return None
+    z = [float(ax[0]), float(ax[1]), float(ax[2])]
+    seed = (0.0, 1.0, 0.0) if abs(z[1]) < 0.9 else (1.0, 0.0, 0.0)
+    x = [seed[1] * z[2] - seed[2] * z[1], seed[2] * z[0] - seed[0] * z[2],
+         seed[0] * z[1] - seed[1] * z[0]]
+    n = (x[0] ** 2 + x[1] ** 2 + x[2] ** 2) ** 0.5
+    x = [v / n for v in x]
+    y = [z[1] * x[2] - z[2] * x[1], z[2] * x[0] - z[0] * x[2],
+         z[0] * x[1] - z[1] * x[0]]
+    m = adsk.core.Matrix3D.create()
+    m.setToAlignCoordinateSystems(
+        adsk.core.Point3D.create(0.0, 0.0, 0.0),
+        adsk.core.Vector3D.create(1.0, 0.0, 0.0),
+        adsk.core.Vector3D.create(0.0, 1.0, 0.0),
+        adsk.core.Vector3D.create(0.0, 0.0, 1.0),
+        _pt(c), _vec(x), _vec(y), _vec(z))
+    tbm.transform(b, m)
+    return b
+
+
 def _make_surface(tbm, s):
     if s[0] == 'plane':
         return _plane_body(tbm, s[1], s[2], s[3], s[4], s[5])
@@ -620,6 +721,8 @@ def _make_surface(tbm, s):
         return _cone_body(tbm, s[1], s[2], s[3], s[4], s[5], s[6], s[7], s[8], s[9])
     if s[0] == 'sphere':
         return _sphere_body(tbm, s[1], s[2])
+    if s[0] == 'torus':
+        return _torus_body(tbm, s[1], s[2], s[3], s[4])
     return None
 
 

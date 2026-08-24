@@ -14,7 +14,8 @@ import time
 import numpy as np
 from OCP.gp import gp_Pnt, gp_Dir, gp_Ax2
 from OCP.BRepBuilderAPI import BRepBuilderAPI_MakePolygon, BRepBuilderAPI_MakeFace
-from OCP.BRepPrimAPI import BRepPrimAPI_MakeCylinder, BRepPrimAPI_MakeCone, BRepPrimAPI_MakeSphere
+from OCP.BRepPrimAPI import (BRepPrimAPI_MakeCylinder, BRepPrimAPI_MakeCone, BRepPrimAPI_MakeSphere,
+                             BRepPrimAPI_MakeTorus)
 from OCP.BOPAlgo import BOPAlgo_MakerVolume
 from OCP.TopTools import TopTools_ListOfShape
 from OCP.TopExp import TopExp_Explorer
@@ -100,6 +101,9 @@ def make(s):
         return faces_of(BRepPrimAPI_MakeCone(ax2, r1, r2, tb - ta, span).Shape(), True)
     if k == 'sphere':
         return faces_of(BRepPrimAPI_MakeSphere(gp_Pnt(*s[1]), s[2]).Shape())
+    if k == 'torus':
+        _, c, ax, R, r = s
+        return faces_of(BRepPrimAPI_MakeTorus(gp_Ax2(gp_Pnt(*c), gp_Dir(*ax)), R, r).Shape())
     raise ValueError(k)
 
 

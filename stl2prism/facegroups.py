@@ -37,8 +37,13 @@ MAX_FACES = 300000
 MAX_FITS = 20000            # least-squares fit budget per body (~20 s worst case)
 SEW_TOL = 1e-3              # sewing tolerance — deliberately NOT the fit tolerance
 ORDER = ('cylinder', 'sphere', 'cone')                 # simplest first (LMM)
-MINSUP = {'cylinder': 3, 'sphere': 8, 'cone': 6}       # seeds AND distinct normals
-MIN_SPREAD_DEG = {'cylinder': 6.0, 'cone': 6.0, 'sphere': 20.0}
+MINSUP = {'cylinder': 3, 'sphere': 8, 'cone': 6, 'torus': 8}   # seeds AND distinct normals
+MIN_SPREAD_DEG = {'cylinder': 6.0, 'cone': 6.0, 'sphere': 20.0, 'torus': 20.0}
+# Tori are not grown: a rolling-ball blend is found after growth as a chain
+# of short cylinder "bands" (each band's axis is a tangent of the torus
+# centre circle), see segment.merge_band_chains.
+BAND_MAX_LEN_R = 4.0        # a band: cylinder region no longer along its axis than this x r
+TORUS_MIN_USPAN_DEG = 10.0  # a torus must curve around its axis at least this much
 NORMAL_AGREE_DEG = 8.0      # facet normal vs fitted-surface normal at the centroid
 FIT_SAMPLE = 2000           # fit on at most this many vertices (deterministic stride)
 
@@ -50,7 +55,7 @@ class FaceGroupError(RuntimeError):
 @dataclass
 class Region:
     id: int
-    kind: str                       # 'plane' | 'cylinder' | 'cone' | 'sphere'
+    kind: str                       # 'plane' | 'cylinder' | 'cone' | 'sphere' | 'torus'
     faces: np.ndarray               # triangle indices
     seeds: list
     params: dict                    # see fit_* below
@@ -85,6 +90,13 @@ def _d_cone(p, pr):
     return rr * np.cos(pr['half_angle']) - h * np.sin(pr['half_angle'])
 
 
+def _d_torus(p, pr):
+    rel = p - pr['center']
+    h = rel @ pr['axis']
+    rho = np.linalg.norm(rel - np.outer(h, pr['axis']), axis=1)
+    return np.hypot(rho - pr['R'], h) - pr['r']
+
+
 def _n_plane(p, pr):
     return np.tile(pr['normal'], (len(p), 1))
 
@@ -110,8 +122,20 @@ def _n_cone(p, pr):
     return rn * np.cos(a) - pr['axis'] * np.sin(a)
 
 
-DIST = {'plane': _d_plane, 'cylinder': _d_cyl, 'sphere': _d_sph, 'cone': _d_cone}
-NORM = {'plane': _n_plane, 'cylinder': _n_cyl, 'sphere': _n_sph, 'cone': _n_cone}
+def _n_torus(p, pr):
+    """Unit normal away from the tube centre circle."""
+    rel = p - pr['center']
+    h = rel @ pr['axis']
+    rad = rel - np.outer(h, pr['axis'])
+    rho = np.maximum(np.linalg.norm(rad, axis=1), 1e-12)
+    w = rad * ((rho - pr['R']) / rho)[:, None] + np.outer(h, pr['axis'])
+    return w / np.maximum(np.linalg.norm(w, axis=1)[:, None], 1e-12)
+
+
+DIST = {'plane': _d_plane, 'cylinder': _d_cyl, 'sphere': _d_sph, 'cone': _d_cone,
+        'torus': _d_torus}
+NORM = {'plane': _n_plane, 'cylinder': _n_cyl, 'sphere': _n_sph, 'cone': _n_cone,
+        'torus': _n_torus}
 
 
 def _project(p, kind, pr):
@@ -138,6 +162,17 @@ def _project(p, kind, pr):
         a = pr['half_angle']
         g = np.cos(a) * pr['axis'] + np.sin(a) * (rad / n)   # generatrix direction
         return pr['apex'] + max(float(rel @ g), 0.0) * g
+    if kind == 'torus':
+        rel = p - pr['center']
+        h = rel @ pr['axis']
+        rad = rel - h * pr['axis']
+        n = np.linalg.norm(rad)
+        if n < 1e-12:
+            return p
+        q = pr['center'] + rad / n * pr['R']            # nearest tube-centre point
+        w = p - q
+        m = np.linalg.norm(w)
+        return p if m < 1e-12 else q + w / m * pr['r']
     return p
 
 
@@ -359,6 +394,12 @@ def segment(mesh, fit_tol=0.08, merge_tol=None, sharp_deg=SHARP_DEG,
                 h = (P - pr['apex']) @ pr['axis']
                 if h.min() < max(5 * merge_tol, 0.05 * (h.max() - h.min())):
                     return None            # loop through the apex: ShapeFix dies there
+            if final and kind == 'torus':
+                R = pr['R']
+                if R > 2 * diag or R < r + max(5 * merge_tol, 0.02 * r):
+                    return None            # spindle / self-intersecting, or a cylinder
+                if _u_span_deg(P, pr['center'], pr['axis']) < TORUS_MIN_USPAN_DEG:
+                    return None            # a cylinder band explains it
         return max(rv, rc)
 
     def support_ok(kind, members):
@@ -467,11 +508,202 @@ def segment(mesh, fit_tol=0.08, merge_tol=None, sharp_deg=SHARP_DEG,
                     assigned[s] = i
                 rg.id = i
 
+    def merge_band_chains():
+        """Rolling-ball blends around curved edges (a boss-base fillet, a
+        filleted hole mouth) come out of growth as chains of short cylinder
+        "bands": every band's axis is a tangent of the blend's centre circle
+        and its point lies on it. Fit one torus per chain, seeded from the
+        bands' own axes (exact to microns, unlike facet normals on a sliver),
+        then absorb every neighbouring region or free seed the torus explains.
+        Returns the number of tori made."""
+        from .features import fit_torus, _plane_basis
+        from .profile_fit import fit_circle_taubin
+
+        def axial_len(rg):
+            P = V[np.unique(F[rg.faces])]
+            h = (P - rg.params['point']) @ rg.params['axis']
+            return float(h.max() - h.min())
+
+        bands = [rg for rg in regions if rg.kind == 'cylinder' and rg.params['r'] < diag
+                 and axial_len(rg) <= BAND_MAX_LEN_R * rg.params['r']]
+        if len(bands) < 3:
+            return 0
+        is_band = {rg.id for rg in bands}
+
+        def region_nbrs(members):
+            out = set()
+            for s in members:
+                for n in nbrs[s]:
+                    j = int(assigned[n])
+                    if j >= 0:
+                        out.add(j)
+            return out
+
+        r_tol = fit_tol / 2
+        cos_lo, cos_hi = np.cos(np.radians(60.0)), np.cos(np.radians(0.5))
+        badj = {}
+        for rg in bands:
+            badj[rg.id] = set()
+            for j in region_nbrs(rg.seeds):
+                if j == rg.id or j not in is_band:
+                    continue
+                o = regions[j]
+                if abs(o.params['r'] - rg.params['r']) > max(r_tol, 0.1 * rg.params['r']):
+                    continue
+                c = abs(float(rg.params['axis'] @ o.params['axis']))
+                if cos_lo <= c <= cos_hi:
+                    badj[rg.id].add(j)
+        seen = set()
+        chains = []                                # BFS order each
+        for rg in bands:
+            if rg.id in seen:
+                continue
+            comp, queue = [], [rg.id]
+            seen.add(rg.id)
+            while queue:
+                i = queue.pop(0)
+                comp.append(i)
+                for j in sorted(badj[i]):
+                    if j not in seen:
+                        seen.add(j)
+                        queue.append(j)
+            if len(comp) >= 3:
+                chains.append(comp)
+
+        def seed_from(ids):
+            q = np.array([regions[i].params['point'] for i in ids])
+            t = np.array([regions[i].params['axis'] for i in ids])
+            _, v = np.linalg.eigh(t.T @ t)
+            a = v[:, 0]
+            b0, b1 = _plane_basis(a)
+            circ = fit_circle_taubin(np.column_stack([q @ b0, q @ b1]), polyline=False)
+            if circ is None:
+                return None
+            cu, cv = circ['center']
+            c = cu * b0 + cv * b1 + float((q @ a).mean()) * a
+            r = float(np.mean([regions[i].params['r'] for i in ids]))
+            return {'center': c, 'axis': a, 'R': float(circ['r']), 'r': r}
+
+        def refit(members, pr0):
+            faces, P = data(members)
+            nfits[0] += 1
+            f = fit_torus(_subsample(P), pr0['center'], pr0['axis'], pr0['R'], pr0['r'])
+            if f is None or evaluate('torus', f, faces, P, True) is None:
+                return None
+            return f
+
+        def explains(pr, members, extra):
+            """Does the torus explain `extra` seeds on top of `members`? The
+            candidate alone first (cheap), then the union (one sign of
+            concavity across the region)."""
+            faces, P = data(extra)
+            if evaluate('torus', pr, faces, P, False) is None:
+                return False
+            faces, P = data(members + extra)
+            return evaluate('torus', pr, faces, P, True) is not None
+
+        n_tori = 0
+        for chain in chains:
+            chain = [i for i in chain if regions[i] is not None]
+            if len(chain) < 3:
+                continue
+            pr, used = None, []
+            for k in sorted({3, 4, 6, len(chain)}):
+                if k > len(chain):
+                    break
+                ids = chain[:k]
+                sd = seed_from(ids)
+                if sd is None:
+                    continue
+                members = [s for i in ids for s in regions[i].seeds]
+                f = refit(members, sd)
+                if f is not None:
+                    pr, used = f, list(ids)
+                    break
+            if pr is None:
+                continue
+            since = 0
+            for i in chain:
+                if i in used:
+                    continue
+                if explains(pr, members, regions[i].seeds):
+                    members = members + regions[i].seeds
+                    since += 1
+                    used.append(i)
+                    if since >= 8:
+                        f = refit(members, pr)
+                        if f is not None:
+                            pr = f
+                        since = 0
+            used = set(used)
+            taken = set(members)
+            rejected = set()                       # seeds/regions refused under these params
+            while True:                            # absorb what the torus explains
+                changed = False
+                cand_r, cand_s = set(), set()
+                for s in members:
+                    for n in nbrs[s]:
+                        if n in taken:
+                            continue
+                        j = int(assigned[n])
+                        if j < 0:
+                            cand_s.add(int(n))
+                        elif j not in used:
+                            cand_r.add(j)
+                for j in sorted(cand_r):
+                    if ('r', j) in rejected:
+                        continue
+                    if explains(pr, members, regions[j].seeds):
+                        members = members + regions[j].seeds
+                        taken.update(regions[j].seeds)
+                        used.add(j)
+                        changed = True
+                    else:
+                        rejected.add(('r', j))
+                for n in sorted(cand_s):
+                    if ('s', n) in rejected:
+                        continue
+                    if explains(pr, members, [n]):
+                        members = members + [n]
+                        taken.add(n)
+                        changed = True
+                    else:
+                        rejected.add(('s', n))
+                if not changed:
+                    break
+                f = refit(members, pr)
+                if f is not None:
+                    pr = f
+                    rejected = set()               # new parameters: retry
+            f = refit(members, pr)
+            if f is not None:
+                pr = f
+            faces, P = data(members)
+            res = evaluate('torus', pr, faces, P, True)
+            if res is None or not support_ok('torus', members):
+                continue
+            rid = len(regions)
+            regions.append(Region(rid, 'torus', faces, list(members), pr, resid=res))
+            for j in used:
+                regions[j] = None
+            for s in members:
+                assigned[s] = rid
+            n_tori += 1
+        if n_tori:
+            regions[:] = [rg for rg in regions if rg is not None]
+            for i, rg in enumerate(regions):
+                if rg.id != i:
+                    for s in rg.seeds:
+                        assigned[s] = i
+                    rg.id = i
+        return n_tori
+
     order = list(np.argsort(-seed_area))
     grow(order)                                # strict pass
     cur_tol[0] = merge_relaxed
     grow([s for s in order if assigned[s] < 0])   # relaxed pass on leftovers only
     cur_tol[0] = merge_relaxed
+    n_tori = merge_band_chains()
 
     # leftover single seeds next to a curved region: absorb if the region's
     # own surface explains them (no refit)
@@ -529,7 +761,7 @@ def segment(mesh, fit_tol=0.08, merge_tol=None, sharp_deg=SHARP_DEG,
               f"merge tol {merge_tol:.4f}mm, {nfits[0]} fits, {time.time() - t0:.1f}s")
     segment.last_stats = {'seeds': ns, 'merge_tol': merge_tol, 'noise': noise,
                           'fits': nfits[0], 'fit_budget_hit': nfits[0] > max_fits,
-                          't_segment': time.time() - t0}
+                          'torus_merges': n_tori, 't_segment': time.time() - t0}
     return regions
 
 
@@ -567,7 +799,7 @@ def regularise(regions, mesh, fit_tol=0.08, merge_tol=None, verbose=False):
     for rg in regions:
         if rg.kind == 'plane':
             items.append((rg.area, rg.params['normal'].copy(), rg, 'normal'))
-        elif rg.kind in ('cylinder', 'cone'):
+        elif rg.kind in ('cylinder', 'cone', 'torus'):
             items.append((rg.area, rg.params['axis'].copy(), rg, 'axis'))
     items.sort(key=lambda t: -t[0])
     reps = []       # [weight, dir]
@@ -614,21 +846,23 @@ def regularise(regions, mesh, fit_tol=0.08, merge_tol=None, verbose=False):
 
     # 2. placement: coaxial cylinders/cones, coplanar planes -----------------------
     pos_tol = fit_tol / 2
-    axes = [rg for rg in regions if rg.kind in ('cylinder', 'cone')]
+    r_tol = fit_tol / 2
+    axes = [rg for rg in regions if rg.kind in ('cylinder', 'cone', 'torus')]
+    anchor = {'cylinder': 'point', 'cone': 'apex', 'torus': 'center'}
     used = set()
     for a in axes:
         if a.id in used:
             continue
         group = [a]
         da = a.params['axis']
-        pa = a.params['point'] if a.kind == 'cylinder' else a.params['apex']
+        pa = a.params[anchor[a.kind]]
         for b in axes:
             if b.id == a.id or b.id in used:
                 continue
             db = b.params['axis']
             if abs(float(da @ db)) < np.cos(np.radians(0.5)):
                 continue
-            pb = b.params['point'] if b.kind == 'cylinder' else b.params['apex']
+            pb = b.params[anchor[b.kind]]
             rel = pb - pa
             if np.linalg.norm(rel - (rel @ da) * da) <= pos_tol:
                 group.append(b)
@@ -637,20 +871,31 @@ def regularise(regions, mesh, fit_tol=0.08, merge_tol=None, verbose=False):
             # weighted mean of the axis lines' foot points on a common line
             foot = np.zeros(3)
             for g in group:
-                p = g.params['point'] if g.kind == 'cylinder' else g.params['apex']
+                p = g.params[anchor[g.kind]]
                 foot += g.area * (p - ((p - pa) @ da) * da)
             foot /= wsum
             for g in group:
                 used.add(g.id)
                 snapped.setdefault(g.id, dict(g.params))
-                p = g.params['point'] if g.kind == 'cylinder' else g.params['apex']
+                p = g.params[anchor[g.kind]]
                 shift = foot - (p - ((p - pa) @ da) * da)
                 if np.linalg.norm(shift) > 1e-12:
-                    if g.kind == 'cylinder':
-                        g.params['point'] = p + shift
-                    else:
-                        g.params['apex'] = p + shift
+                    g.params[anchor[g.kind]] = p + shift
                     stats['axes'] += 1
+            # a blend torus is tangent to the coaxial cylinder it runs into:
+            # its major radius is that cylinder's radius +/- the fillet radius
+            for g in group:
+                if g.kind != 'torus':
+                    continue
+                for h in group:
+                    if h.kind != 'cylinder':
+                        continue
+                    for target in (h.params['r'] + g.params['r'], abs(h.params['r'] - g.params['r'])):
+                        if target > 0 and abs(g.params['R'] - target) <= r_tol and \
+                                abs(g.params['R'] - target) > 1e-12:
+                            g.params['R'] = float(target)
+                            stats['radii'] += 1
+                            break
     planes = [rg for rg in regions if rg.kind == 'plane']
     used = set()
     # two parallel planes are one plane only within the uncertainty the
@@ -685,7 +930,7 @@ def regularise(regions, mesh, fit_tol=0.08, merge_tol=None, verbose=False):
 
     # 3. equality: radii (double-cap clustering as rebuild._global_snap) -------
     r_tol = fit_tol / 2
-    rr = sorted([rg for rg in regions if rg.kind in ('cylinder', 'sphere')],
+    rr = sorted([rg for rg in regions if rg.kind in ('cylinder', 'sphere', 'torus')],
                 key=lambda g: g.params['r'])
     cluster = []
 
@@ -761,6 +1006,19 @@ def _set_direction(rg, key, nd, P, fit_circle_taubin, _plane_basis):
         cu, cv = circ['center']
         rg.params['axis'] = nd
         rg.params['point'] = cu * b0 + cv * b1
+        rg.params['r'] = float(circ['r'])
+        return
+    if rg.kind == 'torus':
+        # fixed axis: the points are a circle in the meridian (rho, h) half-plane
+        rel = P - rg.params['center']
+        h = rel @ nd
+        rho = np.linalg.norm(rel - np.outer(h, nd), axis=1)
+        circ = fit_circle_taubin(np.column_stack([rho, h]), polyline=False)
+        if circ is None or circ['center'][0] <= circ['r']:
+            return
+        rg.params['axis'] = nd
+        rg.params['center'] = rg.params['center'] + float(circ['center'][1]) * nd
+        rg.params['R'] = float(circ['center'][0])
         rg.params['r'] = float(circ['r'])
         return
     if rg.kind == 'cone':
@@ -871,7 +1129,8 @@ def _make_surface(kind, pr, pts, bloops=None, sphere_axis=None):
     otherwise (holes around the pole break the trimmed face)."""
     from OCP.gp import gp_Ax3, gp_Pnt, gp_Dir, gp_Pln
     from OCP.Geom import (Geom_Plane, Geom_CylindricalSurface,
-                          Geom_ConicalSurface, Geom_SphericalSurface)
+                          Geom_ConicalSurface, Geom_SphericalSurface,
+                          Geom_ToroidalSurface)
     if bloops is None:
         bloops = []
     if kind == 'plane':
@@ -888,15 +1147,22 @@ def _make_surface(kind, pr, pts, bloops=None, sphere_axis=None):
         return Geom_SphericalSurface(gp_Ax3(gp_Pnt(*map(float, c)), gp_Dir(*map(float, d)),
                                             gp_Dir(*map(float, xd))), float(pr['r']))
     ax = pr['axis']
+    if kind == 'torus':
+        c = pr['center']
+        xd = _seam_xdir(c, ax, pts, bloops)
+        return Geom_ToroidalSurface(gp_Ax3(gp_Pnt(*map(float, c)), gp_Dir(*map(float, ax)),
+                                           gp_Dir(*map(float, xd))), float(pr['R']), float(pr['r']))
     org = pr['point'] if kind == 'cylinder' else pr['apex']
     xd = _seam_xdir(org, ax, pts, bloops)
     ax3 = gp_Ax3(gp_Pnt(*map(float, org)), gp_Dir(*map(float, ax)), gp_Dir(*map(float, xd)))
     if kind == 'cylinder':
         return Geom_CylindricalSurface(ax3, float(pr['r']))
-    return Geom_ConicalSurface(ax3, float(pr['half_angle']), 0.0)
+    if kind == 'cone':
+        return Geom_ConicalSurface(ax3, float(pr['half_angle']), 0.0)
+    raise ValueError(f'unknown surface kind {kind!r}')
 
 
-def _loops_param_ok(kind, loops, vpos, org, ax, r_ref):
+def _loops_param_ok(kind, loops, vpos, org, ax, r_ref, r_minor=None):
     """The boundary polylines must be well parametrised on a surface of
     revolution about (org, ax): no vertex within a sliver of the axis (its
     angle is meaningless there), no jump of more than 120 deg between
@@ -905,7 +1171,12 @@ def _loops_param_ok(kind, loops, vpos, org, ax, r_ref):
     the surface (a cone region must not contain the apex; a cylinder region
     is a patch or a band), and no self-intersection in UV. ShapeFix_Face
     crashes the process on wires that break these, so this runs BEFORE any
-    OCC call."""
+    OCC call.
+
+    A torus (r_ref = major radius R, r_minor = tube radius r) is periodic in
+    v as well: v is unwrapped like u, a loop may wind round the axis or
+    round the tube but not both, and the region is a patch, a ring about
+    the axis or a ring about the tube (two loops either way)."""
     from shapely.geometry import Polygon, LineString
     b0 = np.cross([0, 1, 0], ax)
     if np.linalg.norm(b0) < 1e-6:
@@ -914,6 +1185,7 @@ def _loops_param_ok(kind, loops, vpos, org, ax, r_ref):
     b1 = np.cross(ax, b0)
     rmin = max(5 * MERGE_TOL_MIN, 0.02 * r_ref)
     n_wind = 0
+    n_wind_v = 0
     for l in loops:
         rel = vpos[l] - org
         h = rel @ ax
@@ -928,19 +1200,34 @@ def _loops_param_ok(kind, loops, vpos, org, ax, r_ref):
             return False
         wind = float(du.sum())
         uu = np.r_[u[0], u[0] + np.cumsum(du)]           # unwrapped, closes at u0+wind
-        v = h if kind != 'sphere' else np.arcsin(np.clip(h / max(r_ref, 1e-12), -1, 1))
-        vv = np.r_[v, v[0]]
-        if abs(wind) < 0.5:
+        wind_v = 0.0
+        if kind == 'torus':
+            v = np.arctan2(h, rn - r_ref)
+            dv = np.diff(np.r_[v, v[0]])
+            dv = (dv + np.pi) % (2 * np.pi) - np.pi
+            if np.abs(dv).max() > np.radians(120):
+                return False
+            wind_v = float(dv.sum())
+            vv = np.r_[v[0], v[0] + np.cumsum(dv)]
+        else:
+            v = h if kind != 'sphere' else np.arcsin(np.clip(h / max(r_ref, 1e-12), -1, 1))
+            vv = np.r_[v, v[0]]
+        winds_u = abs(abs(wind) - 2 * np.pi) < 0.5
+        winds_v = abs(abs(wind_v) - 2 * np.pi) < 0.5
+        if abs(wind) < 0.5 and abs(wind_v) < 0.5:
             if not Polygon(np.column_stack([uu[:-1], vv[:-1]])).is_valid:
                 return False
-        elif abs(abs(wind) - 2 * np.pi) < 0.5:
-            n_wind += 1
+        elif winds_u != winds_v:
+            n_wind += int(winds_u)
+            n_wind_v += int(winds_v)
             if not LineString(np.column_stack([uu, vv])).is_simple:
                 return False
         else:
             return False
     if kind == 'sphere':
         return n_wind <= 2
+    if kind == 'torus':
+        return (n_wind, n_wind_v) in ((0, 0), (2, 0), (0, 2))
     return n_wind in (0, 2)
 
 
@@ -1020,6 +1307,10 @@ def _region_face(mesh, rg, vpos, loops, fit_tol):
             return None, 'axis'
     if rg.kind == 'cylinder':
         if not _loops_param_ok('cylinder', loops, vpos, rg.params['point'], rg.params['axis'], rg.params['r']):
+            return None, 'axis'
+    if rg.kind == 'torus':
+        if not _loops_param_ok('torus', loops, vpos, rg.params['center'], rg.params['axis'],
+                               rg.params['R'], r_minor=rg.params['r']):
             return None, 'axis'
     # sphere: pole placement candidates (centroid direction first; then away
     # from it, the largest facet, the world axes) — a hole around the pole
@@ -1272,6 +1563,22 @@ def _plane_basis_vectors(n):
     return u, np.cross(n, u)
 
 
+def _span_1d(ang, full_gap_deg=20.0):
+    """Range (a0, a1), a1 > a0, that a set of angles (radians) covers on the
+    circle, starting after the largest empty gap; (None, None) when the
+    angles go (nearly) all the way round."""
+    ang = np.sort(np.mod(np.asarray(ang, float), 2 * np.pi))
+    if len(ang) < 2:
+        return None, None
+    gaps = np.diff(np.concatenate([ang, [ang[0] + 2 * np.pi]]))
+    k = int(np.argmax(gaps))
+    if gaps[k] < np.radians(full_gap_deg):
+        return None, None
+    a0 = float(ang[(k + 1) % len(ang)])
+    a1 = a0 + float(2 * np.pi - gaps[k])
+    return round(a0, 6), round(a1, 6)
+
+
 def _angular_span(P, origin, axis, full_gap_deg=20.0):
     """Angular range the points cover about the axis: (xref, a0, a1) with
     angles in radians from xref by the right-hand rule, a1 > a0; a0 = a1 =
@@ -1279,16 +1586,30 @@ def _angular_span(P, origin, axis, full_gap_deg=20.0):
     after the largest empty gap between the points' angles."""
     xref, yref = _plane_basis_vectors(np.asarray(axis, float))
     rel = P - origin
-    ang = np.sort(np.mod(np.arctan2(rel @ yref, rel @ xref), 2 * np.pi))
-    if len(ang) < 2:
-        return xref, None, None
-    gaps = np.diff(np.concatenate([ang, [ang[0] + 2 * np.pi]]))
-    k = int(np.argmax(gaps))
-    if gaps[k] < np.radians(full_gap_deg):
-        return xref, None, None
-    a0 = float(ang[(k + 1) % len(ang)])
-    a1 = a0 + float(2 * np.pi - gaps[k])
-    return xref, round(a0, 6), round(a1, 6)
+    a0, a1 = _span_1d(np.arctan2(rel @ yref, rel @ xref), full_gap_deg)
+    return xref, a0, a1
+
+
+def _u_span_deg(P, origin, axis):
+    """How far round the axis the points go, in degrees (360 = all the way)."""
+    _, a0, a1 = _angular_span(P, origin, axis, full_gap_deg=5.0)
+    return 360.0 if a0 is None else float(np.degrees(a1 - a0))
+
+
+def _torus_uv(P, pr):
+    """(u, v) angles of points about a torus: u round the axis from an
+    arbitrary basis, v round the tube (0 = outer equator)."""
+    a = pr['axis']
+    b0 = np.cross([0, 1, 0], a)
+    if np.linalg.norm(b0) < 1e-6:
+        b0 = np.cross([1, 0, 0], a)
+    b0 /= np.linalg.norm(b0)
+    b1 = np.cross(a, b0)
+    rel = P - pr['center']
+    h = rel @ a
+    rad = rel - np.outer(h, a)
+    rho = np.linalg.norm(rad, axis=1)
+    return np.arctan2(rad @ b1, rad @ b0), np.arctan2(h, rho - pr['R'])
 
 
 def _inside_points(mesh, rg, n_pts=4):
@@ -1299,18 +1620,32 @@ def _inside_points(mesh, rg, n_pts=4):
     F = mesh.faces[rg.faces]
     areas = mesh.area_faces[rg.faces]
     order = np.argsort(-areas)
+    pr = rg.params
+    if rg.kind == 'torus' and rg.concave:
+        # a concave blend's material is a thin wedge between the tube and
+        # the two surfaces it is tangent to; probe from the middle of the
+        # tube span, where the wedge is deepest (near the tangent edges a
+        # probe pokes straight through into the neighbour's cell)
+        _, v = _torus_uv(mesh.triangles_center[rg.faces], pr)
+        v0, v1 = _span_1d(v)
+        if v0 is not None:
+            vmid = (v0 + v1) / 2.0
+            dv = np.abs((v - vmid + np.pi) % (2 * np.pi) - np.pi)
+            order = np.argsort(dv)
     if len(order) > n_pts:
         stride = max(1, len(order) // n_pts)
         order = np.concatenate([order[:1], order[1::stride][:n_pts - 1]])
     cands, deltas = [], []
-    pr = rg.params
     for k in order[:n_pts]:
         c = mesh.vertices[F[k]].mean(axis=0)
         nrm = mesh.face_normals[rg.faces[k]]
         d = 0.3
-        if not rg.concave and rg.kind in ('cylinder', 'cone', 'sphere'):
+        if rg.kind == 'torus' and rg.concave:
+            # never deeper than the wedge: r*(sqrt(2)-1) ~ 0.41 r at its middle
+            d = min(d, 0.3 * float(pr['r']))
+        if not rg.concave and rg.kind in ('cylinder', 'cone', 'sphere', 'torus'):
             # stay inside a convex round feature: never past its axis/centre
-            if rg.kind == 'sphere':
+            if rg.kind in ('sphere', 'torus'):
                 rl = float(pr['r'])
             else:
                 o = pr['point'] if rg.kind == 'cylinder' else pr['apex']
@@ -1408,6 +1743,15 @@ def export_regions(mesh, regions):
         elif rg.kind == 'sphere':
             d.update(center=np.round(np.asarray(pr['center'], float), 5).tolist(),
                      r=round(float(pr['r']), 5))
+        elif rg.kind == 'torus':
+            ax = np.asarray(pr['axis'], float)
+            c = np.asarray(pr['center'], float)
+            xref, a0, a1 = _angular_span(P, c, ax)
+            _, v = _torus_uv(P, pr)
+            v0, v1 = _span_1d(v)
+            d.update(center=np.round(c, 5).tolist(), axis=np.round(ax, 7).tolist(),
+                     R=round(float(pr['R']), 5), r=round(float(pr['r']), 5),
+                     xref=np.round(xref, 7).tolist(), a0=a0, a1=a1, v0=v0, v1=v1)
         out.append(d)
     return out
 

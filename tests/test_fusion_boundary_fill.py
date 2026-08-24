@@ -34,6 +34,7 @@ def _script_ns(text):
     ('fillet_top', synth.fillet_top, {'plane': 6, 'cylinder': 4}),
     ('sphere_boss', synth.sphere_boss, {'plane': 6, 'sphere': 1}),
     ('csk_plate', synth.csk_plate, {'plane': 6, 'cylinder': 4, 'cone': 4}),
+    ('boss_fillet', synth.boss_fillet, {'plane': 7, 'cylinder': 1, 'torus': 1}),
 ])
 def test_export_regions_and_script(tmp_path, name, builder, kinds):
     from collections import Counter
@@ -95,6 +96,13 @@ def test_export_regions_and_script(tmp_path, name, builder, kinds):
             assert 0 < half < math.pi / 2 and t1 > t0 >= 0
         elif s[0] == 'sphere':
             assert s[2] > 0
+        elif s[0] == 'torus':
+            _, c, ax, R, r = s
+            assert abs(np.linalg.norm(ax) - 1) < 1e-5 and R > r > 0
+            assert (np.asarray(c) >= lo).all() and (np.asarray(c) <= hi).all()
+    if 'torus' in kinds:
+        assert sum(1 for s in bd['surfaces'] if s[0] == 'torus') == kinds['torus']
+        assert 'createTorus' in text
     for p in bd['inside']:
         q = np.asarray(p[:3], float)
         assert (q >= lo).all() and (q <= hi).all()
@@ -192,18 +200,24 @@ def test_same_surface_neighbours_are_merged():
 
 
 def test_outlook_flags_band_blends(tmp_path):
-    """The outlook check must pass cleanly fitted parts and flag a torus
-    blend, which the engine keeps as a chain of short cylinder bands — the
-    one thing Fusion's Boundary Fill is known to choke on."""
-    import cadquery as cq
+    """The outlook check must pass cleanly fitted parts — including a torus
+    blend, which is one torus region since the torus fit — and flag a
+    blend kept as a chain of short cylinder bands, the one thing Fusion's
+    Boundary Fill is known to choke on."""
     from stl2prism.fusion_boundary_fill import assess
     _, stats = _regions(synth.fillet_top(), tmp_path, 'ft')
     c = assess(stats['export'])
     assert c['ok'] and c['bands'] == 0 and c['unfitted'] == 0
-    plate = cq.Workplane('XY').box(30, 30, 6)
-    boss = cq.Workplane('XY').workplane(offset=3).circle(5).extrude(8)
-    torus = plate.union(boss).edges(cq.selectors.BoxSelector((-6, -6, 2.9), (6, 6, 3.1))).fillet(1.5)
-    _, stats = _regions(torus, tmp_path, 'torus')
+    _, stats = _regions(synth.boss_fillet(), tmp_path, 'torus')
     c = assess(stats['export'])
-    assert not c['ok'] and c['bands'] > 10, c
-    assert 'blend bands' in c['reason']
+    assert c['ok'] and c['bands'] == 0, c
+    assert sum(1 for r in stats['export']['regions'] if r['kind'] == 'torus') == 1
+    # a chain of 24 short bands round a circle, each 15 deg from the next
+    regs = []
+    for i in range(24):
+        a = math.radians(15 * i)
+        regs.append({'id': i, 'kind': 'cylinder', 'built': 'analytic', 'area': 1.0,
+                     'axis': [-math.sin(a), math.cos(a), 0.0], 'point': [6.5 * math.cos(a), 6.5 * math.sin(a), 0.0],
+                     'r': 1.5, 't0': -0.8, 't1': 0.8, 'adjacent': {(i + 1) % 24: [0, 1], (i - 1) % 24: [2, 3]}})
+    c = assess({'regions': regs})
+    assert not c['ok'] and c['bands'] == 24 and 'blend bands' in c['reason'], c
