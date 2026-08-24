@@ -35,6 +35,7 @@ def _script_ns(text):
     ('sphere_boss', synth.sphere_boss, {'plane': 6, 'sphere': 1}),
     ('csk_plate', synth.csk_plate, {'plane': 6, 'cylinder': 4, 'cone': 4}),
     ('boss_fillet', synth.boss_fillet, {'plane': 7, 'cylinder': 1, 'torus': 1}),
+    ('pencil', synth.pencil, {'plane': 1, 'cylinder': 1, 'cone': 1}),
 ])
 def test_export_regions_and_script(tmp_path, name, builder, kinds):
     from collections import Counter
@@ -51,6 +52,10 @@ def test_export_regions_and_script(tmp_path, name, builder, kinds):
     if name == 'csk_plate':
         # through-holes go all the way round
         assert all(r['a0'] is None for r in regs if r['kind'] == 'cylinder')
+    if name == 'pencil':
+        # the tip cone reaches its apex: t0 = 0, full ring, one solid cone tool
+        c = [r for r in regs if r['kind'] == 'cone'][0]
+        assert c['t0'] == 0.0 and c['a0'] is None and not c['concave'], c
     for r in regs:
         assert r['inside'], f"region {r['id']} ({r['kind']}) has no inside point"
         assert m.contains(np.asarray(r['inside'])).all()
@@ -212,6 +217,13 @@ def test_outlook_flags_band_blends(tmp_path):
     c = assess(stats['export'])
     assert c['ok'] and c['bands'] == 0, c
     assert sum(1 for r in stats['export']['regions'] if r['kind'] == 'torus') == 1
+    # an apex cone is one clean cone region since the cone fits (v0.3.3);
+    # the stubby shank+cone pair still trips the band COUNTER (2 <= 3), but
+    # the verdict must stay ok and nothing may be left as facets
+    _, stats = _regions(synth.pencil(), tmp_path, 'pencil')
+    c = assess(stats['export'])
+    assert c['ok'] and c['bands'] <= 3 and c['unfitted'] == 0, c
+    assert sum(1 for r in stats['export']['regions'] if r['kind'] == 'cone') == 1
     # a chain of 24 short bands round a circle, each 15 deg from the next
     regs = []
     for i in range(24):

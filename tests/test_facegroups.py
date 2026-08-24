@@ -58,6 +58,28 @@ def test_fit_torus_exact_and_noisy():
     assert fit_torus(P[:5], c, a, R, r) is None
 
 
+def test_fit_cone_exact_and_noisy():
+    from stl2prism.features import fit_cone
+    rng = np.random.default_rng(2)
+    apex, a, al = np.array([1.0, 2.0, -3.0]), np.array([0.6, 0.0, 0.8]), np.radians(20.0)
+    b0 = np.cross([0.0, 1.0, 0.0], a)
+    b0 /= np.linalg.norm(b0)
+    b1 = np.cross(a, b0)
+    # a 140-degree sector of a frustum (the real case: a partial taper patch)
+    u = rng.uniform(0.3, 0.3 + np.radians(140), 300)
+    h = rng.uniform(2.0, 8.0, 300)
+    rad = h * np.tan(al)
+    P = apex + np.outer(h, a) + np.outer(rad * np.cos(u), b0) + np.outer(rad * np.sin(u), b1)
+    # seed off by a few degrees, as the chain seed is
+    a0 = a + np.array([0.05, 0.03, 0.0])
+    f = fit_cone(P, a0 / np.linalg.norm(a0), al * 1.15)
+    assert abs(f['axis'] @ a - 1) < 1e-9 and abs(f['half_angle'] - al) < 1e-9
+    assert np.allclose(f['apex'], apex, atol=1e-7) and f['resid'] < 1e-7
+    f2 = fit_cone(P + rng.normal(0, 0.01, P.shape), a0 / np.linalg.norm(a0), al * 1.15)
+    assert abs(f2['half_angle'] - al) < 0.01 and np.allclose(f2['apex'], apex, atol=0.05)
+    assert fit_cone(P[:5], a, al) is None
+
+
 # --- segmentation -------------------------------------------------------------
 
 SEG_CASES = [
@@ -72,6 +94,8 @@ SEG_CASES = [
     ('boss_fillet', synth.boss_fillet, {'plane': 7, 'cylinder': 1, 'torus': 1}),
     ('filleted_hole', synth.filleted_hole, {'plane': 6, 'cylinder': 1, 'torus': 1}),
     ('boss_fillet_two', synth.boss_fillet_two, {'plane': 8, 'cylinder': 2, 'torus': 2}),
+    # a pointed tip: one apex cone (closed at the tip by a degenerate edge)
+    ('pencil', synth.pencil, {'plane': 1, 'cylinder': 1, 'cone': 1}),
 ]
 
 
@@ -117,6 +141,7 @@ ENGINE_CASES = [
     ('boss_fillet', synth.boss_fillet, 9, {'PLANE': 7, 'CYLINDRICAL_SURFACE': 1, 'TOROIDAL_SURFACE': 1}),
     ('filleted_hole', synth.filleted_hole, 8, {'PLANE': 6, 'CYLINDRICAL_SURFACE': 1, 'TOROIDAL_SURFACE': 1}),
     ('boss_fillet_two', synth.boss_fillet_two, 12, {'PLANE': 8, 'CYLINDRICAL_SURFACE': 2, 'TOROIDAL_SURFACE': 2}),
+    ('pencil', synth.pencil, 3, {'PLANE': 1, 'CYLINDRICAL_SURFACE': 1, 'CONICAL_SURFACE': 1}),
 ]
 
 
@@ -190,6 +215,64 @@ def test_engine_reports_torus_radii_exactly(tmp_path):
     assert abs(t['v0'] - np.pi) < 0.02 and abs(t['v1'] - 1.5 * np.pi) < 0.02, t
 
 
+def test_engine_reports_cone_angle_exactly(tmp_path):
+    """The pencil's tip: one conical face closed at the apex by a degenerate
+    edge, with the exact half-angle and apex of the CAD part."""
+    from OCP.BRep import BRep_Tool
+    from OCP.GeomAdaptor import GeomAdaptor_Surface
+    from OCP.GeomAbs import GeomAbs_Cone
+    from OCP.TopExp import TopExp_Explorer
+    from OCP.TopAbs import TopAbs_FACE
+    from OCP.TopoDS import TopoDS
+    from stl2prism import facegroups
+    m = _mesh(synth.pencil(), tmp_path, 'pencil')
+    shape, stats = facegroups.convert(m, tol=0.08)
+    cones = []
+    ex = TopExp_Explorer(shape, TopAbs_FACE)
+    while ex.More():
+        ad = GeomAdaptor_Surface(BRep_Tool.Surface_s(TopoDS.Face_s(ex.Current())))
+        if ad.GetType() == GeomAbs_Cone:
+            c = ad.Cone()
+            a = c.Apex()
+            cones.append((c.SemiAngle(), a.X(), a.Y(), a.Z()))
+        ex.Next()
+    assert len(cones) == 1, cones
+    semi, ax_, ay_, az_ = cones[0]
+    assert abs(semi - math.atan2(4.0, 6.0)) < 1e-6
+    assert abs(ax_) < 1e-4 and abs(ay_) < 1e-4 and abs(az_ - 16.0) < 1e-4, cones
+    # the export record reaches the apex (t0 = 0) and runs all the way round
+    c = [g for g in stats['export']['regions'] if g['kind'] == 'cone'][0]
+    assert c['t0'] == 0.0 and c['a0'] is None and not c['concave'], c
+
+
+def test_taper_pin_grows_two_exact_cones():
+    """Two straight taper slopes: with Taubin-centred cone seeding, growth
+    alone fits exactly two cones — no bands, no merge needed."""
+    from collections import Counter
+    from stl2prism import facegroups
+    m = synth.taper_pin_mesh()
+    regs = facegroups.segment(m, fit_tol=0.08)
+    assert Counter(r.kind for r in regs) == {'plane': 2, 'cone': 2}
+    halves = sorted(np.degrees(r.params['half_angle']) for r in regs if r.kind == 'cone')
+    assert abs(halves[0] - np.degrees(np.arctan(0.05))) < 0.05
+    assert abs(halves[1] - np.degrees(np.arctan(0.22))) < 0.05
+    assert all(r.resid <= 0.08 for r in regs)
+
+
+def test_spiral_taper_sphere_bands_merge_to_cones():
+    """A curved taper on ring-aligned tessellation grows as thin 'sphere'
+    bands (any two vertex rings lie exactly on some sphere): the cone-chain
+    merge must chain those ring-like spheres and refit them as cones."""
+    from collections import Counter
+    from stl2prism import facegroups
+    m = synth.spiral_taper_mesh()
+    regs = facegroups.segment(m, fit_tol=0.08)
+    kinds = Counter(r.kind for r in regs)
+    assert kinds.get('sphere', 0) == 0 and kinds.get('cone', 0) >= 2, kinds
+    assert len(regs) <= 10 and facegroups.segment.last_stats['cone_merges'] >= 2
+    assert all(r.resid <= 0.08 for r in regs)
+
+
 def test_rounded_box_corners_stay_spheres(tmp_path):
     """Three fillets meeting at a box corner blend as a sphere, not a torus:
     the band-chain merge must leave them alone (straight fillets are not
@@ -231,8 +314,11 @@ def test_cone_tip_loops_are_refused_before_occ():
     vpos = np.vstack([ring, ring2])
     loops = [list(range(12)), list(range(12, 24))[::-1]]
     assert _loops_param_ok('cone', loops, vpos, np.zeros(3), ax, 2.0)
-    # a single ring around the axis: the region contains the apex -> refuse
+    # a single ring around the axis: the region contains the apex -> refused
+    # unless the caller says the apex cap is wanted (one ring + degenerate tip)
     assert not _loops_param_ok('cone', [list(range(12))], vpos, np.zeros(3), ax, 2.0)
+    assert _loops_param_ok('cone', [list(range(12))], vpos, np.zeros(3), ax, 2.0,
+                           apex_ok=True)
     # a vertex on the axis -> refuse
     vpos2 = np.vstack([ring, [[0.0, 0.0, 1.0]]])
     assert not _loops_param_ok('cylinder', [list(range(6)) + [12]], vpos2, np.zeros(3), ax, 1.0)

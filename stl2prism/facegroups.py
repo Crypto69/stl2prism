@@ -269,17 +269,40 @@ def _fit(kind, P, N, W, pre_tol=None):
             # garbage would grind to the cap
             return fit_cone(P, ax, float(half), max_nfev=40)
         if pre_tol is not None:
-            # fixed seeded axis: r = (h - h_apex) tan(alpha) is linear in h
-            c0 = P.mean(axis=0)
-            rel = P - c0
-            h = rel @ ax
-            rad = np.linalg.norm(rel - np.outer(h, ax), axis=1)
-            (a, b), *_ = np.linalg.lstsq(np.column_stack([h, np.ones(len(h))]), rad, rcond=None)
-            if not (a > 1e-6):
-                return None
-            al = np.arctan(a)
-            if np.abs((rad - (a * h + b)) * np.cos(al)).max() > pre_tol:
-                return None
+            # slice the patch into h-slabs along the seeded axis and Taubin-fit
+            # a circle per slab: on a cone the slab radii are linear in h and
+            # the centres lie on a line. One circle over the whole patch (used
+            # before v0.3.3) is meaningless for a tapering patch, and the old
+            # centroid-based radius rejected every sector of a real cone.
+            b0, b1 = _plane_basis(ax)
+            h0 = P @ ax
+            uv = np.column_stack([P @ b0, P @ b1])
+            k = 4 if len(P) >= 40 else 2
+            lim = np.linspace(h0.min() - 1e-9, h0.max() + 1e-9, k + 1)
+            hs, cs, rs = [], [], []
+            for i in range(k):
+                sel = (h0 >= lim[i]) & (h0 < lim[i + 1])
+                if sel.sum() < 5:
+                    continue
+                circ = fit_circle_taubin(uv[sel], polyline=False)
+                if circ is None:
+                    continue
+                hs.append(float(h0[sel].mean()))
+                cs.append(circ['center'])
+                rs.append(float(circ['r']))
+            if len(hs) >= 2 and max(hs) - min(hs) > 1e-9:
+                hs, cs, rs = np.array(hs), np.array(cs), np.array(rs)
+                A = np.column_stack([hs, np.ones(len(hs))])
+                (a, b), *_ = np.linalg.lstsq(A, rs, rcond=None)
+                dev_r = float(np.abs(rs - (a * hs + b)).max())
+                sol, *_ = np.linalg.lstsq(A, cs, rcond=None)
+                dev_c = float(np.linalg.norm(cs - A @ sol, axis=1).max())
+                if a < 0:
+                    ax, a = -ax, -a       # the cone opens against the seed
+                if not (a > 1e-6):
+                    return None
+                if max(dev_r, dev_c) * np.cos(np.arctan(a)) > pre_tol:
+                    return None
         return fit_cone(P, ax, float(half))
     return None
 
@@ -392,8 +415,21 @@ def segment(mesh, fit_tol=0.08, merge_tol=None, sharp_deg=SHARP_DEG,
                 return None
             if final and kind == 'cone':
                 h = (P - pr['apex']) @ pr['axis']
-                if h.min() < max(5 * merge_tol, 0.05 * (h.max() - h.min())):
-                    return None            # loop through the apex: ShapeFix dies there
+                span = h.max() - h.min()
+                if h.min() < -max(5 * merge_tol, 0.02 * span):
+                    return None            # crosses onto the mirror nappe: _d_cone
+                                           # can't tell the two apart
+                rad = np.linalg.norm((P - pr['apex']) - np.outer(h, pr['axis']), axis=1)
+                tip = rad.min() < max(2 * merge_tol, 0.005 * rad.max())
+                if (not tip
+                        and (h.min() < max(5 * merge_tol, 0.05 * span)
+                             or rad.min() < max(5 * merge_tol, 0.02 * rad.max()))
+                        and _u_span_deg(P, pr['apex'], pr['axis']) < 300.0):
+                    return None            # a slice near the apex or hugging the
+                                           # axis: no face can be built for it.
+                                           # A region holding the tip point itself
+                                           # (rad ~ 0) may keep growing — it closes
+                                           # into a full ring with a degenerate edge
             if final and kind == 'torus':
                 R = pr['R']
                 if R > 2 * diag or R < r + max(5 * merge_tol, 0.02 * r):
@@ -411,6 +447,22 @@ def segment(mesh, fit_tol=0.08, merge_tol=None, sharp_deg=SHARP_DEG,
             return False
         spread = np.degrees(np.arccos(np.clip((N @ N.T).min(), -1.0, 1.0)))
         return spread >= MIN_SPREAD_DEG[kind]
+
+    def buildable(kind, pr, P):
+        """Refuse committing a cone region no face can ever be built for: a
+        slice through (or hugging) its own apex/axis only closes as a full
+        ring with a degenerate tip edge. Checked at region COMMIT only — a
+        growing or merging region legitimately passes through sector states."""
+        if kind != 'cone':
+            return True
+        h = (P - pr['apex']) @ pr['axis']
+        span = h.max() - h.min()
+        rad = np.linalg.norm((P - pr['apex']) - np.outer(h, pr['axis']), axis=1)
+        if ((h.min() < max(5 * merge_tol, 0.05 * span)
+             or rad.min() < max(5 * merge_tol, 0.02 * rad.max()))
+                and _u_span_deg(P, pr['apex'], pr['axis']) < 300.0):
+            return False
+        return True
 
     def try_fit(kind, P, N, W):
         nfits[0] += 1
@@ -496,7 +548,7 @@ def segment(mesh, fit_tol=0.08, merge_tol=None, sharp_deg=SHARP_DEG,
                 continue
             faces, P = data(members)
             r = evaluate(kind, pr, faces, P, True)
-            if r is None or not support_ok(kind, members):
+            if r is None or not support_ok(kind, members) or not buildable(kind, pr, P):
                 for s in members:
                     assigned[s] = -1          # dissolve; the seeds stay free
                 continue
@@ -698,12 +750,294 @@ def segment(mesh, fit_tol=0.08, merge_tol=None, sharp_deg=SHARP_DEG,
                     rg.id = i
         return n_tori
 
+    def merge_cone_chains():
+        """A tapered pin or a pointed tip comes out of growth as a stack of
+        short cylinder bands / partial-ring sectors with near-parallel axes,
+        sometimes with a cone sector or two at the end: rings of one cone.
+        Chain such regions through the seed adjacency, seed a cone from the
+        chain (common axis from the members' axes, apex and half-angle from
+        a line fit of radius against height), refine with fit_cone and
+        absorb every neighbouring region or free seed it explains. A chain
+        whose taper is flat merges into one cylinder instead (coaxial
+        sectors of a single cylinder). Returns the number of merges."""
+        from .features import fit_cone, fit_cylinder
+
+        def rverts(rg):
+            return V[np.unique(F[rg.faces])]
+
+        def anchor(rg):
+            if rg.kind == 'sphere':
+                return rg.params['center']
+            return rg.params['point'] if rg.kind == 'cylinder' else rg.params['apex']
+
+        def ring_like(rg):
+            """A sphere region that is really a thin ring of a taper: any two
+            vertex rings about an axis lie exactly on some sphere, so growth
+            keeps minting these on ring-aligned tessellations. The giveaway
+            is that the points are nearly coplanar (the ring plane) — a real
+            cap or ball is fully three-dimensional."""
+            P = rverts(rg)
+            if len(P) < 8:
+                return None
+            Q = P - P.mean(axis=0)
+            _, sv, vt = np.linalg.svd(Q, full_matrices=False)
+            if sv[2] > 0.35 * sv[0]:
+                return None
+            inplane = np.linalg.norm(Q - np.outer(Q @ vt[2], vt[2]), axis=1)
+            return float(inplane.min()), float(inplane.max())
+
+        cands, rr = [], {}
+        for rg in regions:
+            if rg is None:
+                continue
+            if rg.kind == 'cone':
+                P = rverts(rg)
+                h = (P - rg.params['apex']) @ rg.params['axis']
+                t = np.tan(rg.params['half_angle'])
+                cands.append(rg)
+                rr[rg.id] = (max(0.0, float(t * h.min())), max(0.0, float(t * h.max())))
+            elif rg.kind == 'cylinder' and rg.params['r'] < diag:
+                cands.append(rg)
+                r = float(rg.params['r'])
+                rr[rg.id] = (r, r)
+            elif rg.kind == 'sphere' and rg.params['r'] < diag:
+                rl = ring_like(rg)
+                if rl is not None:
+                    cands.append(rg)
+                    rr[rg.id] = rl
+        if len(cands) < 2:
+            return 0
+        is_cand = {rg.id for rg in cands}
+
+        def region_nbrs(members):
+            out = set()
+            for s in members:
+                for n in nbrs[s]:
+                    j = int(assigned[n])
+                    if j >= 0:
+                        out.add(j)
+            return out
+
+        cos_par = np.cos(np.radians(30.0))
+        cadj = {}
+        for rg in cands:
+            cadj[rg.id] = set()
+            for j in region_nbrs(rg.seeds):
+                if j == rg.id or j not in is_cand:
+                    continue
+                o = regions[j]
+                if ('axis' in rg.params and 'axis' in o.params
+                        and abs(float(rg.params['axis'] @ o.params['axis'])) < cos_par):
+                    continue                   # spheres carry no axis to test
+                (alo, ahi), (blo, bhi) = rr[rg.id], rr[j]
+                pad = max(fit_tol, 0.15 * max(ahi, bhi))
+                if alo - pad > bhi or blo - pad > ahi:
+                    continue
+                cadj[rg.id].add(j)
+        seen = set()
+        chains = []                                # BFS order each
+        for rg in cands:
+            if rg.id in seen:
+                continue
+            comp, queue = [], [rg.id]
+            seen.add(rg.id)
+            while queue:
+                i = queue.pop(0)
+                comp.append(i)
+                for j in sorted(cadj[i]):
+                    if j not in seen:
+                        seen.add(j)
+                        queue.append(j)
+            if len(comp) >= 2 or regions[comp[0]].kind == 'cone':
+                # a lone cone still runs the absorb sweep: growth order can
+                # leave imposters on its flank (two vertex rings of a cone lie
+                # exactly on some sphere, so a 2-ring "sphere" band evaluates
+                # perfectly) and they only fall to the cone that owns them
+                chains.append(comp)
+
+        def seed_from(ids):
+            axes = [(regions[i].params['axis'],
+                     regions[i].area or len(regions[i].faces))
+                    for i in ids if 'axis' in regions[i].params]
+            centres = [regions[i].params['center'] for i in ids
+                       if regions[i].kind == 'sphere']
+            if axes:
+                t = np.array([x for x, _ in axes])
+                w = np.array([wt for _, wt in axes])
+                sgn = np.where(t @ t[0] < 0, -1.0, 1.0)
+                t = t * sgn[:, None]
+                _, ev = np.linalg.eigh((t * w[:, None]).T @ t)
+                a = ev[:, -1]                      # near-parallel: principal axis
+                if a @ t.sum(axis=0) < 0:
+                    a = -a
+            elif len(centres) >= 2:
+                # ring-sphere centres lie on the revolution axis
+                C = np.array(centres)
+                d = C[-1] - C[0]
+                n = np.linalg.norm(d)
+                if n < 10 * merge_tol:
+                    return None
+                a = d / n
+            else:
+                return None
+            P = np.concatenate([rverts(regions[i]) for i in ids])
+            o0 = P.mean(axis=0)
+            feet = list(centres)                   # sphere centres sit on the axis
+            for i in ids:
+                if 'axis' not in regions[i].params:
+                    continue
+                p, d = anchor(regions[i]), regions[i].params['axis']
+                dd = float(d @ a)
+                if abs(dd) < 0.5:
+                    continue
+                feet.append(p + (float((o0 - p) @ a) / dd) * d)
+            if not feet:
+                return None
+            foot = np.mean(feet, axis=0)
+            foot = foot - float((foot - o0) @ a) * a
+            rel = P - foot
+            h = rel @ a
+            rad = np.linalg.norm(rel - np.outer(h, a), axis=1)
+            (s, b), *_ = np.linalg.lstsq(np.column_stack([h, np.ones(len(h))]), rad, rcond=None)
+            if s < 0:
+                a, h, s = -a, -h, -s
+            if s < np.tan(np.radians(1.0)):
+                return 'cylinder', {'axis': a, 'point': foot, 'r': float(rad.mean())}
+            return 'cone', {'axis': a, 'apex': foot + (-b / s) * a,
+                            'half_angle': float(np.arctan(s))}
+
+        def refit(kind, members, pr0):
+            faces, P = data(members)
+            nfits[0] += 1
+            if kind == 'cone':
+                f = fit_cone(_subsample(P), pr0['axis'], float(pr0['half_angle']))
+            else:
+                f = fit_cylinder(_subsample(P), pr0['axis'])
+            if f is None or evaluate(kind, f, faces, P, True) is None:
+                return None
+            return f
+
+        def explains(kind, pr, members, extra):
+            faces, P = data(extra)
+            if evaluate(kind, pr, faces, P, False) is None:
+                return False
+            faces, P = data(members + extra)
+            return evaluate(kind, pr, faces, P, True) is not None
+
+        n_merged = 0
+        for chain in chains:
+            chain = [i for i in chain if regions[i] is not None]
+            if not chain or (len(chain) < 2 and regions[chain[0]].kind != 'cone'):
+                continue
+            kind, pr, used, members = None, None, [], []
+            ks = sorted({2, 3, 4, 6, len(chain)}) if len(chain) >= 2 else [1]
+            for start in range(len(chain)):     # a chain can mix a cylinder
+                for k in ks:                    # head with cone tails: slide
+                    if start + k > len(chain):  # the seed window until one fits
+                        break
+                    ids = chain[start:start + k]
+                    sd = seed_from(ids)
+                    if sd is None:
+                        continue
+                    members = [s for i in ids for s in regions[i].seeds]
+                    f = refit(sd[0], members, sd[1])
+                    if f is not None:
+                        kind, pr, used = sd[0], f, list(ids)
+                        break
+                if pr is not None:
+                    break
+            if pr is None:
+                continue
+            since = 0
+            for i in chain:
+                if i in used:
+                    continue
+                if explains(kind, pr, members, regions[i].seeds):
+                    members = members + regions[i].seeds
+                    since += 1
+                    used.append(i)
+                    if since >= 8:
+                        f = refit(kind, members, pr)
+                        if f is not None:
+                            pr = f
+                        since = 0
+            used = set(used)
+            taken = set(members)
+            rejected = set()
+            while True:                            # absorb what the cone explains
+                changed = False
+                cand_r, cand_s = set(), set()
+                for s in members:
+                    for n in nbrs[s]:
+                        if n in taken:
+                            continue
+                        j = int(assigned[n])
+                        if j < 0:
+                            cand_s.add(int(n))
+                        elif j not in used:
+                            cand_r.add(j)
+                for j in sorted(cand_r):
+                    if ('r', j) in rejected:
+                        continue
+                    if explains(kind, pr, members, regions[j].seeds):
+                        members = members + regions[j].seeds
+                        taken.update(regions[j].seeds)
+                        used.add(j)
+                        changed = True
+                    else:
+                        rejected.add(('r', j))
+                for n in sorted(cand_s):
+                    if ('s', n) in rejected:
+                        continue
+                    if explains(kind, pr, members, [n]):
+                        members = members + [n]
+                        taken.add(n)
+                        changed = True
+                    else:
+                        rejected.add(('s', n))
+                if not changed:
+                    break
+                f = refit(kind, members, pr)
+                if f is not None:
+                    pr = f
+                    rejected = set()               # new parameters: retry
+            if len(used) < 2 and len(members) <= sum(len(regions[j].seeds) for j in used):
+                continue                           # nothing actually merged
+            f = refit(kind, members, pr)
+            if f is not None:
+                pr = f
+            faces, P = data(members)
+            res = evaluate(kind, pr, faces, P, True)
+            if res is None or not support_ok(kind, members) or not buildable(kind, pr, P):
+                continue
+            rid = len(regions)
+            regions.append(Region(rid, kind, faces, list(members), pr, resid=res))
+            for j in used:
+                regions[j] = None
+            for s in members:
+                assigned[s] = rid
+            n_merged += 1
+        if n_merged:
+            regions[:] = [rg for rg in regions if rg is not None]
+            for i, rg in enumerate(regions):
+                if rg.id != i:
+                    for s in rg.seeds:
+                        assigned[s] = i
+                    rg.id = i
+        return n_merged
+
     order = list(np.argsort(-seed_area))
     grow(order)                                # strict pass
     cur_tol[0] = merge_relaxed
     grow([s for s in order if assigned[s] < 0])   # relaxed pass on leftovers only
     cur_tol[0] = merge_relaxed
     n_tori = merge_band_chains()
+    n_cones = 0
+    for _ in range(6):                         # one merge per chain per sweep;
+        n = merge_cone_chains()                # 6 sweeps bounds the run time and
+        n_cones += n                           # stops harmful over-consolidation
+        if not n:
+            break
 
     # leftover single seeds next to a curved region: absorb if the region's
     # own surface explains them (no refit)
@@ -761,7 +1095,8 @@ def segment(mesh, fit_tol=0.08, merge_tol=None, sharp_deg=SHARP_DEG,
               f"merge tol {merge_tol:.4f}mm, {nfits[0]} fits, {time.time() - t0:.1f}s")
     segment.last_stats = {'seeds': ns, 'merge_tol': merge_tol, 'noise': noise,
                           'fits': nfits[0], 'fit_budget_hit': nfits[0] > max_fits,
-                          'torus_merges': n_tori, 't_segment': time.time() - t0}
+                          'torus_merges': n_tori, 'cone_merges': n_cones,
+                          't_segment': time.time() - t0}
     return regions
 
 
@@ -1162,16 +1497,16 @@ def _make_surface(kind, pr, pts, bloops=None, sphere_axis=None):
     raise ValueError(f'unknown surface kind {kind!r}')
 
 
-def _loops_param_ok(kind, loops, vpos, org, ax, r_ref, r_minor=None):
+def _loops_param_ok(kind, loops, vpos, org, ax, r_ref, r_minor=None, apex_ok=False):
     """The boundary polylines must be well parametrised on a surface of
     revolution about (org, ax): no vertex within a sliver of the axis (its
     angle is meaningless there), no jump of more than 120 deg between
     consecutive vertices (a chord passing the axis/pole), each loop either
     closed in UV or winding exactly once, the winding count consistent with
-    the surface (a cone region must not contain the apex; a cylinder region
-    is a patch or a band), and no self-intersection in UV. ShapeFix_Face
-    crashes the process on wires that break these, so this runs BEFORE any
-    OCC call.
+    the surface (a cone region may contain the apex only when `apex_ok`,
+    where a single ring bounds an apex cap; a cylinder region is a patch or
+    a band), and no self-intersection in UV. ShapeFix_Face crashes the
+    process on wires that break these, so this runs BEFORE any OCC call.
 
     A torus (r_ref = major radius R, r_minor = tube radius r) is periodic in
     v as well: v is unwrapped like u, a loop may wind round the axis or
@@ -1228,6 +1563,8 @@ def _loops_param_ok(kind, loops, vpos, org, ax, r_ref, r_minor=None):
         return n_wind <= 2
     if kind == 'torus':
         return (n_wind, n_wind_v) in ((0, 0), (2, 0), (0, 2))
+    if kind == 'cone' and apex_ok and n_wind == 1:
+        return True                     # apex cap: one ring, apex inside
     return n_wind in (0, 2)
 
 
@@ -1289,6 +1626,124 @@ def _face_vertices_near(face, vpos, loops, tol):
     return True
 
 
+def _apex_cone_face(mesh, rg, vpos, loops, fit_tol):
+    """A cone face that CONTAINS the apex: one ring boundary, closed at the
+    tip by a degenerate edge. MakeFace + ShapeFix cannot synthesise the seam
+    and the degenerate edge for this case (it segfaults or yields a sliver),
+    so the face is assembled by hand: ring edges carry degree-1 B-spline
+    pcurves parameterised over each edge's own 3-D range, the seam generatrix
+    carries one pcurve per side, and the apex is a degenerate edge at v=0."""
+    from OCP.gp import gp_Ax3, gp_Pnt, gp_Dir, gp_Pnt2d
+    from OCP.Geom import Geom_ConicalSurface
+    from OCP.Geom2d import Geom2d_BSplineCurve
+    from OCP.GCE2d import GCE2d_MakeSegment
+    from OCP.TColgp import TColgp_Array1OfPnt2d
+    from OCP.TColStd import TColStd_Array1OfReal, TColStd_Array1OfInteger
+    from OCP.BRep import BRep_Builder, BRep_Tool
+    from OCP.BRepBuilderAPI import BRepBuilderAPI_MakeEdge, BRepBuilderAPI_MakeVertex
+    from OCP.TopoDS import TopoDS_Face, TopoDS_Wire, TopoDS_Edge
+    from OCP.TopAbs import TopAbs_REVERSED, TopAbs_FORWARD
+    from OCP.BRepCheck import BRepCheck_Analyzer
+    from OCP.GProp import GProp_GProps
+    from OCP.BRepGProp import BRepGProp
+
+    if len(loops) != 1:
+        return None, 'apex loops'
+    apex = np.asarray(rg.params['apex'], float)
+    axis = np.asarray(rg.params['axis'], float)
+    half = float(rg.params['half_angle'])
+    ring = vpos[np.asarray(loops[0])]
+    keep = np.linalg.norm(ring - np.roll(ring, 1, axis=0), axis=1) > 1e-9
+    ring = ring[keep]
+    if len(ring) < 3:
+        return None, 'apex ring'
+    b0 = np.cross([0, 1, 0], axis)
+    if np.linalg.norm(b0) < 1e-6:
+        b0 = np.cross([1, 0, 0], axis)
+    b0 /= np.linalg.norm(b0)
+    b1 = np.cross(axis, b0)
+
+    def params(R):
+        rel = R - apex
+        h = rel @ axis
+        v = h / np.cos(half)
+        u = np.arctan2(rel @ b1, rel @ b0)
+        du = np.diff(u)
+        du = (du + np.pi) % (2 * np.pi) - np.pi
+        uu = np.r_[u[0], u[0] + np.cumsum(du)]
+        dlast = (u[0] - uu[-1] + np.pi) % (2 * np.pi) - np.pi
+        return uu, v, (uu[-1] + dlast) - uu[0]
+
+    uu, v, wind = params(ring)
+    if wind < 0:
+        ring = ring[::-1]
+        uu, v, wind = params(ring)
+    if abs(wind - 2 * np.pi) > 0.5 or v.min() <= 10 * MERGE_TOL_MIN:
+        return None, 'apex ring'
+    uuc = np.r_[uu, uu[0] + 2 * np.pi]
+    vvc = np.r_[v, v[0]]
+    tol = max(1e-6, 0.5 * fit_tol)
+
+    def pseg(p0, p1, t1):
+        poles = TColgp_Array1OfPnt2d(1, 2)
+        poles.SetValue(1, gp_Pnt2d(float(p0[0]), float(p0[1])))
+        poles.SetValue(2, gp_Pnt2d(float(p1[0]), float(p1[1])))
+        knots = TColStd_Array1OfReal(1, 2)
+        knots.SetValue(1, 0.0)
+        knots.SetValue(2, float(t1))
+        mult = TColStd_Array1OfInteger(1, 2)
+        mult.SetValue(1, 2)
+        mult.SetValue(2, 2)
+        return Geom2d_BSplineCurve(poles, knots, mult, 1)
+
+    surf = Geom_ConicalSurface(gp_Ax3(gp_Pnt(*map(float, apex)), gp_Dir(*map(float, axis)),
+                                      gp_Dir(*map(float, b0))), half, 0.0)
+    B = BRep_Builder()
+    face = TopoDS_Face()
+    B.MakeFace(face, surf, tol)
+    verts = [BRepBuilderAPI_MakeVertex(gp_Pnt(*map(float, p))).Vertex() for p in ring]
+    va = BRepBuilderAPI_MakeVertex(gp_Pnt(*map(float, apex))).Vertex()
+    n = len(ring)
+    edges = []
+    for i in range(n):
+        j = (i + 1) % n
+        e = BRepBuilderAPI_MakeEdge(verts[i], verts[j]).Edge()
+        _, t1 = BRep_Tool.Range_s(e)
+        B.UpdateEdge(e, pseg((uuc[i], vvc[i]), (uuc[i + 1], vvc[i + 1]), t1), face, tol)
+        edges.append(e)
+    e_seam = BRepBuilderAPI_MakeEdge(va, verts[0]).Edge()
+    _, t1 = BRep_Tool.Range_s(e_seam)
+    B.UpdateEdge(e_seam, pseg((uuc[-1], 0.0), (uuc[-1], vvc[-1]), t1),
+                 pseg((uuc[0], 0.0), (uuc[0], vvc[0]), t1), face, tol)
+    ed = TopoDS_Edge()
+    B.MakeEdge(ed)
+    B.Add(ed, va.Oriented(TopAbs_FORWARD))
+    B.Add(ed, va.Oriented(TopAbs_REVERSED))
+    B.UpdateEdge(ed, GCE2d_MakeSegment(gp_Pnt2d(float(uuc[0]), 0.0),
+                                       gp_Pnt2d(float(uuc[-1]), 0.0)).Value(), face, tol)
+    B.Range(ed, 0.0, 2 * np.pi)
+    B.Degenerated(ed, True)
+    w = TopoDS_Wire()
+    B.MakeWire(w)
+    B.Add(w, ed)
+    B.Add(w, e_seam.Oriented(TopAbs_FORWARD))
+    for e in reversed(edges):
+        B.Add(w, e.Oriented(TopAbs_REVERSED))
+    B.Add(w, e_seam.Oriented(TopAbs_REVERSED))
+    B.Add(face, w)
+    if not BRepCheck_Analyzer(face).IsValid():
+        return None, 'apex invalid'
+    g = GProp_GProps()
+    BRepGProp.SurfaceProperties_s(face, g)
+    a = g.Mass()
+    area_mesh = float(mesh.area_faces[rg.faces].sum())
+    if not (a > 0 and abs(a - area_mesh) <= 0.05 * area_mesh + 1e-3):
+        return None, f'apex area {a:.3f} vs {area_mesh:.3f}'
+    if not _face_vertices_near(face, vpos, loops, fit_tol):
+        return None, 'apex vertices moved'
+    return face, 'analytic'
+
+
 def _region_face(mesh, rg, vpos, loops, fit_tol):
     """One trimmed OCC face for a region, or (None, reason)."""
     from OCP.BRepBuilderAPI import BRepBuilderAPI_MakeFace
@@ -1300,11 +1755,15 @@ def _region_face(mesh, rg, vpos, loops, fit_tol):
     pts = vpos[np.unique(F[rg.faces])]
     if rg.kind == 'cone':
         h = (pts - rg.params['apex']) @ rg.params['axis']
-        if h.min() <= max(5 * MERGE_TOL_MIN, 0.05 * (h.max() - h.min())):
-            return None, 'apex'
         rad = np.linalg.norm((pts - rg.params['apex']) - np.outer(h, rg.params['axis']), axis=1)
-        if not _loops_param_ok('cone', loops, vpos, rg.params['apex'], rg.params['axis'], float(rad.max())):
+        apex_in = h.min() <= max(5 * MERGE_TOL_MIN, 0.05 * (h.max() - h.min()))
+        if not _loops_param_ok('cone', loops, vpos, rg.params['apex'], rg.params['axis'],
+                               float(rad.max()), apex_ok=apex_in):
             return None, 'axis'
+        if apex_in:
+            # the ring loop vertices stay put, but the apex itself needs a
+            # degenerate edge — hand-built, MakeFace can't do it
+            return _apex_cone_face(mesh, rg, vpos, loops, fit_tol)
     if rg.kind == 'cylinder':
         if not _loops_param_ok('cylinder', loops, vpos, rg.params['point'], rg.params['axis'], rg.params['r']):
             return None, 'axis'
