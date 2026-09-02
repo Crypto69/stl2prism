@@ -139,7 +139,7 @@ def gate_values(metrics):
 def run(in_path, out_path, tol=0.08, accept_p95=0.25, accept_vol_pct=2.0,
         accept_max=0.26, accept_hole_max=0.10,
         force_prismatic=False, verbose=True, units='mm', reduce_tol=0.05,
-        write_script=True, face_groups=True):
+        write_script=True, face_groups=True, workers=None, shell_timeout=None):
     """Convert one mesh file to one STEP file.
 
     Every connected body is converted on its own — prismatic where it passes
@@ -149,6 +149,10 @@ def run(in_path, out_path, tol=0.08, accept_p95=0.25, accept_vol_pct=2.0,
     file returns {'mode': 'prismatic'|'facegroup'|'faceted', 'metrics':
     {...}}; a multi-body file adds a per-body list and reports mode 'mixed'
     when the bodies disagree.
+
+    `workers` and `shell_timeout` size the process pool the shells are
+    converted in (see _convert_all; None takes the environment's default,
+    workers=0 converts in this process).
     """
     from .mesh_prep import load_and_prep_bodies
     from .rebuild import write_step
@@ -158,10 +162,13 @@ def run(in_path, out_path, tol=0.08, accept_p95=0.25, accept_vol_pct=2.0,
     gates = dict(tol=tol, accept_p95=accept_p95, accept_max=accept_max,
                  accept_hole_max=accept_hole_max, accept_vol_pct=accept_vol_pct,
                  reduce_tol=reduce_tol, face_groups=face_groups)
+    results = _convert_all(bodies, is_scan, force_prismatic, verbose, gates,
+                           workers, shell_timeout)
 
     if len(bodies) == 1:
-        shape, mode, metrics = _convert_group(
-            bodies[0], is_scan, force_prismatic, verbose, **gates)
+        if isinstance(results[0], Exception):
+            raise results[0]
+        shape, mode, metrics = results[0]
         write_step([shape], out_path, names=[_body_name(in_path, 1, 1)])
         if verbose:
             print(f"[out] {mode} solid -> {out_path}")
@@ -173,27 +180,23 @@ def run(in_path, out_path, tol=0.08, accept_p95=0.25, accept_vol_pct=2.0,
                 'bfill_check': check}
 
     per_body, shapes = [], []
-    for i, body in enumerate(bodies):
-        tag = f"[body {i + 1}/{len(bodies)}]"
-        if verbose:
-            print(f"{tag} converting {len(body.mesh.faces)} faces"
-                  + (f" (+{len(body.voids)} void(s))" if body.voids else ""))
+    for i, (body, res) in enumerate(zip(bodies, results)):
         entry = {'index': i, 'faces': int(len(body.mesh.faces)),
                  'watertight': bool(body.mesh.is_watertight),
                  'voids': len(body.voids),
                  'mode': None, 'metrics': None, 'error': None}
-        try:
-            shape, mode, metrics = _convert_group(
-                body, is_scan, force_prismatic, verbose, **gates)
+        tag = _shell_tag(i, len(bodies))
+        if isinstance(res, Exception):
+            # One bad body must not cost the other 26: record it, move on.
+            entry['error'] = _err(res)
+            if verbose:
+                print(f"{tag} failed ({entry['error']}); body left out")
+        else:
+            shape, mode, metrics = res
             shapes.append(shape)
             entry.update(mode=mode, metrics=metrics)
             if verbose:
                 print(f"{tag} -> {mode}")
-        except Exception as e:
-            # One bad body must not cost the other 26: record it, move on.
-            entry['error'] = f'{type(e).__name__}: {e}'
-            if verbose:
-                print(f"{tag} failed ({entry['error']}); body left out")
         per_body.append(entry)
 
     if not shapes:
@@ -224,6 +227,195 @@ def run(in_path, out_path, tol=0.08, accept_p95=0.25, accept_vol_pct=2.0,
             'n_bodies': len(bodies), 'n_written': len(shapes),
             'n_dropped': n_dropped, 'is_scan': bool(is_scan), 'script': script,
             'bfill_script': bfill, 'bfill_check': check}
+
+
+def _err(e):
+    return f'{type(e).__name__}: {e}'
+
+
+def _shell_tag(i, n, k=None, m=0):
+    """The log tag of a shell: '[body 3/68]', '[body 3/68 void 1/2]',
+    '[void 1/2]' for the voids of a single-body file, '' for its outer."""
+    parts = []
+    if n > 1:
+        parts.append(f'body {i + 1}/{n}')
+    if k is not None:
+        parts.append(f'void {k + 1}/{m}')
+    return f"[{' '.join(parts)}]" if parts else ''
+
+
+def _convert_all(bodies, is_scan, force_prismatic, verbose, gates, workers,
+                 shell_timeout):
+    """Every body's (shape, mode, metrics), or the Exception that stopped
+    it, in body order.
+
+    Shells go through the process pool when there are at least two of
+    them and `workers` asks for it: an explicit count always does; the
+    default (None: STL2PRISM_WORKERS, else half the cores) only when the
+    file carries enough faces for the conversion to outlast the workers'
+    start-up (POOL_MIN_FACES). A scan stays in-process: its shells go
+    straight to the faceted route, not worth a worker's memory each.
+    The pool is sized so that the largest shells in flight together stay
+    under POOL_ONE_WORKER_FACES faces."""
+    from .parallel import default_workers
+    n_shells = sum(1 + len(b.voids) for b in bodies)
+    sizes = sorted((len(m.faces) for b in bodies for m in [b.mesh] + b.voids),
+                   reverse=True)
+    if workers is None:
+        workers = WORKERS if WORKERS is not None else default_workers()
+        if sum(sizes) < POOL_MIN_FACES:
+            workers = 0
+    if shell_timeout is None:
+        shell_timeout = SHELL_TIMEOUT_S
+    if workers >= 1 and n_shells >= 2 and not is_scan:
+        workers = min(int(workers), n_shells)
+        while workers > 1 and sum(sizes[:workers]) > POOL_ONE_WORKER_FACES:
+            workers -= 1
+        return _convert_all_pooled(bodies, is_scan, force_prismatic, verbose,
+                                   gates, workers, shell_timeout)
+    out = []
+    for i, body in enumerate(bodies):
+        tag = _shell_tag(i, len(bodies))
+        if verbose and tag:
+            print(f"{tag} converting {len(body.mesh.faces)} faces"
+                  + (f" (+{len(body.voids)} void(s))" if body.voids else ""))
+        try:
+            out.append(_convert_group(body, is_scan, force_prismatic, verbose,
+                                      tag=tag, **gates))
+        except Exception as e:
+            out.append(e)
+    return out
+
+
+def _shell_task(task):
+    """In a worker: convert one shell and write its solid as a BREP file
+    (OCC shapes do not pickle). Returns the path, the mode and the
+    metrics; what this prints comes back with the result. With
+    'faceted_only' the shell skips straight to the ladder's last rung: the
+    fallback for a shell whose first attempt ran out of time or died."""
+    import trimesh
+    from OCP.BRepTools import BRepTools
+    mesh = trimesh.Trimesh(task['vertices'], task['faces'], process=False)
+    if task.get('faceted_only'):
+        shape, mode, metrics = _faceted_body(mesh, task['verbose'],
+                                             reduce_tol=task['gates']['reduce_tol'])
+    else:
+        shape, mode, metrics = _convert_body(mesh, task['is_scan'],
+                                             task['force_prismatic'],
+                                             task['verbose'], **task['gates'])
+    path = os.path.join(task['dir'], task['name'] + '.brep')
+    if not BRepTools.Write_s(shape, path):
+        raise RuntimeError(f'could not write {path}')
+    return {'brep': path, 'mode': mode, 'metrics': metrics}
+
+
+def _read_brep(path):
+    from OCP.TopoDS import TopoDS_Shape
+    from OCP.BRep import BRep_Builder
+    from OCP.BRepTools import BRepTools
+    shape = TopoDS_Shape()
+    if not BRepTools.Read_s(shape, path, BRep_Builder()) or shape.IsNull():
+        raise RuntimeError(f'could not read {path}')
+    return shape
+
+
+# s: the faceted fallback of a shell that ran out of time or died gets its
+# own, shorter clock in the pool; it is the last rung, one sewing pass
+FALLBACK_TIMEOUT_S = 300.0
+
+
+def _convert_all_pooled(bodies, is_scan, force_prismatic, verbose, gates,
+                        workers, shell_timeout):
+    """The pool route of _convert_all: one task per shell, largest first;
+    each body is then reassembled here (voids subtracted) exactly as the
+    in-process route does.
+
+    A shell whose worker timed out, died or hit SystemExit never finished
+    its ladder: it goes back to the pool for the faceted rung alone, on a
+    shorter clock, and carries 'shell_error' / 'timed_out' in its metrics.
+    A shell that raised did finish the ladder (only the faceted rung's own
+    refusal escapes _convert_body), so its error stands."""
+    import tempfile
+    from .parallel import run_tasks
+    n = len(bodies)
+    shells = []                        # one dict per shell, in body order
+    for i, body in enumerate(bodies):
+        for k, mesh in [(None, body.mesh)] + list(enumerate(body.voids)):
+            shells.append({'body': i, 'void': k, 'mesh': mesh,
+                           'tag': _shell_tag(i, n, k, len(body.voids)),
+                           'name': f'b{i + 1}' + ('' if k is None else f'v{k + 1}')})
+    shells.sort(key=lambda sh: -len(sh['mesh'].faces))    # long jobs first pack better
+    if verbose:
+        print(f"[pool] {len(shells)} shells on {workers} worker(s), "
+              + (f"{shell_timeout:.0f} s each" if shell_timeout else "no time limit"))
+
+    def task(sh, td, **extra):
+        return dict(vertices=np.asarray(sh['mesh'].vertices), faces=np.asarray(sh['mesh'].faces),
+                    is_scan=is_scan, force_prismatic=force_prismatic, verbose=verbose,
+                    gates=gates, name=sh['name'], dir=td, **extra)
+
+    def report(sh, entry, n_done, n_all):
+        if not verbose:
+            return
+        for line in entry['log'].splitlines():
+            print(f"{sh['tag']} {line}".strip())
+        if entry['ok']:
+            print(f"{sh['tag']} shell -> {entry['result']['mode']}".strip())
+        else:
+            print(f"{sh['tag']} shell failed ({entry['error']})".strip())
+        print(f"[progress] {n_done}/{n_all} shells", flush=True)
+
+    with tempfile.TemporaryDirectory(prefix='stl2prism-shells-') as td:
+        got = run_tasks(_shell_task, [task(sh, td) for sh in shells], workers,
+                        timeout=shell_timeout,
+                        on_done=lambda j, e, d, t: report(shells[j], e, d, t))
+        for sh, entry in zip(shells, got):
+            sh['result'] = _shell_result(entry)
+            if entry['kind'] in ('timeout', 'died', 'exited'):
+                sh['retry'] = entry['error']
+        retry = [sh for sh in shells if sh.get('retry')]
+        if retry:
+            if verbose:
+                print(f"[pool] {len(retry)} shell(s) did not finish; building "
+                      f"them faceted ({FALLBACK_TIMEOUT_S:.0f} s each)")
+            budget = min(shell_timeout, FALLBACK_TIMEOUT_S) if shell_timeout else FALLBACK_TIMEOUT_S
+            got = run_tasks(_shell_task, [task(sh, td, faceted_only=True) for sh in retry],
+                            workers, timeout=budget,
+                            on_done=lambda j, e, d, t: report(retry[j], e, d, t))
+            for sh, entry in zip(retry, got):
+                first = sh['retry']
+                res = _shell_result(entry)
+                if not isinstance(res, Exception):
+                    res[2]['shell_error'] = first
+                    res[2]['timed_out'] = first.startswith('timed out')
+                sh['result'] = res
+    out = []
+    for i, body in enumerate(bodies):
+        mine = [sh for sh in shells if sh['body'] == i]
+        outer = next(sh['result'] for sh in mine if sh['void'] is None)
+        voids = [sh['result'] for sh in sorted(mine, key=lambda sh: sh['void'] or 0)
+                 if sh['void'] is not None]
+        try:
+            for r in [outer] + voids:
+                if isinstance(r, Exception):
+                    raise r
+            out.append(_assemble_group(body, outer, voids, verbose))
+        except Exception as e:
+            out.append(e)
+    return out
+
+
+def _shell_result(entry):
+    """(shape, mode, metrics) for one pooled shell from the worker's
+    answer, or the Exception that stopped it; the calling shell dict gets
+    'retry' set when the shell deserves the faceted fallback."""
+    if entry['ok']:
+        r = entry['result']
+        try:
+            return _read_brep(r['brep']), r['mode'], r['metrics']
+        except Exception as e:
+            return e
+    return RuntimeError(entry['error'])
 
 
 def _body_name(in_path, i, n):
@@ -298,6 +490,29 @@ def _env_float(name, default):
 # too (extrusion.MAX_LEVELS), so this is the backstop for the case nobody
 # predicted, not the normal path.
 AXIS_SEARCH_BUDGET_S = _env_float('STL2PRISM_AXIS_BUDGET', 120.0)
+
+def _env_int(name, default):
+    v = _env_float(name, None)
+    if v is None:
+        return default
+    if v != v or v in (float('inf'), float('-inf')) or v != int(v):
+        print(f"[warn] {name}={os.environ.get(name)!r} is not a whole number; "
+              f"using {default}", file=sys.stderr)
+        return default
+    return int(v)
+
+
+# Shells converted at once (STL2PRISM_WORKERS; None: half the cores) and
+# the wall clock per shell (STL2PRISM_SHELL_TIMEOUT; 0: none) before it is
+# built faceted instead. Without an explicit count a file under
+# POOL_MIN_FACES faces stays in-process: a worker's start-up (interpreter
+# plus OCP, a few seconds) would outlast its conversion. The shells in
+# flight together stay under POOL_ONE_WORKER_FACES faces: a CAD shell in a
+# worker is a few hundred megabytes and the NAS has 12 GB for everything.
+WORKERS = _env_int('STL2PRISM_WORKERS', None)
+SHELL_TIMEOUT_S = _env_float('STL2PRISM_SHELL_TIMEOUT', 900.0)
+POOL_MIN_FACES = 20_000
+POOL_ONE_WORKER_FACES = 1_000_000
 
 
 def _write_bfill_script(builds, out_path, verbose):
@@ -374,31 +589,49 @@ def _aggregate(per_body):
     }
 
 
-def _convert_group(body, is_scan, force_prismatic, verbose, **gates):
+def _convert_group(body, is_scan, force_prismatic, verbose, tag='', **gates):
     """Convert a Body (outer shell + voids) into one TopoDS_Shape.
 
     The outer shell and each void are converted independently (each with its
     own gate and fallback); void solids are then subtracted. Metrics are the
     outer shell's, with the volume error recomputed for the hollow result.
     """
-    shape, mode, metrics = _convert_body(
-        body.mesh, is_scan, force_prismatic, verbose, **gates)
-    if not body.voids:
+    outer = _convert_body(body.mesh, is_scan, force_prismatic, verbose, **gates)
+    voids = []
+    for k, v in enumerate(body.voids):
+        if verbose:
+            vtag = tag[:-1] + ' ' if tag else '['
+            print(f"{vtag}void {k + 1}/{len(body.voids)}] converting {len(v.faces)} faces")
+        voids.append(_convert_body(v, is_scan, force_prismatic, verbose, **gates))
+    return _assemble_group(body, outer, voids, verbose)
+
+
+def _assemble_group(body, outer, voids, verbose):
+    """One (shape, mode, metrics) for a body from its converted outer shell
+    and converted voids (each a (shape, mode, metrics)): the voids are
+    subtracted and the volume error recomputed for the hollow result."""
+    shape, mode, metrics = outer
+    if not voids:
         return shape, mode, metrics
     import cadquery as cq
     outer = cq.Shape.cast(shape)
     void_modes = []
     void_builds = []
-    for k, v in enumerate(body.voids):
-        if verbose:
-            print(f"[void {k + 1}/{len(body.voids)}] converting {len(v.faces)} faces")
-        vshape, vmode, vmet = _convert_body(v, is_scan, force_prismatic, verbose, **gates)
+    void_errors = []
+    for vshape, vmode, vmet in voids:
         void_modes.append(vmode)
         void_builds.append(vmet.get('build', {'mode': vmode}))
+        void_errors.append(vmet.get('shell_error'))
         outer = outer.cut(cq.Shape.cast(vshape), tol=1e-4)
     metrics = dict(metrics)
     metrics['voids'] = len(body.voids)
     metrics['void_modes'] = void_modes
+    if any(void_errors):
+        # a cavity given up on (timed out, worker died) is not one that
+        # merely fitted no surface; the report must be able to tell
+        metrics['void_shell_errors'] = void_errors
+        metrics['timed_out'] = bool(metrics.get('timed_out')) or any(
+            e and e.startswith('timed out') for e in void_errors)
     if 'build' in metrics:
         metrics['build'] = dict(metrics['build'], voids=void_builds)
     vol_mesh = body.volume()
@@ -726,6 +959,15 @@ def main():
     ap.add_argument('--units', choices=sorted(UNIT_SCALE), default='mm',
                     help='unit the input file is in; STL/OBJ carry none, '
                          'and the tool works in mm (default mm)')
+    ap.add_argument('--workers', type=int, default=None,
+                    help='shells (bodies and cavities) converted at once in '
+                         'worker processes; 0 converts in this process '
+                         '(default: STL2PRISM_WORKERS, else half the cores, '
+                         'and in-process for files under 20k faces)')
+    ap.add_argument('--shell-timeout', type=float, default=None,
+                    help='seconds a shell may run in a worker before it is '
+                         'built faceted instead; 0 for no limit '
+                         '(default: STL2PRISM_SHELL_TIMEOUT, else 900)')
     ap.add_argument('--quiet', action='store_true')
     args = ap.parse_args()
     out = args.output or args.input.rsplit('.', 1)[0] + '.step'
@@ -736,7 +978,8 @@ def main():
                 accept_vol_pct=args.accept_vol_pct,
                 force_prismatic=args.force_prismatic, verbose=not args.quiet,
                 units=args.units, reduce_tol=args.reduce_tol,
-                face_groups=not args.no_face_groups)
+                face_groups=not args.no_face_groups,
+                workers=args.workers, shell_timeout=args.shell_timeout)
     except Exception as e:
         # A crash must not look like a success to a calling script.
         print(f"[error] {type(e).__name__}: {e}", file=sys.stderr)

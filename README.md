@@ -141,10 +141,15 @@ QNAP; clone on the NAS, build natively, optional Tailscale HTTPS front), follow
 Environment knobs: `STL2PRISM_DATA` (job storage dir, default `/data` in
 the container), `STL2PRISM_JOB_TTL` (seconds before old jobs are purged,
 default 86400), `STL2PRISM_MAX_UPLOAD` (bytes, default 200 MB),
-`STL2PRISM_AXIS_BUDGET` (seconds one shell's extrusion-axis search may take
-before the best candidate so far is used, default 120; 0 means no limit).
-The budget is a backstop: a shell that reaches it is scored on what was
-done by then, so its result can depend on machine load.
+`STL2PRISM_WORKERS` (shells converted at once in worker processes, default
+half the cores; 0 converts in-process, as does any file under 20k faces
+when the count is not set explicitly), `STL2PRISM_SHELL_TIMEOUT` (seconds
+a shell may run in a worker before it is built faceted instead, default
+900; 0 means no limit), `STL2PRISM_AXIS_BUDGET` (seconds one shell's extrusion-axis search may
+take before the best candidate so far is used, default 120; 0 means no
+limit). The budgets are backstops: a shell that reaches one is scored on
+what was done by then, so its result can depend on machine load. The CLI
+takes the first two as `--workers` and `--shell-timeout`.
 
 ## How it works
 

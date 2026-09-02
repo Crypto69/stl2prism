@@ -17,6 +17,12 @@ services:
       STL2PRISM_JOB_TTL: "86400"
       # conversions run one at a time; scan repair can peak at several GB
       STL2PRISM_CONCURRENCY: "1"
+      # shells (bodies and their cavities) converted at once inside a job:
+      # two of the four cores, the rest for the kernel's threads and the NAS
+      STL2PRISM_WORKERS: "2"
+      # seconds a shell may take in a worker before it is built faceted
+      # instead (default 900)
+      # STL2PRISM_SHELL_TIMEOUT: "900"
       # seconds one shell's extrusion-axis search may take before the best
       # candidate so far is used (default 120; 0 means no limit)
       # STL2PRISM_AXIS_BUDGET: "120"

@@ -241,16 +241,8 @@ def _assembly(path):
     """Two boxes, a sphere and a 2-triangle sliver in one file: three real
     bodies (two prismatic, one not) plus the kind of stray fragment exporters
     leave behind."""
-    a = trimesh.creation.box((20, 10, 5))
-    b = trimesh.creation.box((8, 8, 8))
-    b.apply_translation((40, 0, 0))
-    c = trimesh.creation.icosphere(subdivisions=3, radius=5)
-    c.apply_translation((0, 40, 0))
-    sliver = trimesh.Trimesh(
-        vertices=[[80, 0, 0], [81, 0, 0], [80, 1, 0], [80, 0, 1]],
-        faces=[[0, 1, 2], [0, 2, 3]], process=False)
-    trimesh.util.concatenate([a, b, c, sliver]).export(path)
-    return path
+    from .synth import assembly
+    return assembly(path, sphere=True, sliver=True)
 
 
 def test_split_bodies_drops_only_slivers(tmp_path):

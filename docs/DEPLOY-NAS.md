@@ -101,6 +101,8 @@ All settings live in `docker-compose.yml`; edit, then `docker compose up -d`.
 | `STL2PRISM_JOB_TTL` | `86400` | seconds before job directories are deleted |
 | `STL2PRISM_CONCURRENCY` | `1` | parallel conversions; keep 1 unless RAM is plentiful |
 | `STL2PRISM_MAX_UPLOAD` | 200 MB | maximum upload size |
+| `STL2PRISM_WORKERS` | `2` | shells (bodies and cavities) converted at once inside one job; each worker holds a few hundred MB |
+| `STL2PRISM_SHELL_TIMEOUT` | `900` | seconds a shell may run in a worker before it is built faceted instead; 0 means no limit |
 | `STL2PRISM_AXIS_BUDGET` | `120` | seconds one shell's extrusion-axis search may take before the best candidate so far is used; 0 means no limit |
 | `mem_limit` | `12g` | container memory cap; lower it if other services suffer |
 
