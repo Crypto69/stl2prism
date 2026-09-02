@@ -107,3 +107,41 @@ def test_a_killed_task_keeps_the_lines_it_printed():
 def test_zero_timeout_means_no_limit():
     out = run_tasks(_partial_log, ['a', 'b'], workers=2, timeout=0)
     assert [e['result'] for e in out] == ['a', 'b']
+
+
+def test_one_pool_serves_several_runs_and_reports_starts():
+    from stl2prism.parallel import Pool
+    starts = []
+    with Pool(2) as pool:
+        a = pool.run(_double, [1, 2, 3], on_start=starts.append)
+        pids = {w.proc.pid for w in pool._pool}
+        b = pool.run(_sleepy, ['a', 'b'])
+        assert pids == {w.proc.pid for w in pool._pool}, 'workers are reused'
+    assert [e['result'] for e in a] == [2, 4, 6] and [e['result'] for e in b] == ['a', 'b']
+    assert sorted(starts) == [0, 1, 2]
+
+
+def test_deadline_leaves_unstarted_tasks_unrun():
+    out = run_tasks(_partial_log, ['a', 'b', 'c', 'd'], workers=1,
+                    deadline=time.monotonic() + 1.5)
+    kinds = [e['kind'] for e in out]
+    assert kinds[0] == 'ok' and 'timeout' in kinds
+    assert all(e['error'] == 'not started: past the deadline' for e in out if e['kind'] == 'timeout')
+
+
+def test_an_unpicklable_task_is_a_failed_task():
+    out = run_tasks(_double, [3, lambda: None], workers=1, timeout=10)
+    assert out[0]['result'] == 6
+    assert out[1]['kind'] == 'raised' and 'could not be sent' in out[1]['error']
+
+
+def _who(x):
+    return os.getpid()
+
+
+def test_a_dead_pool_worker_is_replaced_between_runs():
+    from stl2prism.parallel import Pool
+    with Pool(1) as pool:
+        pool.run(_crash, ['crash'])
+        out = pool.run(_who, [1])
+    assert out[0]['ok']

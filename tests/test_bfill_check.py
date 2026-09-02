@@ -90,14 +90,20 @@ def test_dry_run_honours_the_scripts_skip_list(tmp_path):
     assert outlook(res)['ok'] is not True
 
 
+def _script_n_bodies(tmp_path, n):
+    """The fillet_top script with its one body repeated `n` times."""
+    text = _script(tmp_path, 'ft', synth.fillet_top)
+    head, rt = text.split('\nimport adsk.core')
+    return head.replace('BODIES = [', f'BODIES = {n} * [', 1) + '\nimport adsk.core' + rt
+
+
 def test_dry_run_budget_leaves_later_bodies_unchecked(tmp_path):
     from stl2prism.bfill_check import check_script, outlook
     text = _script(tmp_path, 'ft', synth.fillet_top)
     # one body: a zero budget still checks it (the budget is tested between bodies)
     res = check_script(text, budget_s=0.0)
     assert res[0]['error'] is None
-    head, rt = text.split('\nimport adsk.core')
-    two = head.replace('BODIES = [', 'BODIES = 2 * [', 1) + '\nimport adsk.core' + rt
+    two = _script_n_bodies(tmp_path, 2)
     res = check_script(two, budget_s=0.0)
     assert res[0]['error'] is None and res[1]['error'].startswith('not checked')
     assert outlook(res)['ok'] is None

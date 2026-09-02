@@ -292,7 +292,7 @@ def test_pipeline_outlook_is_the_dry_run_and_the_header_agrees(tmp_path, monkeyp
     r2 = run(str(p), str(tmp_path / 'ft_noscript.step'), verbose=False, write_script=False)
     assert r2['bfill_check'] is None and r2['bfill_script'] is None
 
-    def failing(text, budget_s=None):
+    def failing(text, budget_s=None, **kw):
         return [dict(name='ft', enclosed_pct=80.0, unenclosed=[], n_probes=5, error=None)]
     monkeypatch.setattr(bfill_check, 'check_script', failing)
     r = run(str(p), str(tmp_path / 'ft_fail.step'), verbose=False)
@@ -302,7 +302,7 @@ def test_pipeline_outlook_is_the_dry_run_and_the_header_agrees(tmp_path, monkeyp
     assert 'WARNING: likely to fail in Fusion' in text and c['reason'] in text
     ast.parse(text)
 
-    def broken(text, budget_s=None):
+    def broken(text, budget_s=None, **kw):
         raise RuntimeError('no kernel')
     monkeypatch.setattr(bfill_check, 'check_script', broken)
     r = run(str(p), str(tmp_path / 'ft_nocheck.step'), verbose=False)

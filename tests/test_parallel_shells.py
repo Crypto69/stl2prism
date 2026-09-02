@@ -55,7 +55,9 @@ def test_pool_logs_one_block_per_shell_and_progress(tmp_path, capsys):
     assert '[pool] 5 shells on 2 worker(s)' in text
     assert '[progress] 5/5 shells' in text
     assert '[body 4/4 void 1/1] shell -> ' in text
+    assert '[body 4/4 void 1/1] shell started (12 faces)' in text
     assert '[body 4/4] -> ' in text
+    assert '[time] conversion' in text
 
 
 # --- failure modes: stand-ins a spawned worker imports from this module ---
@@ -155,9 +157,9 @@ def test_memory_guard_sizes_the_pool_by_shells_in_flight(tmp_path, monkeypatch):
     seen = []
     real = pipeline._convert_all_pooled
 
-    def spy(bodies, is_scan, force_prismatic, verbose, gates, workers, shell_timeout):
+    def spy(bodies, force_prismatic, verbose, gates, pool, workers, shell_timeout):
         seen.append(workers)
-        return real(bodies, is_scan, force_prismatic, verbose, gates, workers, shell_timeout)
+        return real(bodies, force_prismatic, verbose, gates, pool, workers, shell_timeout)
     monkeypatch.setattr(pipeline, '_convert_all_pooled', spy)
     stl = synth.assembly(tmp_path / 'asm.stl', sphere=True, hollow=True)   # 1280 + 4 x 12 faces
     monkeypatch.setattr(pipeline, 'POOL_ONE_WORKER_FACES', 1300)          # sphere + one box fit
