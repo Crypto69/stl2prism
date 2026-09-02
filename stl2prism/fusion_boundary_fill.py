@@ -236,7 +236,6 @@ def _snap_tangencies(regions, surfaces, penetrate_mm=0.0):
     idx = {r['id']: i for i, r in enumerate(regions)}
     sin_tol = math.sin(math.radians(TANGENT_DEG))
     cos_tol = math.cos(math.radians(TANGENT_DEG))
-    gap_tol = TANGENT_GAP_MM / 10.0
     planes = {}
     for r, s in zip(regions, surfaces):
         if s[0] == 'plane':
@@ -250,6 +249,9 @@ def _snap_tangencies(regions, surfaces, penetrate_mm=0.0):
     order = sorted(range(len(regions)), key=lambda i: -regions[i]['area'])
     for i in order:
         r, s = regions[i], surfaces[i]
+        # a consolidated blend tool is a fit-tol approximation: its tangent
+        # neighbours sit up to ~0.1 mm away, so the snap must reach further
+        gap_tol = (3.0 if r.get('approx') else 1.0) * TANGENT_GAP_MM / 10.0
         if s[0] == 'torus':
             # a blend torus touches the plane perpendicular to its axis at
             # r from its centre, and the coaxial cylinder it runs into at
@@ -790,7 +792,7 @@ def _select_cells(cells, bd, log):
     target_vol = bd['volume']
     n_cells = cells.count
     _progress('{} cells to classify'.format(n_cells))
-    kept, vols, by_centre, skipped, kept_vol = 0, [], 0, 0, 0.0
+    kept, vols, by_centre, by_face, kept_vol = 0, [], 0, 0, 0.0
     t_start = time.time()
     for i in range(n_cells):
         if i and i % 25 == 0:
@@ -810,19 +812,43 @@ def _select_cells(cells, bd, log):
         if not hit and mesh is not None:
             try:
                 lo, hi = box.minPoint, box.maxPoint
-                diag = math.sqrt((hi.x - lo.x) ** 2 + (hi.y - lo.y) ** 2 + (hi.z - lo.z) ** 2)
-                if diag < TINY_CELL:
-                    skipped += 1            # a sliver: not worth a slow property call
-                else:
-                    # cheap first: the box centre, if it is inside the cell
-                    c = adsk.core.Point3D.create((lo.x + hi.x) / 2, (lo.y + hi.y) / 2, (lo.z + hi.z) / 2)
-                    if body.pointContainment(c) != INSIDE:
-                        c = body.physicalProperties.centerOfMass
-                    if body.pointContainment(c) == INSIDE and mesh.contains((c.x, c.y, c.z)):
-                        hit = True
-                        by_centre += 1
+                cx, cy, cz = (lo.x + hi.x) / 2, (lo.y + hi.y) / 2, (lo.z + hi.z) / 2
+                # slivers get the same tests as any other cell: the thin
+                # slices between a blend chain's approximate tool and its
+                # neighbours are real material, and skipping them left
+                # visible cracks (2026-08-24, joystick claw). Cells outside
+                # the part still fail the mesh-containment test.
+                c = adsk.core.Point3D.create(cx, cy, cz)
+                if body.pointContainment(c) != INSIDE:
+                    c = body.physicalProperties.centerOfMass
+                if body.pointContainment(c) == INSIDE and mesh.contains((c.x, c.y, c.z)):
+                    hit = True
+                    by_centre += 1
             except Exception:
                 pass
+        if not hit and mesh is not None:
+            # a thin curved sliver is a crescent: its own centre lies outside
+            # it, so probe points ON its faces, nudged 0.05 mm inward — a
+            # crescent always contains those (2026-08-24, joystick claw)
+            try:
+                faces_sorted = sorted(body.faces, key=lambda f: -f.area)[:6]
+            except Exception:
+                faces_sorted = []
+            for f in faces_sorted:
+                try:
+                    p0 = f.pointOnFace
+                    dx, dy, dz = cx - p0.x, cy - p0.y, cz - p0.z
+                    nn = math.sqrt(dx * dx + dy * dy + dz * dz) or 1.0
+                    p1 = adsk.core.Point3D.create(p0.x + 0.005 * dx / nn,
+                                                  p0.y + 0.005 * dy / nn,
+                                                  p0.z + 0.005 * dz / nn)
+                    if (body.pointContainment(p1) == INSIDE
+                            and mesh.contains((p1.x, p1.y, p1.z))):
+                        hit = True
+                        by_face += 1
+                        break
+                except Exception:
+                    continue
         if hit or kept == 0:
             try:
                 vols.append(body.volume)
@@ -834,8 +860,8 @@ def _select_cells(cells, bd, log):
         if hit:
             kept += 1
             kept_vol += vols[-1]
-    if skipped:
-        log.append('{} sliver cell(s) under {:.2f} mm skipped'.format(skipped, TINY_CELL * 10))
+    if by_face:
+        log.append('{} sliver cell(s) kept by a point on their own face'.format(by_face))
     log.append('kept volume {:.3f} cm^3 of {:.3f} (mesh)'.format(kept_vol, target_vol))
     n_miss = sum(1 for h in pt_hit if not h)
     if n_miss:
@@ -1172,7 +1198,7 @@ def emit_boundary_fill_script(builds, stem='part', expand_mm=EXPAND_MM,
         'RUN_FILL = True          # False: only create the surfaces (run Boundary Fill by hand)',
         'DIAGNOSE = False         # if Fusion cannot compute the cells, find the tools it rejects (slow, can hang)',
         'SKIP = []                # tool numbers (frame_s<N>) to leave out',
-        'TINY_CELL = 0.02         # cm: cells smaller than this (box diagonal) are never kept',
+        'TINY_CELL = 0.02         # cm: cells smaller than this are logged as slivers',
         'SHOW_SUMMARY = True      # message box with the log at the end',
         '',
     ]

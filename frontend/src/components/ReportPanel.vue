@@ -268,7 +268,7 @@ const reduction = computed(() => {
         The script rebuilds the recognised sketches and extrudes as an editable program — change a radius or height and re-run it to get a new STEP.
       </p>
       <p v-if="store.fusionBfillScriptUrl" class="hint">
-        The Boundary Fill script rebuilds every fitted surface inside Fusion and lets Fusion compute the edges between them, so the face-group solid comes out without the mesh's zig-zag edges. Works on cleanly fitted parts (fillets around curved edges are one torus tool each, a pointed cone is one solid cone tool); blends kept as many small bands (tapered corner fillets) still defeat it. To run: put the .py in an empty folder, then in Fusion Utilities → Add-Ins → Scripts and Add-Ins → + → choose that folder → Run.
+        The Boundary Fill script rebuilds every fitted surface inside Fusion and lets Fusion compute the edges between them, so the face-group solid comes out without the mesh's zig-zag edges. Works on cleanly fitted parts (fillets around curved edges are one torus tool each, a pointed cone is one solid cone tool, a tapered fillet's band chain is one approximate tool); the reported outlook comes from an OpenCascade dry run of the script itself. To run: put the .py in an empty folder, then in Fusion Utilities → Add-Ins → Scripts and Add-Ins → + → choose that folder → Run.
       </p>
     </section>
 
