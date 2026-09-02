@@ -298,13 +298,67 @@ def test_pinched_region_is_peeled_into_clean_pieces():
                 tri.append(t)
     m = trimesh.Trimesh(V, np.asarray(tri), process=False)
     faces = np.arange(len(m.faces))
-    if _group_loops(m, faces) is not None:
-        pytest.skip('construction did not pinch (triangulation changed)')
+    # deterministic construction: if _group_loops ever accepts this boundary,
+    # build_solid's repair gate (the same refusal) stops firing — fail loudly
+    assert _group_loops(m, faces) is None, 'construction must pinch'
     pieces = _split_pinched(m, faces)
     assert pieces is not None and len(pieces) >= 2
     assert sum(len(p) for p in pieces) == len(faces)
     for p in pieces:
         assert _group_loops(m, p) is not None
+
+
+def test_two_lobes_touching_at_a_vertex_are_split_into_both():
+    """A bow-tie region (two planar patches sharing one vertex) pinches at
+    that vertex; the repair must hand back one clean piece per lobe plus
+    the peeled fans, not a two-component 'core' that _region_face then
+    builds as a plate with a hole."""
+    import trimesh
+    from stl2prism.facegroups import _split_pinched
+    from stl2prism.rebuild import _group_loops
+
+    def grid(x0, y0):
+        V = [(x0 + i, y0 + j, 0.0) for j in range(3) for i in range(3)]
+        T = []
+        for j in range(2):
+            for i in range(2):
+                a = j * 3 + i
+                T += [[a, a + 1, a + 4], [a, a + 4, a + 3]]
+        return np.asarray(V, float), np.asarray(T)
+    VA, TA = grid(0, 0)
+    VB, TB = grid(2, 2)                       # B's corner 0 is A's corner 8
+    V = np.vstack([VA, VB[1:]])
+    remap = np.array([8] + list(range(9, 17)))
+    T = np.vstack([TA, remap[TB]])
+    m = trimesh.Trimesh(V, T, process=False)
+    faces = np.arange(len(m.faces))
+    assert _group_loops(m, faces) is None, 'construction must pinch'
+    pieces = _split_pinched(m, faces)
+    assert pieces is not None and len(pieces) >= 4, pieces
+    assert sum(len(p) for p in pieces) == len(faces)
+    for p in pieces:
+        assert _group_loops(m, p) is not None
+    # every piece lies in one lobe
+    for p in pieces:
+        xs = m.triangles_center[p][:, 0]
+        assert (xs <= 2.0).all() or (xs >= 2.0).all()
+
+
+def test_blend_chain_is_walked_from_an_end():
+    """consolidate_blends tries runs of consecutive bands: the component
+    must be in chain order (from an end band), not BFS order from the
+    smallest id, or a mid-chain start hides the real sub-chains."""
+    from stl2prism.facegroups import _chain_order, _connected
+    # a-b-c-d-e with ids c=0, b=1, d=2, a=3, e=4
+    adj = {3: {1}, 1: {3, 0}, 0: {1, 2}, 2: {0, 4}, 4: {2}}
+    order = _chain_order([0, 1, 2, 3, 4], adj)
+    assert order in ([3, 1, 0, 2, 4], [4, 2, 0, 1, 3]), order
+    assert _connected([3, 1, 0], adj) and _connected([0], adj)
+    assert not _connected([1, 2], adj) and not _connected([3, 4], adj)
+    ring = {0: {1, 3}, 1: {0, 2}, 2: {1, 3}, 3: {2, 0}}
+    assert _chain_order([0, 1, 2, 3], ring) == [0, 1, 2, 3]       # no end: as is
+    branch = {0: {1, 2, 3}, 1: {0}, 2: {0}, 3: {0}}
+    assert _chain_order([0, 1, 2, 3], branch) == [0, 1, 2, 3]
 
 
 def test_rounded_box_corners_stay_spheres(tmp_path):

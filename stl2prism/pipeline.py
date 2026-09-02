@@ -163,12 +163,12 @@ def run(in_path, out_path, tol=0.08, accept_p95=0.25, accept_vol_pct=2.0,
         write_step([shape], out_path, names=[_body_name(in_path, 1, 1)])
         if verbose:
             print(f"[out] {mode} solid -> {out_path}")
-        script, bfill = _write_script([metrics.pop('build', {'mode': mode})], out_path,
-                                      write_script, verbose)
+        script, bfill, check = _write_script([metrics.pop('build', {'mode': mode})],
+                                             out_path, write_script, verbose)
         return {'mode': mode, 'metrics': metrics,
                 'n_bodies': 1, 'n_written': 1, 'n_dropped': n_dropped,
                 'is_scan': bool(is_scan), 'script': script, 'bfill_script': bfill,
-                'bfill_check': getattr(_write_bfill_script, 'last_check', None)}
+                'bfill_check': check}
 
     per_body, shapes = [], []
     for i, body in enumerate(bodies):
@@ -204,7 +204,7 @@ def run(in_path, out_path, tol=0.08, accept_p95=0.25, accept_vol_pct=2.0,
     for b in per_body:
         if b['metrics'] is not None:
             builds.append(b['metrics'].pop('build', {'mode': b['mode']}))
-    script, bfill = _write_script(builds, out_path, write_script, verbose)
+    script, bfill, check = _write_script(builds, out_path, write_script, verbose)
 
     n_pr = sum(1 for b in per_body if b['mode'] == 'prismatic')
     n_fg = sum(1 for b in per_body if b['mode'] == 'facegroup')
@@ -221,8 +221,7 @@ def run(in_path, out_path, tol=0.08, accept_p95=0.25, accept_vol_pct=2.0,
     return {'mode': mode, 'metrics': _aggregate(per_body), 'bodies': per_body,
             'n_bodies': len(bodies), 'n_written': len(shapes),
             'n_dropped': n_dropped, 'is_scan': bool(is_scan), 'script': script,
-            'bfill_script': bfill,
-            'bfill_check': getattr(_write_bfill_script, 'last_check', None)}
+            'bfill_script': bfill, 'bfill_check': check}
 
 
 def _body_name(in_path, i, n):
@@ -235,16 +234,18 @@ def _write_script(builds, out_path, write_script, verbose):
     """Write the CadQuery script next to the STEP (same stem, .py), the
     Fusion script for prismatic bodies (<stem>_fusion.py) and the Fusion
     Boundary Fill script for face-group bodies (<stem>_fusion_bfill.py).
-    Returns (cadquery_script_path, bfill_script_path), each None if not written."""
+    Returns (cadquery_script_path, bfill_script_path, bfill_outlook), the
+    paths None if not written, the outlook None without a Boundary Fill
+    script."""
     if not write_script:
-        return None, None
-    bfill = _write_bfill_script(builds, out_path, verbose)
+        return None, None, None
+    bfill, check = _write_bfill_script(builds, out_path, verbose)
     if not any(b.get('mode') == 'prismatic' and 'slabs' in b for b in builds):
         # A script with no recognised bodies would be an empty program that
         # crashes on its first line; better no file than a broken one.
         if verbose:
             print('[out] no prismatic bodies; no script written')
-        return None, bfill
+        return None, bfill, check
     try:
         from .script_export import emit_script
         import os
@@ -264,62 +265,66 @@ def _write_script(builds, out_path, write_script, verbose):
         except Exception as e:
             if verbose:
                 print(f"[out] Fusion script export failed ({type(e).__name__}: {e})")
-        return py_path, bfill
+        return py_path, bfill, check
     except Exception as e:
         if verbose:
             print(f"[out] script export failed ({type(e).__name__}: {e})")
-        return None, bfill
+        return None, bfill, check
+
+
+BFILL_CHECK_BUDGET_S = 120   # s: bodies past this are not dry-run (outlook 'not checked')
 
 
 def _write_bfill_script(builds, out_path, verbose):
-    """Fusion 360 Boundary Fill script for face-group bodies. Returns the
-    path or None (no face-group body, or one too big for the script); the
-    outlook (will Fusion cope?) is left in `_write_bfill_script.last_check`."""
+    """Fusion 360 Boundary Fill script for face-group bodies. Returns
+    (path, outlook): the path None (and the outlook None) without a
+    face-group body or when none is small enough for the script; the
+    outlook {'ok': True | False | None, 'reason', 'enclosed_pct'} says
+    whether Fusion is expected to cope — the verdict of an OCC dry run of
+    the script itself (bfill_check), per body, with the region heuristic
+    (assess) only as the text when the dry run cannot run. The file's own
+    header carries the same verdict."""
     import os
-    _write_bfill_script.last_check = None
-    if not any(b.get('mode') == 'facegroup' and 'regions' in b for b in builds):
-        return None
+    fg = [b for b in builds if b.get('mode') == 'facegroup' and 'regions' in b]
+    if not fg:
+        return None, None
     try:
-        from .fusion_boundary_fill import emit_boundary_fill_script, TooManyRegions, assess
+        from .fusion_boundary_fill import (emit_boundary_fill_script, TooManyRegions,
+                                           assess, skipped_bodies)
         stem = os.path.splitext(os.path.basename(out_path))[0]
         text = emit_boundary_fill_script(builds, stem)
-        checks = [assess(b) for b in builds if b.get('mode') == 'facegroup' and 'regions' in b]
-        _write_bfill_script.last_check = {
-            'ok': all(c['ok'] for c in checks),
-            'bands': sum(c['bands'] for c in checks),
-            'unfitted': sum(c['unfitted'] for c in checks),
-            'tools': sum(c['tools'] for c in checks),
-            'reason': '; '.join(c['reason'] for c in checks if not c['ok']) or checks[0]['reason']}
         try:
             # the real outlook: rebuild the tools in OCC and see whether the
             # cells actually enclose the part — no heuristic on the region
             # list predicts kernel behaviour (a chain of blend bands can cut
             # fine while gently curved plates never close)
-            from .bfill_check import check_script
-            results, _ = check_script(text)
-            pct = min(r['enclosed_pct'] for r in results) if results else 0.0
-            _write_bfill_script.last_check.update(
-                enclosed_pct=round(pct, 2),
-                ok=bool(99.0 <= pct <= 103.0),
-                reason=f'OCC dry run: cells enclose {pct:.1f}% of the mesh volume')
+            from .bfill_check import check_script, outlook
+            check = outlook(check_script(text, budget_s=BFILL_CHECK_BUDGET_S),
+                            skipped_bodies(builds))
         except Exception as e:
-            _write_bfill_script.last_check['reason'] += f' (OCC dry run unavailable: {type(e).__name__})'
+            heur = [assess(b) for b in fg]
+            why = '; '.join(c['reason'] for c in heur if not c['ok']) or heur[0]['reason']
+            check = {'ok': None, 'enclosed_pct': None,
+                     'reason': f'not checked (OCC dry run unavailable: {type(e).__name__}); '
+                               f'region heuristic: {why}'}
+        if check['ok'] is False:
+            text = emit_boundary_fill_script(builds, stem, warning=check['reason'])
     except TooManyRegions as e:
         if verbose:
             print(f"[out] no Boundary Fill script: {e}")
-        return None
+        return None, None
     except Exception as e:
         if verbose:
             print(f"[out] Boundary Fill script export failed ({type(e).__name__}: {e})")
-        return None
+        return None, None
     fpath = os.path.splitext(out_path)[0] + '_fusion_bfill.py'
     with open(fpath, 'w') as f:
         f.write(text)
     if verbose:
         print(f"[out] Fusion 360 Boundary Fill script -> {fpath}")
-        c = _write_bfill_script.last_check
-        print(f"[out] Boundary Fill outlook: {'OK' if c['ok'] else 'LIKELY TO FAIL'} ({c['reason']})")
-    return fpath
+        verdict = {True: 'OK', False: 'LIKELY TO FAIL', None: 'NOT CHECKED'}[check['ok']]
+        print(f"[out] Boundary Fill outlook: {verdict} ({check['reason']})")
+    return fpath, check
 
 
 def _aggregate(per_body):

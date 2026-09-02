@@ -260,6 +260,26 @@ volume ≤ 2 %). "faces" = ADVANCED_FACE count in the STEP.
 The remaining planar faces on the face-group parts are blends (tapered
 corner fillets, free-form) that v1 keeps as exact facets.
 
+v0.3.5 (the dry run made honest and fast): the OCC dry run behind the
+Boundary Fill outlook now builds exactly the tools the script builds — the
+script's own arc growth is executed from its text (the emulation had grown
+arcs by at most 30° where Fusion grows by up to 180° and closes near-full
+arcs into circles), a cone tool's two ends share one angular window, the
+SKIP list is honoured, unbuildable tools are skipped and counted, and cells
+are classified by the same procedure as the runtime (probe point, interior
+point, face probe for slivers, closest-volume fallback). It is ~50× faster
+(one classifier per cell behind a bounding-box test: claw_1's conversion
+270 s → 36 s) and judges every body on its own — a region none of whose
+probe points lies in a cell, or a body the script had to leave out, is a
+FAIL; a kernel error or a body past the time budget is "not checked"
+rather than a guess; the script's own header carries the same verdict as
+the UI. Also: merged tapered-fillet cones are snapped to their tangent
+planes; pieces of one torus/sphere/cone fit (pinch repair) become one tool
+instead of two coincident ones; blend chains are walked in chain order; the
+segmenter's acceptance test and seeders are shared with the blend merge;
+region ids in the script's log carry the engine ids they were made from
+(`12<3,4,5>`). claw_1's dry run: 101.2 % enclosed, OK.
+
 v0.3.4 (pinched boundaries, blend tools, real Boundary Fill outlook): a
 region whose boundary pinches (an annulus whose hole touches the rim at one
 vertex) is repaired by peeling the faces at the pinch instead of falling to

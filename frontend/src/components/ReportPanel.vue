@@ -50,6 +50,14 @@ const inputRows = computed(() => {
 // Multi-body runs carry a per-body list; single-body runs do not.
 const bodies = computed(() => store.result?.bodies || null)
 
+// Boundary Fill outlook: ok true (dry run closed the cells), false (it did
+// not: 'fail'), null (it could not run: 'unchecked').
+const bfillState = computed(() => {
+  const c = store.bfillCheck
+  if (!c) return null
+  return c.ok === true ? 'ok' : c.ok === false ? 'fail' : 'unchecked'
+})
+
 const verdict = computed(() => {
   const r = store.result
   if (!r?.ok) return null
@@ -258,11 +266,14 @@ const reduction = computed(() => {
       <a v-if="store.fusionScriptUrl" class="download secondary" :href="store.fusionScriptUrl" download>
         Download Fusion 360 script (.py) — experimental
       </a>
-      <a v-if="store.fusionBfillScriptUrl" class="download secondary" :class="{ risky: store.bfillCheck && !store.bfillCheck.ok }" :href="store.fusionBfillScriptUrl" download>
-        Download Fusion 360 script (Boundary Fill) — {{ store.bfillCheck && !store.bfillCheck.ok ? 'likely to fail' : 'experimental' }}
+      <a v-if="store.fusionBfillScriptUrl" class="download secondary" :class="{ risky: bfillState === 'fail' }" :href="store.fusionBfillScriptUrl" download>
+        Download Fusion 360 script (Boundary Fill) — {{ bfillState === 'fail' ? 'likely to fail' : bfillState === 'unchecked' ? 'not checked' : 'experimental' }}
       </a>
-      <p v-if="store.bfillCheck && !store.bfillCheck.ok" class="hint warn">
-        This one will probably not build in Fusion: {{ store.bfillCheck.reason }}. Fusion cannot resolve blends made of many small bands; the STEP is still fine.
+      <p v-if="bfillState === 'fail'" class="hint warn">
+        This one will probably not build in Fusion: {{ store.bfillCheck.reason }}. The STEP is still fine.
+      </p>
+      <p v-else-if="bfillState === 'unchecked'" class="hint">
+        The dry run could not check this script ({{ store.bfillCheck.reason }}); Fusion may still build it.
       </p>
       <p v-if="store.scriptUrl" class="hint">
         The script rebuilds the recognised sketches and extrudes as an editable program — change a radius or height and re-run it to get a new STEP.

@@ -98,6 +98,27 @@ def _same_surface(a, b):
             return False
         w = np.asarray(b['point'], float) - np.asarray(a['point'], float)
         return float(np.linalg.norm(w - (w @ ax) * ax)) < MERGE_GAP_MM
+    # closed tools (sphere, torus) and cones: the same surface only when the
+    # fits coincide — the case of a region split by the engine's pinch repair,
+    # whose pieces carry one and the same fit and would otherwise become two
+    # coincident whole tools (a kernel failure)
+    if a['kind'] == 'cone':
+        ax, bx = np.asarray(a['axis'], float), np.asarray(b['axis'], float)
+        if ax @ bx < cos_tol or abs(a['half_angle'] - b['half_angle']) > math.radians(MERGE_DEG):
+            return False
+        return float(np.linalg.norm(np.asarray(b['apex'], float)
+                                    - np.asarray(a['apex'], float))) < MERGE_GAP_MM
+    if a['kind'] == 'sphere':
+        return (abs(a['r'] - b['r']) <= MERGE_GAP_MM
+                and float(np.linalg.norm(np.asarray(b['center'], float)
+                                         - np.asarray(a['center'], float))) < MERGE_GAP_MM)
+    if a['kind'] == 'torus':
+        ax, bx = np.asarray(a['axis'], float), np.asarray(b['axis'], float)
+        if (abs(ax @ bx) < cos_tol or abs(a['R'] - b['R']) > MERGE_GAP_MM
+                or abs(a['r'] - b['r']) > MERGE_GAP_MM):
+            return False
+        return float(np.linalg.norm(np.asarray(b['center'], float)
+                                    - np.asarray(a['center'], float))) < MERGE_GAP_MM
     return False
 
 
@@ -105,6 +126,7 @@ def _merge_same_surface(regions):
     """Neighbouring regions that sit on the same plane/cylinder with
     slightly different fits become one tool: two parallel sheets a few
     microns apart never cross, and the cell leaks out through the slit.
+    Pieces of one cone/sphere/torus fit (pinch repair) become one tool too.
     (The face-group engine keeps them as separate faces in the STEP.)"""
     by_id = {r['id']: r for r in regions}
     parent = {r['id']: r['id'] for r in regions}
@@ -142,24 +164,17 @@ def _merge_same_surface(regions):
             n = np.asarray(rep['normal'], float)
             o = np.asarray(rep['point'], float)
             pts = np.vstack([np.asarray(m['hull'], float) for m in members])
-            pts = pts - np.outer((pts - o) @ n, n)            # onto the kept plane
-            from shapely.geometry import MultiPoint
-            from .facegroups import _plane_basis_vectors
-            u, v = _plane_basis_vectors(n)
-            rel = pts - o
-            hull = MultiPoint(np.c_[rel @ u, rel @ v]).convex_hull
-            if hull.geom_type != 'Polygon':
-                hull = hull.buffer(0.05, join_style=2)
-            xy = np.asarray(hull.exterior.coords)[:-1]
-            rep['hull'] = (o + np.outer(xy[:, 0], u) + np.outer(xy[:, 1], v)).tolist()
-        else:
+            from .facegroups import _plane_hull
+            rep['hull'] = _plane_hull(pts, o, n).tolist()       # onto the kept plane
+        elif rep['kind'] in ('cylinder', 'cone'):
+            okey = 'point' if rep['kind'] == 'cylinder' else 'apex'
             ax = np.asarray(rep['axis'], float)
-            o = np.asarray(rep['point'], float)
+            o = np.asarray(rep[okey], float)
             ts, angles = [], []
             xref = np.asarray(rep.get('xref', (1, 0, 0)), float)
             yref = np.cross(ax, xref)
             for m in members:
-                om, am = np.asarray(m['point'], float), np.asarray(m['axis'], float)
+                om, am = np.asarray(m[okey], float), np.asarray(m['axis'], float)
                 for t in (m['t0'], m['t1']):
                     ts.append(float(((om + t * am) - o) @ ax))
                 if m.get('a0') is None:
@@ -292,6 +307,43 @@ def _snap_tangencies(regions, surfaces, penetrate_mm=0.0):
                     pairs.add((nid, r['id']))
                 surfaces[i] = ('torus', tuple(round(float(x), 9) for x in c), s[2],
                                round(float(R), 9), rad)
+            continue
+        if s[0] == 'cone':
+            # a tapered fillet (an approximate cone tool) is tangent to each
+            # plane it blends along one ruling: the plane passes through the
+            # apex and makes (90 - half) degrees with the axis. Move the apex
+            # onto the plane and turn the axis to the exact angle about it,
+            # alternating when two planes constrain it. (Cone/cylinder
+            # tangencies are not snapped.)
+            apex, ax, half = np.asarray(s[1], float), np.asarray(s[2], float), s[3]
+            cons = []
+            for nid, vs in r.get('adjacent', {}).items():
+                if len(vs) < 2 or nid not in planes:
+                    continue
+                o, n = planes[nid]
+                if abs(abs(float(ax @ n)) - math.sin(half)) > sin_tol:
+                    continue
+                if abs(float((apex - o) @ n)) <= gap_tol:
+                    cons.append((o, n, nid))
+            if not cons:
+                continue
+            for _ in range(20):
+                for o, n, _nid in cons:
+                    apex = apex - float((apex - o) @ n) * n
+                    q = float(ax @ n)
+                    p = ax - q * n
+                    pn = float(np.linalg.norm(p))
+                    if pn > 1e-12:
+                        ax = math.cos(half) * (p / pn) + math.copysign(math.sin(half), q) * n
+            for _o, _n, nid in cons:
+                pairs.add((r['id'], nid))
+                pairs.add((nid, r['id']))
+            xref = np.asarray(s[7], float)
+            xref = xref - float(xref @ ax) * ax
+            xref = xref / (float(np.linalg.norm(xref)) or 1.0)
+            surfaces[i] = (('cone', tuple(round(float(x), 9) for x in apex),
+                            tuple(round(float(x), 9) for x in ax)) + tuple(s[3:7])
+                           + (tuple(round(float(x), 7) for x in xref),) + tuple(s[8:]))
             continue
         if s[0] not in ('cyl', 'sphere'):
             continue
@@ -517,6 +569,17 @@ def _drop_coincident_facets(regions):
     return kept, dropped
 
 
+def _label(r):
+    """A region's id for the script's log, with the engine's ids it was
+    made from when they differ ('12<3,4,5>': a consolidated blend tool,
+    a pinch piece) — the ids the pipeline's fallback list and verbose
+    output use."""
+    src = [int(i) for i in r.get('src', [])]
+    if src and src != [int(r['id'])]:
+        return '{}<{}>'.format(r['id'], ','.join(str(i) for i in src))
+    return str(r['id'])
+
+
 def _body_record(info, name, penetrate_mm=0.0):
     regions, n_facets = _facet_regions(info['regions'], info.get('mesh_vertices', []),
                                        info.get('mesh_faces', []))
@@ -527,7 +590,7 @@ def _body_record(info, name, penetrate_mm=0.0):
     snapped = _snap_tangencies(regions, surfaces, penetrate_mm)
     n_snapped = len(snapped) // 2
     _extensions(regions, surfaces, info.get('mesh_vertices', []), snapped)
-    inside = [_cm3(p) + ('{} {}'.format(r['id'], r['kind']),)
+    inside = [_cm3(p) + ('{} {}'.format(_label(r), r['kind']),)
               for r in regions for p in r.get('inside', [])]
     unfitted = sum(1 for r in info['regions'] if r.get('built') != 'analytic')
     return {'name': name, 'volume': round(float(info.get('mesh_volume', 0.0)) / 1000.0, 6),
@@ -618,6 +681,19 @@ def _expand(size, emin):
     return max(EXPAND_MIN, emin, min(EXPAND, 0.5 * size))
 
 
+def _arc_span(r, a0, a1, expand):
+    """Angular window (lo, hi) of a cylinder/cone tool: the region's arc
+    widened by `expand` along the circumference; None when the region goes
+    (nearly) all the way round, meaning the whole circle. Pure arithmetic,
+    shared with the OCC dry run (stl2prism.bfill_check)."""
+    if a0 is None or a1 is None or r <= 0:
+        return None
+    da = min(math.pi, expand / r)
+    if (a1 - a0) + 2 * da >= 2 * math.pi - 0.02:
+        return None
+    return a0 - da, a1 + da
+
+
 def _plane_body(tbm, o, u, v, xy, emin):
     n = [u[1] * v[2] - u[2] * v[1], u[2] * v[0] - u[0] * v[2], u[0] * v[1] - u[1] * v[0]]
     hull = [[o[k] + x * u[k] + y * v[k] for k in range(3)] for x, y in xy]
@@ -634,16 +710,13 @@ def _plane_body(tbm, o, u, v, xy, emin):
     return tbm.createFaceFromPlanarWires([wire])
 
 
-def _arc_or_circle(center, ax, xref, r, a0, a1, expand):
-    """The region's arc widened by `expand` along the circumference, or the
-    whole circle when the region goes (nearly) all the way round."""
-    if a0 is None or r <= 0:
-        return adsk.core.Circle3D.createByCenter(_pt(center), _vec(ax), r)
-    da = min(math.pi, expand / r)
-    if (a1 - a0) + 2 * da >= 2 * math.pi - 0.02:
+def _arc_or_circle(center, ax, xref, r, span):
+    """An arc over the window span = (lo, hi), or the whole circle when
+    span is None (see _arc_span)."""
+    if span is None:
         return adsk.core.Circle3D.createByCenter(_pt(center), _vec(ax), r)
     return adsk.core.Arc3D.createByCenter(_pt(center), _vec(ax), _vec(xref), r,
-                                          a0 - da, a1 + da)
+                                          span[0], span[1])
 
 
 def _ruled(tbm, c1, c2):
@@ -660,8 +733,9 @@ def _cyl_body(tbm, o, ax, r, t0, t1, emin, xref, a0, a1):
     expand = _expand(t1 - t0, emin)
     p1 = [o[k] + (t0 - expand) * ax[k] for k in range(3)]
     p2 = [o[k] + (t1 + expand) * ax[k] for k in range(3)]
-    return _ruled(tbm, _arc_or_circle(p1, ax, xref, r, a0, a1, expand),
-                  _arc_or_circle(p2, ax, xref, r, a0, a1, expand))
+    span = _arc_span(r, a0, a1, expand)
+    return _ruled(tbm, _arc_or_circle(p1, ax, xref, r, span),
+                  _arc_or_circle(p2, ax, xref, r, span))
 
 
 def _cone_body(tbm, apex, ax, half, t0, t1, emin, xref, a0, a1):
@@ -679,8 +753,12 @@ def _cone_body(tbm, apex, ax, half, t0, t1, emin, xref, a0, a1):
     if r1 < 0.005:
         # reaches the apex: a solid cone (a ruled sheet cannot end in a point)
         return tbm.createCylinderOrCone(_pt(p1), max(1e-4, r1), _pt(p2), r2)
-    return _ruled(tbm, _arc_or_circle(p1, ax, xref, r1, a0, a1, slant),
-                  _arc_or_circle(p2, ax, xref, r2, a0, a1, slant))
+    # one angular window for both ends (grown at the small end's radius):
+    # the rulings stay on the fitted cone, and both ends are arcs or both
+    # are circles — a ruled sheet between a circle and an arc fails
+    span = _arc_span(r1, a0, a1, slant)
+    return _ruled(tbm, _arc_or_circle(p1, ax, xref, r1, span),
+                  _arc_or_circle(p2, ax, xref, r2, span))
 
 
 def _sphere_body(tbm, c, r):
@@ -737,6 +815,9 @@ class _Mesh:
         self.V, self.F, self.n = V, F, n
         xs = [v[0] for v in V]
         ys = [v[1] for v in V]
+        zs = [v[2] for v in V]
+        self.lo = (min(xs), min(ys), min(zs))       # bounds: a cheap
+        self.hi = (max(xs), max(ys), max(zs))       # "cannot be inside"
         self.x0, self.y0 = min(xs), min(ys)
         self.dx = (max(xs) - self.x0) / n + 1e-9
         self.dy = (max(ys) - self.y0) / n + 1e-9
@@ -771,6 +852,10 @@ class _Mesh:
                 n += 1
         return n % 2
 
+    def box_outside(self, lo, hi):
+        """Does a box (two corners) lie entirely outside the mesh's bounds?"""
+        return any(hi[k] < self.lo[k] or lo[k] > self.hi[k] for k in range(3))
+
     def contains(self, p):
         # three slightly shifted rays, majority vote: a ray through a mesh
         # edge or vertex would otherwise be counted twice
@@ -780,10 +865,89 @@ class _Mesh:
         return votes >= 2
 
 
+SLIVER_CM = 0.1   # cm: a cell this small whose centre lies outside the part still gets the face probe
+
+
+def _cell_is_material(body, pts, pt_hit, mesh, INSIDE):
+    """Is this cell material? (hit, how): a probe point lies in it
+    ('probe'); else a point of its own interior — the box centre, else the
+    centre of mass — lies inside the mesh ('centre'); else, for a crescent
+    sliver whose interior points are not its own (a thin curved slice
+    between a blend chain's approximate tool and its neighbours: real
+    material, 2026-08-24 joystick claw) or a sliver straddling the part's
+    skin, a point on one of its faces nudged 0.05 mm inward ('face'). Each
+    step is guarded on its own: a Fusion API error skips that step only,
+    nothing is read from another cell. bfill_check.check_body runs the
+    same procedure on OCC solids."""
+    hit = False
+    box = None
+    try:
+        box = body.boundingBox
+        for k, p in enumerate(pts):
+            if box.contains(p) and body.pointContainment(p) == INSIDE:
+                hit = True
+                pt_hit[k] = True
+    except Exception:
+        pass
+    if hit:
+        return True, 'probe'
+    if mesh is None:
+        return False, None
+    centre, diag = None, 0.0
+    try:
+        if box is not None:
+            lo, hi = box.minPoint, box.maxPoint
+            if mesh.box_outside((lo.x, lo.y, lo.z), (hi.x, hi.y, hi.z)):
+                return False, None                  # entirely outside the part's bounds
+            centre = ((lo.x + hi.x) / 2, (lo.y + hi.y) / 2, (lo.z + hi.z) / 2)
+            diag = math.sqrt((hi.x - lo.x) ** 2 + (hi.y - lo.y) ** 2 + (hi.z - lo.z) ** 2)
+    except Exception:
+        centre = None
+    inner = None
+    try:
+        if centre is not None:
+            c = adsk.core.Point3D.create(centre[0], centre[1], centre[2])
+            if body.pointContainment(c) == INSIDE:
+                inner = c
+        if inner is None:
+            c = body.physicalProperties.centerOfMass
+            if body.pointContainment(c) == INSIDE:
+                inner = c
+    except Exception:
+        pass
+    if inner is not None:
+        if mesh.contains((inner.x, inner.y, inner.z)):
+            return True, 'centre'
+        if diag > SLIVER_CM:
+            return False, None                      # a cell of the outside: decided
+    if centre is None:
+        return False, None
+    try:
+        faces = body.faces
+        n = min(faces.count, 6)
+    except Exception:
+        return False, None
+    for fi in range(n):
+        try:
+            p0 = faces.item(fi).pointOnFace
+            dx, dy, dz = centre[0] - p0.x, centre[1] - p0.y, centre[2] - p0.z
+            nn = math.sqrt(dx * dx + dy * dy + dz * dz) or 1.0
+            p1 = adsk.core.Point3D.create(p0.x + 0.005 * dx / nn,
+                                          p0.y + 0.005 * dy / nn,
+                                          p0.z + 0.005 * dz / nn)
+            if (body.pointContainment(p1) == INSIDE
+                    and mesh.contains((p1.x, p1.y, p1.z))):
+                return True, 'face'
+        except Exception:
+            continue
+    return False, None
+
+
 def _select_cells(cells, bd, log):
-    """Keep every cell that contains one of the inside points, plus every
-    other cell whose centre of mass lies inside the mesh; if nothing at all
-    can be tested, the cell whose volume is closest to the mesh volume."""
+    """Keep every cell that is material (_cell_is_material: a probe point
+    in it, else a point of its own interior inside the mesh, else a face
+    probe for slivers); if nothing at all can be tested, the cell whose
+    volume is closest to the mesh volume."""
     INSIDE = adsk.fusion.PointContainment.PointInsidePointContainment
     pts = [_pt(p) for p in bd['inside']]
     labels = [p[3] if len(p) > 3 else '?' for p in bd['inside']]
@@ -800,55 +964,11 @@ def _select_cells(cells, bd, log):
                 i, n_cells, kept, time.time() - t_start))
         cell = cells.item(i)
         body = cell.cellBody
-        hit = False
-        try:
-            box = body.boundingBox
-            for k, p in enumerate(pts):
-                if box.contains(p) and body.pointContainment(p) == INSIDE:
-                    hit = True
-                    pt_hit[k] = True
-        except Exception:
-            hit = False
-        if not hit and mesh is not None:
-            try:
-                lo, hi = box.minPoint, box.maxPoint
-                cx, cy, cz = (lo.x + hi.x) / 2, (lo.y + hi.y) / 2, (lo.z + hi.z) / 2
-                # slivers get the same tests as any other cell: the thin
-                # slices between a blend chain's approximate tool and its
-                # neighbours are real material, and skipping them left
-                # visible cracks (2026-08-24, joystick claw). Cells outside
-                # the part still fail the mesh-containment test.
-                c = adsk.core.Point3D.create(cx, cy, cz)
-                if body.pointContainment(c) != INSIDE:
-                    c = body.physicalProperties.centerOfMass
-                if body.pointContainment(c) == INSIDE and mesh.contains((c.x, c.y, c.z)):
-                    hit = True
-                    by_centre += 1
-            except Exception:
-                pass
-        if not hit and mesh is not None:
-            # a thin curved sliver is a crescent: its own centre lies outside
-            # it, so probe points ON its faces, nudged 0.05 mm inward — a
-            # crescent always contains those (2026-08-24, joystick claw)
-            try:
-                faces_sorted = sorted(body.faces, key=lambda f: -f.area)[:6]
-            except Exception:
-                faces_sorted = []
-            for f in faces_sorted:
-                try:
-                    p0 = f.pointOnFace
-                    dx, dy, dz = cx - p0.x, cy - p0.y, cz - p0.z
-                    nn = math.sqrt(dx * dx + dy * dy + dz * dz) or 1.0
-                    p1 = adsk.core.Point3D.create(p0.x + 0.005 * dx / nn,
-                                                  p0.y + 0.005 * dy / nn,
-                                                  p0.z + 0.005 * dz / nn)
-                    if (body.pointContainment(p1) == INSIDE
-                            and mesh.contains((p1.x, p1.y, p1.z))):
-                        hit = True
-                        by_face += 1
-                        break
-                except Exception:
-                    continue
+        hit, how = _cell_is_material(body, pts, pt_hit, mesh, INSIDE)
+        if how == 'centre':
+            by_centre += 1
+        elif how == 'face':
+            by_face += 1
         if hit or kept == 0:
             try:
                 vols.append(body.volume)
@@ -877,7 +997,7 @@ def _select_cells(cells, bd, log):
                    'Regions (id kind, points missed/total):'.format(n_miss, len(pts)))
         log.append('  ' + ', '.join('{} {}/{}'.format(lb, n, total[lb]) for lb, n in worst[:25]))
     if by_centre:
-        log.append('{} cell(s) kept by their centre of mass lying inside the mesh'.format(by_centre))
+        log.append('{} cell(s) kept by a point of their interior lying inside the mesh'.format(by_centre))
     if kept == 0 and cells.count > 0:
         best = min(range(cells.count), key=lambda i: abs(vols[i] - target_vol))
         cells.item(best).isSelected = True
@@ -1106,6 +1226,8 @@ def run(context):
 
 
 BAND_MAX_BANDS = 3      # more chained blend bands than this: Fusion is expected to fail
+ASSESS_BAND_LEN_R = 2.5   # a band, for the heuristic: a curved region shorter than this x radius
+ASSESS_BAND_R_TOL = 0.25  # ... next to one of the same kind within this fraction in radius
 
 
 def assess(build):
@@ -1125,7 +1247,7 @@ def assess(build):
         length = float(r['t1'] - r['t0'])
         rad = float(r['r']) if r['kind'] == 'cylinder' else \
             float(r['t1']) * math.tan(float(r['half_angle']))
-        if rad <= 0 or length > 2.5 * rad:
+        if rad <= 0 or length > ASSESS_BAND_LEN_R * rad:
             continue
         ax = np.asarray(r['axis'], float)
         for nid in r.get('adjacent', {}):
@@ -1134,7 +1256,7 @@ def assess(build):
                 continue
             nrad = float(n['r']) if n['kind'] == 'cylinder' else \
                 float(n['t1']) * math.tan(float(n['half_angle']))
-            if abs(nrad - rad) > 0.25 * rad:
+            if abs(nrad - rad) > ASSESS_BAND_R_TOL * rad:
                 continue
             if abs(float(ax @ np.asarray(n['axis'], float))) > math.cos(math.radians(25)):
                 bands += 1
@@ -1153,11 +1275,22 @@ def assess(build):
             'reason': '; '.join(reasons) if reasons else 'all regions fitted cleanly'}
 
 
+def skipped_bodies(builds, max_regions=MAX_REGIONS):
+    """(index, n_regions) of the face-group bodies the script leaves out
+    for having more regions than it supports — an outlook must not vouch
+    for a script that lacks them."""
+    return [(bi, len(info['regions'])) for bi, info in enumerate(builds)
+            if info.get('mode') == 'facegroup' and 'regions' in info
+            and len(info['regions']) > max_regions]
+
+
 def emit_boundary_fill_script(builds, stem='part', expand_mm=EXPAND_MM,
-                              max_regions=MAX_REGIONS, penetrate_mm=0.0):
+                              max_regions=MAX_REGIONS, penetrate_mm=0.0, warning=None):
     """Script text for every face-group body in `builds` (the per-body build
     records pipeline.run collects; prismatic/faceted bodies get a comment).
-    Raises TooManyRegions when no body is small enough."""
+    `warning` (the pipeline's outlook, when it is a FAIL) goes into the
+    docstring header so the file says what the UI says. Raises
+    TooManyRegions when no body is small enough."""
     recs, notes = [], []
     n_fg = sum(1 for b in builds if b.get('mode') == 'facegroup' and 'regions' in b)
     for bi, info in enumerate(builds):
@@ -1178,8 +1311,7 @@ def emit_boundary_fill_script(builds, stem='part', expand_mm=EXPAND_MM,
                 f"face-group bodies have more than {max_regions} regions")
         raise ValueError('no face-group body')
     n_surf = sum(len(r['surfaces']) for r in recs)
-    checks = [assess(b) for b in builds if b.get('mode') == 'facegroup' and 'regions' in b]
-    warn = [c['reason'] for c in checks if not c['ok']]
+    warn = [warning] if warning else []
     head = [
         '"""Generated by stl2prism — rebuilds a face-group result with Fusion 360\'s',
         'Boundary Fill: every fitted surface is recreated slightly oversized as a',
@@ -1198,7 +1330,6 @@ def emit_boundary_fill_script(builds, stem='part', expand_mm=EXPAND_MM,
         'RUN_FILL = True          # False: only create the surfaces (run Boundary Fill by hand)',
         'DIAGNOSE = False         # if Fusion cannot compute the cells, find the tools it rejects (slow, can hang)',
         'SKIP = []                # tool numbers (frame_s<N>) to leave out',
-        'TINY_CELL = 0.02         # cm: cells smaller than this are logged as slivers',
         'SHOW_SUMMARY = True      # message box with the log at the end',
         '',
     ]
