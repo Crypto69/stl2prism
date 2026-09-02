@@ -1861,6 +1861,60 @@ def _full_sphere_solid(rg):
     return BRepPrimAPI_MakeSphere(gp_Pnt(*map(float, c)), float(rg.params['r'])).Solid()
 
 
+def _coplanar_pieces(mesh, faces):
+    """Edge-connected, coplanar groups of a face set (exact CAD facets):
+    the honest pieces of a region that could not get one analytic face."""
+    import trimesh
+    FN = np.round(mesh.face_normals[faces], 3)
+    sub = {int(f): i for i, f in enumerate(faces)}
+    pairs = [(sub[int(a)], sub[int(b)]) for a, b in mesh.face_adjacency
+             if int(a) in sub and int(b) in sub
+             and bool(np.all(FN[sub[int(a)]] == FN[sub[int(b)]]))]
+    comp = trimesh.graph.connected_components(
+        np.asarray(pairs, dtype=np.int64).reshape(-1, 2),
+        min_len=1, nodes=np.arange(len(faces)))
+    return [faces[np.array(sorted(c))] for c in comp]
+
+
+def _split_pinched(mesh, faces):
+    """Split a region whose boundary pinches — a vertex with two outgoing
+    boundary edges, e.g. an annulus whose hole touches the rim at one point —
+    into a core plus the peeled faces around each pinch vertex (one piece per
+    edge-connected component). Returns a list of face arrays whose loops all
+    group cleanly, or None when this repair does not apply."""
+    from collections import Counter as _Counter
+    import trimesh
+    pieces = []
+    core = faces
+    for _ in range(3):                       # a repair can reveal a second pinch
+        tri = mesh.faces[core]
+        edges = np.vstack([tri[:, [0, 1]], tri[:, [1, 2]], tri[:, [2, 0]]])
+        key = np.sort(edges, axis=1)
+        _, idx, cnt = np.unique(key, axis=0, return_index=True, return_counts=True)
+        bnd = edges[idx[cnt == 1]]
+        outd = _Counter(int(a) for a, _b in bnd)
+        pinch = {v for v, d in outd.items() if d > 1}
+        if not pinch:
+            return None                      # a different failure mode: no repair
+        touch = np.array([any(int(v) in pinch for v in t) for t in tri])
+        peel = core[touch]
+        core = core[~touch]
+        if len(core) == 0 or len(peel) == 0:
+            return None
+        sub = {int(f): i for i, f in enumerate(peel)}
+        pairs = [(sub[int(a)], sub[int(b)]) for a, b in mesh.face_adjacency
+                 if int(a) in sub and int(b) in sub]
+        comp = trimesh.graph.connected_components(
+            np.asarray(pairs, dtype=np.int64).reshape(-1, 2),
+            min_len=1, nodes=np.arange(len(peel)))
+        pieces += [peel[np.array(sorted(c))] for c in comp]
+        if _group_loops(mesh, core) is not None:
+            if all(_group_loops(mesh, p) is not None for p in pieces):
+                return [core] + pieces
+            return None
+    return None
+
+
 def build_solid(mesh, regions, fit_tol=0.08, sew_tol=SEW_TOL, verbose=False):
     """Faces for every region → sew → largest solid. Returns (TopoDS_Solid,
     stats); raises FaceGroupError when the result is not one closed shell."""
@@ -1873,6 +1927,25 @@ def build_solid(mesh, regions, fit_tol=0.08, sew_tol=SEW_TOL, verbose=False):
     from .rebuild import _largest_solid, _naked_edges
     t0 = time.time()
     F = mesh.faces
+    # a pinched boundary loses the whole region to triangles: peel the faces
+    # at the pinch vertex into pieces of their own and keep the core analytic
+    n_pinch_repairs = 0
+    extra = []
+    for rg in regions:
+        if _group_loops(mesh, rg.faces) is not None:
+            continue
+        split = _split_pinched(mesh, rg.faces)
+        if split is None:
+            continue
+        rg.faces = split[0]
+        for pf in split[1:]:
+            extra.append(Region(0, rg.kind, pf, [], dict(rg.params),
+                                resid=rg.resid, concave=rg.concave))
+        n_pinch_repairs += 1
+    if extra:
+        regions.extend(extra)
+        for i, rg in enumerate(regions):
+            rg.id = i
     vpos, inc = _vertex_positions(mesh, regions)
     fallbacks = []
     faces_by_region = {}
@@ -1900,6 +1973,39 @@ def build_solid(mesh, regions, fit_tol=0.08, sew_tol=SEW_TOL, verbose=False):
         else:
             faces_by_region[rg.id] = face
 
+    fallback_cache = {}
+
+    def fallback_faces(rg):
+        """Faces for a region that gets no analytic surface: one planar face
+        per coplanar facet group where that builds (the groups are exact CAD
+        facets, so this loses nothing), raw triangles otherwise."""
+        got = fallback_cache.get(rg.id)
+        if got is not None:
+            return got
+        out = []
+        for gf in _coplanar_pieces(mesh, rg.faces):
+            face = None
+            if len(gf) >= 2:
+                loops = _group_loops(mesh, gf)
+                if loops:
+                    n = mesh.face_normals[gf[0]]
+                    tmp = Region(rg.id, 'plane', gf, [],
+                                 {'normal': n / np.linalg.norm(n),
+                                  'point': mesh.triangles_center[gf[0]].copy()})
+                    face, _why = _region_face(mesh, tmp, vpos, loops, fit_tol)
+            if face is not None:
+                out.append(face)
+                continue
+            for tri in F[gf]:
+                w = _polygon(vpos, tri)
+                if w is None:
+                    continue
+                mk = BRepBuilderAPI_MakeFace(w, True)
+                if mk.IsDone():
+                    out.append(mk.Face())
+        fallback_cache[rg.id] = out
+        return out
+
     def sew_all(triangle_regions):
         sew = BRepBuilderAPI_Sewing(sew_tol)
         n_added = n_tri = 0
@@ -1911,16 +2017,11 @@ def build_solid(mesh, regions, fit_tol=0.08, sew_tol=SEW_TOL, verbose=False):
                 rg.n_faces_out = 1
                 continue
             rg.n_faces_out = 0
-            for tri in F[rg.faces]:
-                w = _polygon(vpos, tri)
-                if w is None:
-                    continue
-                mk = BRepBuilderAPI_MakeFace(w, True)
-                if mk.IsDone():
-                    sew.Add(mk.Face())
-                    n_added += 1
-                    n_tri += 1
-                    rg.n_faces_out += 1
+            for f2 in fallback_faces(rg):
+                sew.Add(f2)
+                n_added += 1
+                n_tri += 1
+                rg.n_faces_out += 1
         sew.Perform()
         return sew, n_added, n_tri
 
@@ -1998,7 +2099,8 @@ def build_solid(mesh, regions, fit_tol=0.08, sew_tol=SEW_TOL, verbose=False):
     stats = {'faces_added': n_added, 'faces_kept': kept, 'shells': n_shells,
              'free_edges': int(free), 'triangle_faces': n_tri,
              'naked_edges': naked, 'volume': float(vol), 'valid': bool(valid),
-             'fallbacks': fallbacks, 't_build': time.time() - t0}
+             'fallbacks': fallbacks, 'pinch_repairs': n_pinch_repairs,
+             't_build': time.time() - t0}
     if verbose:
         n_an = sum(1 for rg in regions if rg.built == 'analytic')
         print(f"[fgroup] {n_an} analytic face(s), {n_tri} triangle face(s) from "
@@ -2129,6 +2231,148 @@ def _inside_points(mesh, rg, n_pts=4):
     return out
 
 
+def consolidate_blends(mesh, regions, fit_tol=0.08):
+    """For the Boundary Fill export ONLY: merge chains of tangent band
+    regions (a tapered / variable-radius fillet the exact kinds cannot hold
+    within the vertex tolerance) into single approximate torus or cone
+    tools. A G1 chain of tangent bands defeats the kernel's cell
+    computation — tangent contacts drop out — so one surface per blend is
+    needed there, and a cutting tool only has to stay within the fit
+    tolerance. The STEP path is untouched and keeps the exact bands.
+    Returns a new regions list; the input list is not modified."""
+    from .features import fit_torus, fit_cone, _plane_basis
+    from .profile_fit import fit_circle_taubin
+    V, F = mesh.vertices, mesh.faces
+
+    def verts(faces):
+        return V[np.unique(F[faces])]
+
+    def mean_r(rg):
+        if rg.kind == 'cylinder':
+            return float(rg.params['r'])
+        P = verts(rg.faces)
+        h = (P - rg.params['apex']) @ rg.params['axis']
+        return float(np.tan(rg.params['half_angle']) * np.abs(h).mean())
+
+    def is_band(rg):
+        if rg.kind not in ('cylinder', 'cone') or rg.built != 'analytic':
+            return False
+        P = verts(rg.faces)
+        o = rg.params['point'] if rg.kind == 'cylinder' else rg.params['apex']
+        h = (P - o) @ rg.params['axis']
+        r = mean_r(rg)
+        return r > 0 and (h.max() - h.min()) <= 4.0 * r
+
+    cands = [rg for rg in regions if is_band(rg)]
+    if len(cands) < 3:
+        return regions
+    owner = np.full(len(F), -1)
+    for rg in regions:
+        owner[rg.faces] = rg.id
+    is_cand = {rg.id for rg in cands}
+    by_id = {rg.id: rg for rg in regions}
+    adj = {i: set() for i in is_cand}
+    for a, b in mesh.face_adjacency:
+        ra, rb = int(owner[a]), int(owner[b])
+        if ra != rb and ra in is_cand and rb in is_cand:
+            adj[ra].add(rb)
+            adj[rb].add(ra)
+
+    def fits(kind, pr, faces):
+        d = DIST[kind](verts(faces), pr)
+        if np.abs(d).max() > fit_tol:
+            return False
+        C = mesh.triangles_center[faces]
+        dots = (NORM[kind](C, pr) * mesh.face_normals[faces]).sum(axis=1)
+        return bool(np.all(dots > 0.5) or np.all(dots < -0.5))
+
+    def try_fit_chain(ids):
+        members = [by_id[i] for i in ids]
+        faces = np.concatenate([rg.faces for rg in members])
+        P = _subsample(verts(faces))
+        cyls = [rg for rg in members if rg.kind == 'cylinder']
+        if len(cyls) >= 3:
+            # torus: the band axes are tangents of the blend's centre circle
+            t = np.array([rg.params['axis'] for rg in cyls])
+            _, ev = np.linalg.eigh(t.T @ t)
+            a = ev[:, 0]
+            b0, b1 = _plane_basis(a)
+            q = np.array([rg.params['point'] for rg in cyls])
+            circ = fit_circle_taubin(np.column_stack([q @ b0, q @ b1]),
+                                     polyline=False)
+            if circ is not None:
+                cu, cv = circ['center']
+                c0 = cu * b0 + cv * b1 + float((q @ a).mean()) * a
+                r0 = float(np.mean([rg.params['r'] for rg in cyls]))
+                f = fit_torus(P, c0, a, float(circ['r']), r0)
+                if (f is not None and f['R'] > f['r'] > 0
+                        and fits('torus', f, faces)):
+                    return 'torus', f
+        # cone: radius roughly linear along a common axis
+        t = np.array([rg.params['axis'] for rg in members])
+        sgn = np.where(t @ t[0] < 0, -1.0, 1.0)
+        t = t * sgn[:, None]
+        _, ev = np.linalg.eigh(t.T @ t)
+        a = ev[:, -1]
+        rel = P - P.mean(axis=0)
+        h = rel @ a
+        rad = np.linalg.norm(rel - np.outer(h, a), axis=1)
+        (s, _b), *_ = np.linalg.lstsq(np.column_stack([h, np.ones(len(h))]),
+                                      rad, rcond=None)
+        if s < 0:
+            a, s = -a, -s
+        f = fit_cone(P, a, float(np.arctan(max(s, 0.05))))
+        if f is not None and fits('cone', f, faces):
+            return 'cone', f
+        return None
+
+    merged_out, used, seen = [], set(), set()
+    for start in sorted(adj):
+        if start in seen:
+            continue
+        comp, queue = [], [start]
+        seen.add(start)
+        while queue:
+            i = queue.pop(0)
+            comp.append(i)
+            for j in sorted(adj[i]):
+                ri, rj = mean_r(by_id[i]), mean_r(by_id[j])
+                if j not in seen and abs(ri - rj) <= 0.35 * max(ri, rj):
+                    seen.add(j)
+                    queue.append(j)
+        pos = 0
+        while pos < len(comp) - 1:
+            best = None
+            for end in range(len(comp), pos + 1, -1):
+                got = try_fit_chain(comp[pos:end])
+                if got is not None:
+                    best = (end, got)
+                    break
+            if best is None:
+                pos += 1
+                continue
+            end, (kind, pr) = best
+            ids = comp[pos:end]
+            faces = np.concatenate([by_id[i].faces for i in ids])
+            C = mesh.triangles_center[faces]
+            dots = (NORM[kind](C, pr) * mesh.face_normals[faces]).sum(axis=1)
+            mg = Region(0, kind, faces, [], pr,
+                        resid=float(np.abs(DIST[kind](verts(faces), pr)).max()),
+                        concave=bool(dots.mean() < 0), built='analytic')
+            mg.approx = True         # a fit-tol tool, not a vertex-tol fit:
+            merged_out.append(mg)    # tangency snapping needs a wider gap
+            used.update(ids)
+            pos = end
+    if not merged_out:
+        return regions
+    import dataclasses
+    final = [dataclasses.replace(rg) for rg in regions if rg.id not in used]
+    final += merged_out
+    for i, rg in enumerate(final):
+        rg.id = i
+    return final
+
+
 def export_regions(mesh, regions):
     """Plain-dict description of every region's fitted surface (mm), with the
     extent the region covers on it, for script generators that rebuild the
@@ -2159,12 +2403,32 @@ def export_regions(mesh, regions):
         d = {'id': int(rg.id), 'kind': rg.kind, 'built': rg.built,
              'n_faces': int(len(rg.faces)), 'area': round(float(rg.area), 4),
              'concave': bool(rg.concave), 'resid': round(float(rg.resid), 5),
+             'approx': bool(getattr(rg, 'approx', False)),
              'inside': _inside_points(mesh, rg),
              'adjacent': {b: sorted(vs) for (a, b), vs in junction.items() if a == rg.id}}
         if rg.built != 'analytic':
-            # the STEP keeps this region as facets; the Fusion script does
-            # the same (the fit is there but was not good enough to trim)
+            # the STEP keeps this region as facets; the Fusion script gets
+            # one sealing plane per coplanar facet piece, so Boundary Fill
+            # can still close the cells around an unfittable patch
             d['faces'] = [int(i) for i in rg.faces]
+            seals = []
+            for gf in _coplanar_pieces(mesh, rg.faces):
+                n = mesh.face_normals[gf[0]]
+                n = n / (np.linalg.norm(n) or 1.0)
+                u2, v2 = _plane_basis_vectors(n)
+                Pg = V[np.unique(F[gf])]
+                o2 = Pg.mean(axis=0)
+                rel2 = Pg - o2
+                uv2 = np.c_[rel2 @ u2, rel2 @ v2]
+                hl = MultiPoint(uv2).convex_hull
+                if hl.geom_type != 'Polygon':
+                    hl = hl.buffer(0.05, join_style=2)
+                xy2 = np.asarray(hl.exterior.coords)[:-1]
+                pts3 = o2 + np.outer(xy2[:, 0], u2) + np.outer(xy2[:, 1], v2)
+                seals.append({'point': np.round(o2, 5).tolist(),
+                              'normal': np.round(n, 7).tolist(),
+                              'hull': np.round(pts3, 4).tolist()})
+            d['seal'] = seals
         if rg.kind == 'plane':
             n = np.asarray(pr['normal'], float)
             u, v = _plane_basis_vectors(n)
@@ -2248,7 +2512,7 @@ def convert(mesh, tol=0.08, verbose=False):
         'faces_by_kind': dict(kinds),
         'resid_max': float(max(r.resid for r in regions)) if regions else 0.0,
         'volume': float(shape.Volume()),
-        'export': {'regions': export_regions(mesh, regions),
+        'export': {'regions': export_regions(mesh, consolidate_blends(mesh, regions, tol)),
                    'mesh_vertices': np.round(mesh.vertices, 4).tolist(),
                    'mesh_faces': mesh.faces.tolist(),
                    'mesh_volume': float(mesh.volume),

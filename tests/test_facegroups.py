@@ -273,6 +273,40 @@ def test_spiral_taper_sphere_bands_merge_to_cones():
     assert all(r.resid <= 0.08 for r in regs)
 
 
+def test_pinched_region_is_peeled_into_clean_pieces():
+    """An annulus whose hole touches the rim at one vertex has a pinched
+    boundary (one vertex with two outgoing boundary edges): _group_loops
+    refuses it, and before v0.3.4 the whole region fell to triangles.
+    _split_pinched must peel the faces at the pinch and return pieces whose
+    loops all group cleanly."""
+    import trimesh
+    from stl2prism.facegroups import _split_pinched
+    from stl2prism.rebuild import _group_loops
+    # a proper annulus strip whose inner ring reuses rim vertex 0: the hole
+    # touches the rim there, degenerate triangles at the weld are dropped
+    n = 12
+    a = np.linspace(0, 2 * np.pi, n, endpoint=False)
+    outer = np.column_stack([4 * np.cos(a), 4 * np.sin(a), np.zeros(n)])
+    inner = np.column_stack([1.5 * np.cos(a), 1.5 * np.sin(a), np.zeros(n)])
+    V = np.vstack([outer, inner])
+    idx_in = [0] + list(range(n + 1, 2 * n))          # inner ring, v0 welded
+    tri = []
+    for i in range(n):
+        j = (i + 1) % n
+        for t in ([i, j, idx_in[i]], [j, idx_in[j], idx_in[i]]):
+            if len(set(t)) == 3:
+                tri.append(t)
+    m = trimesh.Trimesh(V, np.asarray(tri), process=False)
+    faces = np.arange(len(m.faces))
+    if _group_loops(m, faces) is not None:
+        pytest.skip('construction did not pinch (triangulation changed)')
+    pieces = _split_pinched(m, faces)
+    assert pieces is not None and len(pieces) >= 2
+    assert sum(len(p) for p in pieces) == len(faces)
+    for p in pieces:
+        assert _group_loops(m, p) is not None
+
+
 def test_rounded_box_corners_stay_spheres(tmp_path):
     """Three fillets meeting at a box corner blend as a sphere, not a torus:
     the band-chain merge must leave them alone (straight fillets are not

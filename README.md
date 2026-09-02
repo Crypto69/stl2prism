@@ -100,12 +100,15 @@ Text Commands).
 Boundary Fill status: verified on parts the engine fits cleanly (planes,
 cylinders, cones, spheres, fillets, holes — exact face counts). Torus blends
 (fillets around curved edges) are one torus tool each; an apex cone (a
-pencil tip) is one solid cone tool. It fails where the engine still keeps a
-blend as many short cylinder bands (tapered corner fillets): the
-near-coincident sheets defeat Fusion's cell computation. Those blends are
-future engine work (see Roadmap). Bodies with more than 200 regions get no
-script; `EXPAND` at the top of the script sets the oversize (1 mm by
-default).
+pencil tip) is one solid cone tool; a tapered / variable-radius fillet kept
+as bands in the STEP becomes a single approximate torus or cone tool per
+chain (tangent band chains defeat the cell computation). The printed
+outlook is an OCC dry run of the actual script — the tools are rebuilt,
+the cells computed and the enclosed volume measured — so OK / LIKELY TO
+FAIL reflects the arrangement itself, not a guess. Still fails on bodies
+whose gently curved plates segment into near-parallel plane strips (the
+frame — see Roadmap). Bodies with more than 200 regions get no script;
+`EXPAND` at the top of the script sets the oversize (1 mm by default).
 
 ## Web app
 
@@ -249,13 +252,28 @@ volume ≤ 2 %). "faces" = ADVANCED_FACE count in the STEP.
 | servo_bracket_2 | 1,712 | prismatic | 19 (was 28) | 0.044 mm | 0.06 % |
 | top_arm_1 | 3,896 | prismatic (chamfered bosses as cones) | 44 (was 1,245 faceted) | 0.050 mm | 0.00 % |
 | top_arm_2 | 3,816 | prismatic | 40 (was 1,213 faceted) | 0.050 mm | 0.05 % |
-| joystick_claw_1 | 2,134 | face-group (27 cyl, 5 spheres, 8 cones, 5 tori) | 495 (was 514 in v0.3.2, 671 patched) | 0.019 mm | 0.07 % |
+| joystick_claw_1 | 2,134 | face-group (27 cyl, 5 spheres, 8 cones, 5 tori) | 153 (was 495 in v0.3.3, 671 patched) | 0.019 mm | 0.07 % |
 | joystick_claw_2 | 1,902 | face-group (17 cyl, 12 spheres, 13 cones, 5 tori) | 208 (was 226 in v0.3.2, 341 faceted) | 0.047 mm | 0.04 % |
 | frame | 4,200 | face-group (9 cyl, 7 cones) | 101 (was 160 in v0.3.2, 516 faceted) | 0.040 mm | 0.03 % |
 | Mesh_90p (scan) | 2.17 M | faceted (scan route) | 39,575 | — | 0.00 % |
 
 The remaining planar faces on the face-group parts are blends (tapered
 corner fillets, free-form) that v1 keeps as exact facets.
+
+v0.3.4 (pinched boundaries, blend tools, real Boundary Fill outlook): a
+region whose boundary pinches (an annulus whose hole touches the rim at one
+vertex) is repaired by peeling the faces at the pinch instead of falling to
+triangles — joystick_claw_1's biggest plane was one such region, 290
+triangles for what is now 3 planar faces (claw_1: 495 → 153). Regions that
+still get no analytic face are emitted as one planar face per coplanar
+facet group instead of raw triangles. For the Boundary Fill script only,
+chains of tangent blend bands (tapered / variable-radius fillets) are
+merged into single approximate torus or cone tools — a G1 chain of tangent
+bands defeats the kernel's cell computation, and a cutting tool only has to
+stay within the fit tolerance; the STEP keeps the exact bands. The Boundary
+Fill outlook is now an OCC dry run of the actual script (build the tools,
+compute the cells, measure the enclosed volume) instead of a heuristic:
+claw_1 gets its first OK (cells enclose 100.3 % of the mesh).
 
 v0.3.3 (apex and tapered cones): a pointed cone is one conical face closed
 at the tip by a degenerate edge (a pencil part: 1 plane + 1 cylinder +
@@ -321,10 +339,13 @@ exact through the face-group engine.
 
 In rough priority order:
 
-- **Tapered corner fillets in the face-group engine.** Variable-radius
-  corner fillets are still short cylinder bands; fixing this is what the
-  Boundary Fill script needs on the remaining parts. (Torus fits landed in
-  v0.3.2; apex cones and tapered pins in v0.3.3.)
+- **Curved-plate consolidation for Boundary Fill.** A body whose gently
+  curved plates segment into many near-parallel plane strips (the frame)
+  never closes its cells: the strips' tools cannot reach each other at
+  grazing angles. Needs curved fits over gently-bent plane chains, tools
+  first. (Torus fits landed in v0.3.2; apex cones and tapered pins in
+  v0.3.3; pinch repair, blend-chain tools and the OCC dry-run outlook in
+  v0.3.4 — variable-radius fillets stay exact bands in the STEP by design.)
 - **Clean intersection edges on face-group solids.** Today each analytic face
   in the STEP is bounded by the mesh's own polyline edges. Done via the
   Fusion 360 Boundary Fill script for cleanly fitted parts (experimental,

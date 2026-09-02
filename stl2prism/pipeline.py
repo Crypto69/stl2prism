@@ -290,6 +290,20 @@ def _write_bfill_script(builds, out_path, verbose):
             'unfitted': sum(c['unfitted'] for c in checks),
             'tools': sum(c['tools'] for c in checks),
             'reason': '; '.join(c['reason'] for c in checks if not c['ok']) or checks[0]['reason']}
+        try:
+            # the real outlook: rebuild the tools in OCC and see whether the
+            # cells actually enclose the part — no heuristic on the region
+            # list predicts kernel behaviour (a chain of blend bands can cut
+            # fine while gently curved plates never close)
+            from .bfill_check import check_script
+            results, _ = check_script(text)
+            pct = min(r['enclosed_pct'] for r in results) if results else 0.0
+            _write_bfill_script.last_check.update(
+                enclosed_pct=round(pct, 2),
+                ok=bool(99.0 <= pct <= 103.0),
+                reason=f'OCC dry run: cells enclose {pct:.1f}% of the mesh volume')
+        except Exception as e:
+            _write_bfill_script.last_check['reason'] += f' (OCC dry run unavailable: {type(e).__name__})'
     except TooManyRegions as e:
         if verbose:
             print(f"[out] no Boundary Fill script: {e}")
