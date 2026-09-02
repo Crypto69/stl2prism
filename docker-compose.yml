@@ -17,6 +17,9 @@ services:
       STL2PRISM_JOB_TTL: "86400"
       # conversions run one at a time; scan repair can peak at several GB
       STL2PRISM_CONCURRENCY: "1"
+      # seconds one shell's extrusion-axis search may take before the best
+      # candidate so far is used (default 120; 0 means no limit)
+      # STL2PRISM_AXIS_BUDGET: "120"
     # keep a runaway conversion from starving the NAS's other services
     mem_limit: 12g
     restart: unless-stopped

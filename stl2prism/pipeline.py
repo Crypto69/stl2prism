@@ -1,6 +1,8 @@
 """Validate rebuilt solid against source mesh + CLI entry point."""
 import argparse
+import os
 import sys
+import time
 import numpy as np
 import trimesh
 
@@ -274,6 +276,29 @@ def _write_script(builds, out_path, write_script, verbose):
 
 BFILL_CHECK_BUDGET_S = 120   # s: bodies past this are not dry-run (outlook 'not checked')
 
+def _env_float(name, default):
+    """A numeric knob from the environment; an unparsable value is reported
+    once and the default used, so a typo in docker-compose.yml costs a log
+    line, not every job."""
+    raw = os.environ.get(name)
+    if raw is None or raw.strip() == '':
+        return default
+    try:
+        return float(raw)
+    except ValueError:
+        print(f"[warn] {name}={raw!r} is not a number; using {default}",
+              file=sys.stderr)
+        return default
+
+
+# s: the whole axis search of one shell (every candidate, sectioning and
+# refinement); a body with voids gets one budget per shell. Past it the
+# best candidate scored so far is used; with none scored the shell goes
+# straight to the face-group route. The search is bounded per candidate
+# too (extrusion.MAX_LEVELS), so this is the backstop for the case nobody
+# predicted, not the normal path.
+AXIS_SEARCH_BUDGET_S = _env_float('STL2PRISM_AXIS_BUDGET', 120.0)
+
 
 def _write_bfill_script(builds, out_path, verbose):
     """Fusion 360 Boundary Fill script for face-group bodies. Returns
@@ -441,7 +466,8 @@ def _convert_body(mesh, is_scan, force_prismatic, verbose, tol, accept_p95,
          gate; raises if even that cannot represent the body).
     Any exception on a rung falls through to the next.
     """
-    from .extrusion import dominant_axis, score_axis, _axis_basis
+    from .extrusion import (dominant_axis, score_axis, _axis_basis,
+                            AxisSearchTimeout, MAX_LEVELS)
     from .rebuild import build_solid
     gates = dict(accept_p95=accept_p95, accept_max=accept_max,
                  accept_hole_max=accept_hole_max, accept_vol_pct=accept_vol_pct)
@@ -459,16 +485,44 @@ def _convert_body(mesh, is_scan, force_prismatic, verbose, tol, accept_p95,
     try:
         cands = dominant_axis(mesh)
         best = None
+        budget = AXIS_SEARCH_BUDGET_S
+        deadline = time.monotonic() + budget if budget and budget > 0 else None
         for frac, ax in cands:
-            sc, levels, slabs = score_axis(mesh, ax)
+            # candidates come largest area fraction first and a score is at
+            # most 1, so once the best rank is beyond what the next
+            # candidate could reach the rest cannot win
+            if best is not None and best[0] >= 1.0 + 0.5 * frac + 1e-9:
+                break
+            if best is not None and deadline is not None and time.monotonic() > deadline:
+                if verbose:
+                    print(f"[axis] search budget ({budget:.0f} s) spent; "
+                          f"keeping the best candidate so far")
+                break
+            try:
+                sc, levels, slabs = score_axis(mesh, ax, deadline=deadline)
+            except AxisSearchTimeout:
+                if best is None:
+                    raise AxisSearchTimeout(
+                        f"axis search budget ({budget:.0f} s) spent before any "
+                        f"candidate was scored")
+                if verbose:
+                    print(f"[axis] candidate {np.round(ax,3)} abandoned: search "
+                          f"budget ({budget:.0f} s) spent; keeping the best so far")
+                break
             # perpendicular-face area is a strong prior for the extrusion
             # direction (the 'base faces'); use it to break near-ties
             rank = sc * (1.0 + 0.5 * frac)
             if verbose:
-                print(f"[axis] candidate {np.round(ax,3)} area {frac*100:.0f}% "
-                      f"-> constancy score {sc:.2f} ({len(slabs)} slabs)")
+                what = (f"not an extrusion ({len(levels)} levels, cap {MAX_LEVELS}); skipped"
+                        if len(levels) > MAX_LEVELS else
+                        f"constancy score {sc:.2f} ({len(slabs)} slabs)")
+                print(f"[axis] candidate {np.round(ax,3)} area {frac*100:.0f}% -> {what}")
+            if not slabs:
+                continue            # capped, or nothing closed: never the best
             if best is None or rank > best[0] + 1e-9:
                 best = (rank, ax, levels, slabs, sc)
+        if best is None:
+            raise RuntimeError('no candidate axis gave any slab')
         _, axis, levels, slabs, score = best
         if verbose:
             print(f"[axis] selected {np.round(axis,3)} "
