@@ -140,7 +140,11 @@ QNAP; clone on the NAS, build natively, optional Tailscale HTTPS front), follow
 
 Environment knobs: `STL2PRISM_DATA` (job storage dir, default `/data` in
 the container), `STL2PRISM_JOB_TTL` (seconds before old jobs are purged,
-default 86400), `STL2PRISM_MAX_UPLOAD` (bytes, default 200 MB).
+default 86400), `STL2PRISM_MAX_UPLOAD` (bytes, default 200 MB),
+`STL2PRISM_AXIS_BUDGET` (seconds one shell's extrusion-axis search may take
+before the best candidate so far is used, default 120; 0 means no limit).
+The budget is a backstop: a shell that reaches it is scored on what was
+done by then, so its result can depend on machine load.
 
 ## How it works
 
@@ -259,6 +263,21 @@ volume ≤ 2 %). "faces" = ADVANCED_FACE count in the STEP.
 
 The remaining planar faces on the face-group parts are blends (tapered
 corner fillets, free-form) that v1 keeps as exact facets.
+
+v0.3.6 (the extrusion search made finite): a 12k-face textured cavity in
+a 68-body controller offered 772 perpendicular levels on one axis and kept
+the level refinement busy for 41 minutes; the same shell's axis search now
+takes about 27 s. A candidate with more than 120 levels is not an
+extrusion and scores 0 unsectioned; every slab's probe heights are cut in
+one pass and slabs are cached by height, so a refinement round sections
+only the two slabs a new level made; a slab's bisections are done once,
+not once per round; bisection probes chain their own loops (trimesh's path
+machinery was the cost on sections of hundreds of tiny loops) over just the
+faces that span the slab; the same-section test runs its cheap parts
+first; candidate scoring stops once no remaining candidate can win; and a
+budget (`STL2PRISM_AXIS_BUDGET`, 120 s per shell) backstops the whole
+search — past it the best candidate so far is used, or the shell goes to
+the face-group route. The sample STEPs are unchanged.
 
 v0.3.5 (the dry run made honest and fast): the OCC dry run behind the
 Boundary Fill outlook now builds exactly the tools the script builds — the
