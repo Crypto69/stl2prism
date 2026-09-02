@@ -385,6 +385,7 @@ def test_cad_endtoend_hits_prismatic_gate(tmp_path):
     out = str(tmp_path / 'cad.step')
     r = run(paths[0], out, verbose=False)
     assert r['mode'] in ('prismatic', 'facegroup', 'faceted')
-    if r['mode'] == 'prismatic':
+    if r['mode'] in ('prismatic', 'facegroup'):
+        # both routes are held to the same fidelity gate
         assert r['metrics']['dev_p95'] <= 0.25
     assert os.path.getsize(out) > 0

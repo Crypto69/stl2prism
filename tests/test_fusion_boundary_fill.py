@@ -59,6 +59,8 @@ def test_export_regions_and_script(tmp_path, name, builder, kinds):
     for r in regs:
         assert r['inside'], f"region {r['id']} ({r['kind']}) has no inside point"
         assert m.contains(np.asarray(r['inside'])).all()
+        assert r['src'] and all(isinstance(i, int) for i in r['src'])
+        assert isinstance(r['approx'], bool) and 'seal' not in r
         if r['kind'] == 'plane':
             assert len(r['hull']) >= 3
             n, o = np.asarray(r['normal']), np.asarray(r['point'])
@@ -76,6 +78,11 @@ def test_export_regions_and_script(tmp_path, name, builder, kinds):
     ast.parse(text)
     assert 'nan' not in text and 'inf' not in text.replace('info', '')
     assert 'boundaryFillFeatures' in text and 'TemporaryBRepManager' in text
+    assert 'TINY_CELL' not in text and 'WARNING' not in text
+    # both ends of a cone tool share one angular window (a ruled sheet
+    # between a circle and an arc fails), computed by the shared _arc_span
+    assert 'span = _arc_span(r1, a0, a1, slant)' in text
+    assert '_arc_or_circle(p2, ax, xref, r2, span)' in text
     ns = _script_ns(text)
     assert len(ns['BODIES']) == 1
     bd = ns['BODIES'][0]
@@ -183,6 +190,70 @@ def test_tangent_fillet_snapped_to_its_plane():
     assert abs(np.linalg.norm((q - p)[[0, 2]]) - (r + rq)) < 1e-8   # and to the fillet
 
 
+def test_same_fit_pieces_become_one_tool():
+    """Two pieces of one torus/sphere/cone fit (the engine's pinch repair
+    gives the peeled piece the core's params) must not become two
+    coincident whole tools — a kernel failure — but one."""
+    from stl2prism.fusion_boundary_fill import _merge_same_surface
+    t = {'kind': 'torus', 'built': 'analytic', 'center': [0, 0, 5.0], 'axis': [0, 0, 1],
+         'R': 6.0, 'r': 1.5, 'area': 30.0, 'inside': [[6, 0, 4]], 'adjacent': {1: [0, 1]}}
+    a = dict(t, id=0)
+    b = dict(t, id=1, area=2.0, inside=[[0, 6, 4]], adjacent={0: [0, 1]})
+    out, n = _merge_same_surface([a, b])
+    assert n == 1 and len(out) == 1 and out[0]['kind'] == 'torus'
+    assert len(out[0]['inside']) == 2 and out[0]['area'] == 32.0
+    c = dict(t, id=1, center=[0, 0, 9.0], adjacent={0: [0, 1]})          # another torus
+    out, n = _merge_same_surface([a, c])
+    assert n == 0 and len(out) == 2
+    s = {'kind': 'sphere', 'built': 'analytic', 'center': [1, 2, 3.0], 'r': 4.0, 'area': 10.0,
+         'inside': [[1, 2, 6]], 'adjacent': {1: [0, 1]}}
+    out, n = _merge_same_surface([dict(s, id=0), dict(s, id=1, adjacent={0: [0, 1]})])
+    assert n == 1 and len(out) == 1
+    k = {'kind': 'cone', 'built': 'analytic', 'apex': [0, 0, 0.0], 'axis': [0, 0, 1],
+         'half_angle': 0.3, 't0': 2.0, 't1': 5.0, 'xref': [1, 0, 0], 'a0': 0.0, 'a1': 1.0,
+         'area': 10.0, 'inside': [[0, 0, 3]], 'adjacent': {1: [0, 1]}}
+    k2 = dict(k, id=1, t0=5.0, t1=8.0, a0=1.0, a1=2.0, adjacent={0: [0, 1]})
+    out, n = _merge_same_surface([dict(k, id=0), k2])
+    assert n == 1 and len(out) == 1
+    assert out[0]['t0'] == 2.0 and out[0]['t1'] == 8.0          # extents united
+    assert out[0]['a0'] == pytest.approx(0.0, abs=0.03) and out[0]['a1'] == pytest.approx(2.0, abs=0.03)
+
+
+def test_tapered_fillet_cone_snapped_to_its_planes():
+    """An approximate cone tool blending two planes is tangent to each along
+    a ruling: after the snap the apex lies on both planes and the axis makes
+    exactly (90 - half) degrees with each normal — a fit a hair off is
+    corrected, not left with a growing gap along the ruling."""
+    from stl2prism.fusion_boundary_fill import _surface_record, _snap_tangencies
+    half = math.radians(10.0)
+    s = math.sin(half)
+    axis = np.array([math.sqrt(1 - 2 * s * s), s, s])          # tangent to z=0 and y=0
+    th = math.radians(0.3)                                    # ... fitted 0.3 deg off
+    rot = np.array([[1, 0, 0], [0, math.cos(th), -math.sin(th)], [0, math.sin(th), math.cos(th)]])
+    fitted = rot @ axis
+    xref = np.cross(fitted, [0, 0, 1.0])
+    xref /= np.linalg.norm(xref)
+    big = [[-50, -50, 0.0], [50, -50, 0.0], [50, 50, 0.0], [-50, 50, 0.0]]
+    p1 = {'id': 0, 'kind': 'plane', 'normal': [0, 0, 1], 'point': [0, 0, 0.0], 'hull': big,
+          'area': 10000.0, 'adjacent': {2: [0, 1, 2]}}
+    p2 = {'id': 1, 'kind': 'plane', 'normal': [0, 1, 0], 'point': [0, 0, 0.0],
+          'hull': [[-50, 0, -50.0], [50, 0, -50.0], [50, 0, 50.0], [-50, 0, 50.0]],
+          'area': 10000.0, 'adjacent': {2: [3, 4, 5]}}
+    cone = {'id': 2, 'kind': 'cone', 'apex': [0.0, 0.003, -0.002], 'axis': fitted.tolist(),
+            'half_angle': half, 't0': 1.0, 't1': 20.0, 'xref': xref.tolist(), 'a0': 0.0,
+            'a1': 1.0, 'area': 50.0, 'approx': True, 'adjacent': {0: [0, 1, 2], 1: [3, 4, 5]}}
+    regs = [p1, p2, cone]
+    S = [_surface_record(r) for r in regs]
+    pairs = _snap_tangencies(regs, S)
+    assert {(2, 0), (0, 2), (2, 1), (1, 2)} <= pairs
+    apex, ax, xr = (np.asarray(S[2][k], float) for k in (1, 2, 7))
+    assert abs(apex[2]) < 1e-8 and abs(apex[1]) < 1e-8             # on both planes
+    assert abs(np.linalg.norm(ax) - 1) < 1e-8
+    assert abs(ax @ [0, 0, 1] - s) < 1e-6 and abs(ax @ [0, 1, 0] - s) < 1e-6
+    assert abs(ax @ xr) < 1e-6 and abs(np.linalg.norm(xr) - 1) < 1e-6
+    assert S[2][3:7] == tuple(_surface_record(cone)[3:7])          # half, t0, t1, emin kept
+
+
 def test_same_surface_neighbours_are_merged():
     from stl2prism.fusion_boundary_fill import _merge_same_surface
     a = {'id': 0, 'kind': 'plane', 'normal': [0, 0, 1], 'point': [0, 0, 10.0], 'area': 100.0,
@@ -202,6 +273,42 @@ def test_same_surface_neighbours_are_merged():
     assert hull[:, 0].max() == 15 and np.allclose(hull[:, 2], 10.0)   # on a's plane
     assert m['adjacent'] == {2: [4, 5, 6, 7]}
     assert next(r for r in out if r['id'] == 2)['adjacent'] == {0: [4, 5, 6, 7]}
+
+
+def test_pipeline_outlook_is_the_dry_run_and_the_header_agrees(tmp_path, monkeypatch):
+    """The API's outlook comes from the OCC dry run, per body; a FAIL is
+    written into the script's own header; when the dry run cannot run the
+    outlook says so (ok None) instead of a heuristic verdict; and a run
+    without scripts carries no outlook at all (nothing stale from the
+    run before)."""
+    from stl2prism import run, bfill_check
+    p = synth.export(synth.fillet_top(), tmp_path / 'ft.stl')
+    r = run(str(p), str(tmp_path / 'ft.step'), verbose=False)
+    c = r['bfill_check']
+    assert c['ok'] is True and 'enclose' in c['reason']
+    assert c['enclosed_pct'] == pytest.approx(100.0, abs=3.0)
+    text = (tmp_path / 'ft_fusion_bfill.py').read_text()
+    assert 'WARNING' not in text
+    r2 = run(str(p), str(tmp_path / 'ft_noscript.step'), verbose=False, write_script=False)
+    assert r2['bfill_check'] is None and r2['bfill_script'] is None
+
+    def failing(text, budget_s=None):
+        return [dict(name='ft', enclosed_pct=80.0, unenclosed=[], n_probes=5, error=None)]
+    monkeypatch.setattr(bfill_check, 'check_script', failing)
+    r = run(str(p), str(tmp_path / 'ft_fail.step'), verbose=False)
+    c = r['bfill_check']
+    assert c['ok'] is False and 'ft: cells enclose 80.0%' in c['reason']
+    text = (tmp_path / 'ft_fail_fusion_bfill.py').read_text()
+    assert 'WARNING: likely to fail in Fusion' in text and c['reason'] in text
+    ast.parse(text)
+
+    def broken(text, budget_s=None):
+        raise RuntimeError('no kernel')
+    monkeypatch.setattr(bfill_check, 'check_script', broken)
+    r = run(str(p), str(tmp_path / 'ft_nocheck.step'), verbose=False)
+    c = r['bfill_check']
+    assert c['ok'] is None and c['reason'].startswith('not checked') and 'RuntimeError' in c['reason']
+    assert 'WARNING' not in (tmp_path / 'ft_nocheck_fusion_bfill.py').read_text()
 
 
 def test_outlook_flags_band_blends(tmp_path):

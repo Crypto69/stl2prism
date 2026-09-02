@@ -913,15 +913,12 @@ def _write_step_xde(shapes, path, names, colours, schema):
         label = shape_tool.AddShape(shape, False)
         TDataStd_Name.Set_s(label, TCollection_ExtendedString(str(name)))
         if colours:
-            exp = TopExp_Explorer(shape, TopAbs_FACE)
-            while exp.More():
-                face = TopoDS.Face_s(exp.Current())
+            for face in _faces(shape):
                 rgb = SURFACE_COLOURS[_surface_kind(face)]
                 sub = shape_tool.AddSubShape(label, face)
                 if not sub.IsNull():
                     color_tool.SetColor(sub, Quantity_Color(*rgb, Quantity_TOC_RGB),
                                         XCAFDoc_ColorSurf)
-                exp.Next()
     Interface_Static.SetCVal_s('write.step.schema', schema)
     w = STEPCAFControl_Writer()
     w.SetColorMode(bool(colours))
@@ -947,6 +944,24 @@ def _count(shape, kind):
         n += 1
         exp.Next()
     return n
+
+
+def _faces(shape, nonplanar_only=False):
+    """The faces of a shape in explorer order; optionally only the curved
+    ones (the sheets of a cylinder/cone tool without its end discs)."""
+    from OCP.TopExp import TopExp_Explorer
+    from OCP.TopAbs import TopAbs_FACE
+    from OCP.TopoDS import TopoDS
+    from OCP.BRepAdaptor import BRepAdaptor_Surface
+    from OCP.GeomAbs import GeomAbs_Plane
+    exp = TopExp_Explorer(shape, TopAbs_FACE)
+    out = []
+    while exp.More():
+        f = TopoDS.Face_s(exp.Current())
+        if not nonplanar_only or BRepAdaptor_Surface(f).GetType() != GeomAbs_Plane:
+            out.append(f)
+        exp.Next()
+    return out
 
 
 def _naked_edges(shape):
@@ -1037,16 +1052,21 @@ def planar_groups(mesh, angle_tol=1e-3):
     return [np.array(sorted(c)) for c in nx.connected_components(G)]
 
 
-def _group_loops(mesh, faces):
-    """Boundary loops (lists of vertex indices) of a face group; None if the
-    boundary is not a set of simple closed loops."""
-    fset = set(faces.tolist())
-    tri = mesh.faces[faces]
-    # boundary edges: appear once among the group's directed edges
+def _boundary_edges(tri):
+    """Directed boundary edges of a set of triangles (an (n, 3) array of
+    vertex ids): the edges that appear once among the triangles' directed
+    edges, oriented with the face winding."""
+    tri = np.asarray(tri)
     edges = np.vstack([tri[:, [0, 1]], tri[:, [1, 2]], tri[:, [2, 0]]])
     key = np.sort(edges, axis=1)
     _, idx, cnt = np.unique(key, axis=0, return_index=True, return_counts=True)
-    bnd = edges[idx[cnt == 1]]                     # directed, consistent with face winding
+    return edges[idx[cnt == 1]]
+
+
+def _group_loops(mesh, faces):
+    """Boundary loops (lists of vertex indices) of a face group; None if the
+    boundary is not a set of simple closed loops."""
+    bnd = _boundary_edges(mesh.faces[faces])
     if len(bnd) < 3:
         return None
     nxt = {}
