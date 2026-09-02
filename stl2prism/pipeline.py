@@ -7,6 +7,7 @@ import numpy as np
 import trimesh
 
 from .mesh_prep import UNIT_SCALE
+from .extrusion import AxisSearchTimeout
 
 # Deterministic surface sampling: the verdict for a given file must not
 # depend on the random state, or parts near a gate flip mode between runs.
@@ -139,7 +140,7 @@ def gate_values(metrics):
 def run(in_path, out_path, tol=0.08, accept_p95=0.25, accept_vol_pct=2.0,
         accept_max=0.26, accept_hole_max=0.10,
         force_prismatic=False, verbose=True, units='mm', reduce_tol=0.05,
-        write_script=True, face_groups=True):
+        write_script=True, face_groups=True, workers=None, shell_timeout=None):
     """Convert one mesh file to one STEP file.
 
     Every connected body is converted on its own — prismatic where it passes
@@ -149,6 +150,10 @@ def run(in_path, out_path, tol=0.08, accept_p95=0.25, accept_vol_pct=2.0,
     file returns {'mode': 'prismatic'|'facegroup'|'faceted', 'metrics':
     {...}}; a multi-body file adds a per-body list and reports mode 'mixed'
     when the bodies disagree.
+
+    `workers` and `shell_timeout` size the process pool the shells are
+    converted in (see _convert_all; None takes the environment's default,
+    workers=0 converts in this process).
     """
     from .mesh_prep import load_and_prep_bodies
     from .rebuild import write_step
@@ -158,42 +163,58 @@ def run(in_path, out_path, tol=0.08, accept_p95=0.25, accept_vol_pct=2.0,
     gates = dict(tol=tol, accept_p95=accept_p95, accept_max=accept_max,
                  accept_hole_max=accept_hole_max, accept_vol_pct=accept_vol_pct,
                  reduce_tol=reduce_tol, face_groups=face_groups)
+    from .parallel import Pool
+    workers = _pool_size(bodies, workers)
+    pool = Pool(workers) if workers >= 1 else None
+    stages = _Stages(verbose)
+    try:
+        results = _convert_all(bodies, is_scan, force_prismatic, verbose, gates,
+                               pool, shell_timeout)
+        stages.mark('conversion')
+        if len(bodies) == 1:
+            if isinstance(results[0], Exception):
+                raise results[0]
+            shape, mode, metrics = results[0]
+            write_step([shape], out_path, names=[_body_name(in_path, 1, 1)])
+            stages.mark('STEP')
+            if verbose:
+                print(f"[out] {mode} solid -> {out_path}")
+            script, bfill, check = _write_script([metrics.pop('build', {'mode': mode})],
+                                                 out_path, write_script, verbose, pool)
+            stages.mark('scripts and dry run')
+            stages.report()
+            return {'mode': mode, 'metrics': metrics,
+                    'n_bodies': 1, 'n_written': 1, 'n_dropped': n_dropped,
+                    'is_scan': bool(is_scan), 'script': script, 'bfill_script': bfill,
+                    'bfill_check': check}
+        return _finish_multi(bodies, results, in_path, out_path, write_script,
+                             verbose, pool, n_dropped, is_scan, stages)
+    finally:
+        if pool is not None:
+            pool.close()
 
-    if len(bodies) == 1:
-        shape, mode, metrics = _convert_group(
-            bodies[0], is_scan, force_prismatic, verbose, **gates)
-        write_step([shape], out_path, names=[_body_name(in_path, 1, 1)])
-        if verbose:
-            print(f"[out] {mode} solid -> {out_path}")
-        script, bfill, check = _write_script([metrics.pop('build', {'mode': mode})],
-                                             out_path, write_script, verbose)
-        return {'mode': mode, 'metrics': metrics,
-                'n_bodies': 1, 'n_written': 1, 'n_dropped': n_dropped,
-                'is_scan': bool(is_scan), 'script': script, 'bfill_script': bfill,
-                'bfill_check': check}
 
+def _finish_multi(bodies, results, in_path, out_path, write_script, verbose,
+                  pool, n_dropped, is_scan, stages):
+    from .rebuild import write_step
     per_body, shapes = [], []
-    for i, body in enumerate(bodies):
-        tag = f"[body {i + 1}/{len(bodies)}]"
-        if verbose:
-            print(f"{tag} converting {len(body.mesh.faces)} faces"
-                  + (f" (+{len(body.voids)} void(s))" if body.voids else ""))
+    for i, (body, res) in enumerate(zip(bodies, results)):
         entry = {'index': i, 'faces': int(len(body.mesh.faces)),
                  'watertight': bool(body.mesh.is_watertight),
                  'voids': len(body.voids),
                  'mode': None, 'metrics': None, 'error': None}
-        try:
-            shape, mode, metrics = _convert_group(
-                body, is_scan, force_prismatic, verbose, **gates)
+        tag = _shell_tag(i, len(bodies))
+        if isinstance(res, Exception):
+            # One bad body must not cost the other 26: record it, move on.
+            entry['error'] = _err(res)
+            if verbose:
+                print(f"{tag} failed ({entry['error']}); body left out")
+        else:
+            shape, mode, metrics = res
             shapes.append(shape)
             entry.update(mode=mode, metrics=metrics)
             if verbose:
                 print(f"{tag} -> {mode}")
-        except Exception as e:
-            # One bad body must not cost the other 26: record it, move on.
-            entry['error'] = f'{type(e).__name__}: {e}'
-            if verbose:
-                print(f"{tag} failed ({entry['error']}); body left out")
         per_body.append(entry)
 
     if not shapes:
@@ -202,11 +223,13 @@ def run(in_path, out_path, tol=0.08, accept_p95=0.25, accept_vol_pct=2.0,
             f"see the per-body log lines above")
     names = [_body_name(in_path, b['index'] + 1, len(bodies)) for b in per_body if b['mode']]
     write_step(shapes, out_path, names=names)
+    stages.mark('STEP')
     builds = []
     for b in per_body:
         if b['metrics'] is not None:
             builds.append(b['metrics'].pop('build', {'mode': b['mode']}))
-    script, bfill, check = _write_script(builds, out_path, write_script, verbose)
+    script, bfill, check = _write_script(builds, out_path, write_script, verbose, pool)
+    stages.mark('scripts and dry run')
 
     n_pr = sum(1 for b in per_body if b['mode'] == 'prismatic')
     n_fg = sum(1 for b in per_body if b['mode'] == 'facegroup')
@@ -220,10 +243,258 @@ def run(in_path, out_path, tol=0.08, accept_p95=0.25, accept_vol_pct=2.0,
               + (f", {failed} failed" if failed else "")
               + (f", {n_dropped} sliver(s) dropped" if n_dropped else "")
               + f") -> {out_path}")
+    stages.report()
     return {'mode': mode, 'metrics': _aggregate(per_body), 'bodies': per_body,
             'n_bodies': len(bodies), 'n_written': len(shapes),
             'n_dropped': n_dropped, 'is_scan': bool(is_scan), 'script': script,
             'bfill_script': bfill, 'bfill_check': check}
+
+
+def _err(e):
+    return f'{type(e).__name__}: {e}'
+
+
+class _Stages:
+    """Wall clock per stage of a run, one '[time]' line at the end: a
+    68-body file spends its time in places the per-shell log cannot show
+    (void subtraction, the STEP write, the dry run)."""
+
+    def __init__(self, verbose):
+        self.verbose = verbose
+        self.t0 = time.monotonic()
+        self.parts = []
+
+    def mark(self, name):
+        now = time.monotonic()
+        self.parts.append((name, now - self.t0))
+        self.t0 = now
+
+    def report(self):
+        if self.verbose and self.parts:
+            print('[time] ' + ', '.join(f'{n} {t:.0f} s' for n, t in self.parts)
+                  + f' (total {sum(t for _, t in self.parts):.0f} s)')
+
+
+def _shell_tag(i, n, k=None, m=0):
+    """The log tag of a shell: '[body 3/68]', '[body 3/68 void 1/2]',
+    '[void 1/2]' for the voids of a single-body file, '' for its outer."""
+    parts = []
+    if n > 1:
+        parts.append(f'body {i + 1}/{n}')
+    if k is not None:
+        parts.append(f'void {k + 1}/{m}')
+    return f"[{' '.join(parts)}]" if parts else ''
+
+
+def _pool_size(bodies, workers):
+    """The worker count a run may use: an explicit `workers` as given, the
+    default (None: STL2PRISM_WORKERS, else half the cores) only when the
+    file carries enough faces for the work to outlast the workers'
+    start-up (POOL_MIN_FACES); 0 means everything in this process."""
+    from .parallel import default_workers
+    if workers is not None:
+        return max(0, int(workers))
+    workers = WORKERS if WORKERS is not None else default_workers()
+    total = sum(len(m.faces) for b in bodies for m in [b.mesh] + b.voids)
+    return workers if total >= POOL_MIN_FACES else 0
+
+
+def _convert_all(bodies, is_scan, force_prismatic, verbose, gates, pool,
+                 shell_timeout):
+    """Every body's (shape, mode, metrics), or the Exception that stopped
+    it, in body order.
+
+    Shells go through the pool when there is one and there are at least
+    two of them. A scan stays in-process: its shells go straight to the
+    faceted route, not worth a worker's memory each. The shells in flight
+    together stay under POOL_ONE_WORKER_FACES faces. In-process, a single
+    big shell may still use the pool for its axis candidates
+    (_convert_body)."""
+    n_shells = sum(1 + len(b.voids) for b in bodies)
+    sizes = sorted((len(m.faces) for b in bodies for m in [b.mesh] + b.voids),
+                   reverse=True)
+    if shell_timeout is None:
+        shell_timeout = SHELL_TIMEOUT_S
+    if shell_timeout is not None and shell_timeout <= 0:
+        shell_timeout = None
+    if pool is not None and n_shells >= 2 and not is_scan:
+        workers = min(pool.size, n_shells)
+        while workers > 1 and sum(sizes[:workers]) > POOL_ONE_WORKER_FACES:
+            workers -= 1
+        return _convert_all_pooled(bodies, force_prismatic, verbose, gates,
+                                   pool, workers, shell_timeout)
+    out = []
+    for i, body in enumerate(bodies):
+        tag = _shell_tag(i, len(bodies))
+        if verbose and tag:
+            print(f"{tag} converting {len(body.mesh.faces)} faces"
+                  + (f" (+{len(body.voids)} void(s))" if body.voids else ""))
+        try:
+            out.append(_convert_group(body, is_scan, force_prismatic, verbose,
+                                      i, len(bodies), pool=pool, **gates))
+        except Exception as e:
+            out.append(e)
+    return out
+
+
+def _mesh_payload(mesh, td, name):
+    """A shell's arrays as a file the workers load: written once, read by
+    every task that needs the mesh (a retry, each axis candidate), and
+    never held as a pickle in a queue."""
+    path = os.path.join(td, name + '.npz')
+    np.savez(path, vertices=np.asarray(mesh.vertices, float),
+             faces=np.asarray(mesh.faces, np.int64))
+    return path
+
+
+def _payload_mesh(task):
+    import trimesh
+    with np.load(task['mesh']) as z:
+        return trimesh.Trimesh(z['vertices'], z['faces'], process=False)
+
+
+def _shell_task(task):
+    """In a worker: convert one shell and write its solid as a binary BREP
+    (OCC shapes do not pickle). Returns the path, the mode and the
+    metrics; what this prints comes back with the result. With
+    'faceted_only' the shell skips straight to the ladder's last rung: the
+    fallback for a shell whose first attempt ran out of time or died."""
+    from OCP.BinTools import BinTools
+    mesh = _payload_mesh(task)
+    if task.get('faceted_only'):
+        shape, mode, metrics = _faceted_body(mesh, task['verbose'],
+                                             reduce_tol=task['gates']['reduce_tol'])
+    else:
+        shape, mode, metrics = _convert_body(mesh, False, task['force_prismatic'],
+                                             task['verbose'], **task['gates'])
+    path = os.path.join(task['dir'], task['name'] + '.brep')
+    if not BinTools.Write_s(shape, path):
+        raise RuntimeError(f'could not write {path} (disk full?)')
+    return {'brep': path, 'mode': mode, 'metrics': metrics}
+
+
+def _read_brep(path):
+    from OCP.TopoDS import TopoDS_Shape
+    from OCP.BinTools import BinTools
+    shape = TopoDS_Shape()
+    if not BinTools.Read_s(shape, path) or shape.IsNull():
+        raise RuntimeError(f'could not read {path}')
+    return shape
+
+
+# s: the faceted fallback of a shell that ran out of time or died gets its
+# own, shorter clock in the pool; it is the last rung, one sewing pass
+FALLBACK_TIMEOUT_S = 300.0
+
+
+def _convert_all_pooled(bodies, force_prismatic, verbose, gates, pool, workers,
+                        shell_timeout):
+    """The pool route of _convert_all: one task per shell, largest first;
+    each body is then reassembled here (voids subtracted) exactly as the
+    in-process route does.
+
+    A shell whose worker timed out, died or hit SystemExit never finished
+    its ladder: it goes back to the pool for the faceted rung alone, on a
+    shorter clock, and carries 'shell_error' / 'timed_out' in its metrics
+    (a void's, on its body as 'void_shell_errors'). A shell that raised did
+    finish the ladder (only the faceted rung's own refusal escapes
+    _convert_body), so its error stands."""
+    import tempfile
+    n = len(bodies)
+    by_body = []                       # per body: [outer shell, void shells...]
+    for i, body in enumerate(bodies):
+        mine = []
+        for k, mesh in [(None, body.mesh)] + list(enumerate(body.voids)):
+            mine.append({'mesh': mesh, 'tag': _shell_tag(i, n, k, len(body.voids)),
+                         'name': f'b{i + 1}' + ('' if k is None else f'v{k + 1}')})
+        by_body.append(mine)
+    shells = sorted((sh for mine in by_body for sh in mine),
+                    key=lambda sh: -len(sh['mesh'].faces))    # long jobs first pack better
+    if verbose:
+        print(f"[pool] {len(shells)} shells on {workers} worker(s), "
+              + (f"{shell_timeout:.0f} s each" if shell_timeout else "no time limit"))
+        for i, body in enumerate(bodies):
+            print(f"{_shell_tag(i, n)} {len(body.mesh.faces)} faces"
+                  + (f" (+{len(body.voids)} void(s))" if body.voids else ""))
+
+    def task(sh, **extra):
+        return dict(mesh=sh['payload'], force_prismatic=force_prismatic,
+                    verbose=verbose, gates=gates, name=sh['name'], dir=td, **extra)
+
+    def started(batch):
+        def on_start(j):
+            if verbose:
+                sh = batch[j]
+                print(f"{sh['tag']} shell started ({len(sh['mesh'].faces)} faces)".strip(),
+                      flush=True)
+        return on_start
+
+    def reported(batch):
+        def on_done(j, entry, n_done, n_all):
+            if not verbose:
+                return
+            sh = batch[j]
+            for line in entry['log'].splitlines():
+                print(f"{sh['tag']} {line}".strip())
+            if entry['ok']:
+                print(f"{sh['tag']} shell -> {entry['result']['mode']}".strip())
+            else:
+                print(f"{sh['tag']} shell failed ({entry['error']})".strip())
+            print(f"[progress] {n_done}/{n_all} shells", flush=True)
+        return on_done
+
+    with tempfile.TemporaryDirectory(prefix='stl2prism-shells-') as td:
+        for sh in shells:
+            sh['payload'] = _mesh_payload(sh['mesh'], td, sh['name'])
+        got = pool.run(_shell_task, [task(sh) for sh in shells], timeout=shell_timeout,
+                       on_done=reported(shells), on_start=started(shells), workers=workers)
+        retry = []
+        for sh, entry in zip(shells, got):
+            sh['result'], again = _shell_result(entry)
+            if again:
+                sh['first'] = entry
+                retry.append(sh)
+        if retry:
+            budget = (min(shell_timeout, FALLBACK_TIMEOUT_S) if shell_timeout
+                      else None)
+            if verbose:
+                print(f"[pool] {len(retry)} shell(s) did not finish; building them faceted"
+                      + (f" ({budget:.0f} s each)" if budget else ""))
+            got = pool.run(_shell_task, [task(sh, faceted_only=True) for sh in retry],
+                           timeout=budget, on_done=reported(retry),
+                           on_start=started(retry), workers=workers)
+            for sh, entry in zip(retry, got):
+                res, _ = _shell_result(entry)
+                if not isinstance(res, Exception):
+                    res[2]['shell_error'] = sh['first']['error']
+                    res[2]['timed_out'] = sh['first']['kind'] == 'timeout'
+                sh['result'] = res
+    out = []
+    for body, mine in zip(bodies, by_body):
+        outer, *voids = [sh['result'] for sh in mine]
+        failed = next((r for r in [outer] + voids if isinstance(r, Exception)), None)
+        if failed is not None:
+            out.append(failed)
+            continue
+        try:
+            out.append(_assemble_group(body, outer, voids, verbose))
+        except Exception as e:
+            out.append(e)
+    return out
+
+
+def _shell_result(entry):
+    """(result, retry) for one pooled shell: the result is (shape, mode,
+    metrics) from the worker's answer or the Exception that stopped it;
+    `retry` says the shell deserves the faceted fallback (it never
+    finished its ladder: timed out, died, or SystemExit)."""
+    if entry['ok']:
+        r = entry['result']
+        try:
+            return (_read_brep(r['brep']), r['mode'], r['metrics']), False
+        except Exception as e:
+            return e, False
+    return RuntimeError(entry['error']), entry['kind'] in ('timeout', 'died', 'exited')
 
 
 def _body_name(in_path, i, n):
@@ -232,7 +503,7 @@ def _body_name(in_path, i, n):
     return stem if n == 1 else f'{stem}_body{i}'
 
 
-def _write_script(builds, out_path, write_script, verbose):
+def _write_script(builds, out_path, write_script, verbose, pool=None):
     """Write the CadQuery script next to the STEP (same stem, .py), the
     Fusion script for prismatic bodies (<stem>_fusion.py) and the Fusion
     Boundary Fill script for face-group bodies (<stem>_fusion_bfill.py).
@@ -241,7 +512,7 @@ def _write_script(builds, out_path, write_script, verbose):
     script."""
     if not write_script:
         return None, None, None
-    bfill, check = _write_bfill_script(builds, out_path, verbose)
+    bfill, check = _write_bfill_script(builds, out_path, verbose, pool)
     if not any(b.get('mode') == 'prismatic' and 'slabs' in b for b in builds):
         # A script with no recognised bodies would be an empty program that
         # crashes on its first line; better no file than a broken one.
@@ -275,8 +546,9 @@ def _write_script(builds, out_path, write_script, verbose):
 
 
 BFILL_CHECK_BUDGET_S = 120   # s: bodies past this are not dry-run (outlook 'not checked')
+BFILL_CHECK_WORKERS = 2      # bodies dry-run at once; MakerVolume is threaded inside already
 
-def _env_float(name, default):
+def _env_num(name, default, parse, what):
     """A numeric knob from the environment; an unparsable value is reported
     once and the default used, so a typo in docker-compose.yml costs a log
     line, not every job."""
@@ -284,11 +556,15 @@ def _env_float(name, default):
     if raw is None or raw.strip() == '':
         return default
     try:
-        return float(raw)
+        return parse(raw)
     except ValueError:
-        print(f"[warn] {name}={raw!r} is not a number; using {default}",
+        print(f"[warn] {name}={raw!r} is not {what}; using {default}",
               file=sys.stderr)
         return default
+
+
+def _env_float(name, default):
+    return _env_num(name, default, float, 'a number')
 
 
 # s: the whole axis search of one shell (every candidate, sectioning and
@@ -299,8 +575,24 @@ def _env_float(name, default):
 # predicted, not the normal path.
 AXIS_SEARCH_BUDGET_S = _env_float('STL2PRISM_AXIS_BUDGET', 120.0)
 
+def _env_int(name, default):
+    return _env_num(name, default, int, 'a whole number')
 
-def _write_bfill_script(builds, out_path, verbose):
+
+# Shells converted at once (STL2PRISM_WORKERS; None: half the cores) and
+# the wall clock per shell (STL2PRISM_SHELL_TIMEOUT; 0: none) before it is
+# built faceted instead. Without an explicit count a file under
+# POOL_MIN_FACES faces stays in-process: a worker's start-up (interpreter
+# plus OCP, a few seconds) would outlast its conversion. The shells in
+# flight together stay under POOL_ONE_WORKER_FACES faces: a CAD shell in a
+# worker is a few hundred megabytes and the NAS has 12 GB for everything.
+WORKERS = _env_int('STL2PRISM_WORKERS', None)
+SHELL_TIMEOUT_S = _env_float('STL2PRISM_SHELL_TIMEOUT', 900.0)
+POOL_MIN_FACES = 20_000          # also: a shell's axis candidates go to the pool from here
+POOL_ONE_WORKER_FACES = 1_000_000
+
+
+def _write_bfill_script(builds, out_path, verbose, pool=None):
     """Fusion 360 Boundary Fill script for face-group bodies. Returns
     (path, outlook): the path None (and the outlook None) without a
     face-group body or when none is small enough for the script; the
@@ -324,7 +616,10 @@ def _write_bfill_script(builds, out_path, verbose):
             # list predicts kernel behaviour (a chain of blend bands can cut
             # fine while gently curved plates never close)
             from .bfill_check import check_script, outlook
-            check = outlook(check_script(text, budget_s=BFILL_CHECK_BUDGET_S),
+            progress = ((lambda k, n: print(f"[progress] {k}/{n} dry runs", flush=True))
+                        if verbose else None)
+            check = outlook(check_script(text, budget_s=BFILL_CHECK_BUDGET_S, pool=pool,
+                                         workers=BFILL_CHECK_WORKERS, progress=progress),
                             skipped_bodies(builds))
         except Exception as e:
             heur = [assess(b) for b in fg]
@@ -374,31 +669,52 @@ def _aggregate(per_body):
     }
 
 
-def _convert_group(body, is_scan, force_prismatic, verbose, **gates):
+def _convert_group(body, is_scan, force_prismatic, verbose, i=0, n=1, pool=None,
+                   **gates):
     """Convert a Body (outer shell + voids) into one TopoDS_Shape.
 
     The outer shell and each void are converted independently (each with its
     own gate and fallback); void solids are then subtracted. Metrics are the
     outer shell's, with the volume error recomputed for the hollow result.
+    `i` of `n` bodies names the log lines.
     """
-    shape, mode, metrics = _convert_body(
-        body.mesh, is_scan, force_prismatic, verbose, **gates)
-    if not body.voids:
+    outer = _convert_body(body.mesh, is_scan, force_prismatic, verbose,
+                          pool=pool, **gates)
+    voids = []
+    for k, v in enumerate(body.voids):
+        if verbose:
+            print(f"{_shell_tag(i, n, k, len(body.voids))} converting {len(v.faces)} faces")
+        voids.append(_convert_body(v, is_scan, force_prismatic, verbose,
+                                   pool=pool, **gates))
+    return _assemble_group(body, outer, voids, verbose)
+
+
+def _assemble_group(body, outer, voids, verbose):
+    """One (shape, mode, metrics) for a body from its converted outer shell
+    and converted voids (each a (shape, mode, metrics)): the voids are
+    subtracted and the volume error recomputed for the hollow result."""
+    shape, mode, metrics = outer
+    if not voids:
         return shape, mode, metrics
     import cadquery as cq
     outer = cq.Shape.cast(shape)
     void_modes = []
     void_builds = []
-    for k, v in enumerate(body.voids):
-        if verbose:
-            print(f"[void {k + 1}/{len(body.voids)}] converting {len(v.faces)} faces")
-        vshape, vmode, vmet = _convert_body(v, is_scan, force_prismatic, verbose, **gates)
+    void_errors = []
+    for vshape, vmode, vmet in voids:
         void_modes.append(vmode)
         void_builds.append(vmet.get('build', {'mode': vmode}))
+        void_errors.append(vmet.get('shell_error'))
         outer = outer.cut(cq.Shape.cast(vshape), tol=1e-4)
     metrics = dict(metrics)
     metrics['voids'] = len(body.voids)
     metrics['void_modes'] = void_modes
+    if any(void_errors):
+        # a cavity given up on (timed out, worker died) is not one that
+        # merely fitted no surface; the report must be able to tell
+        metrics['void_shell_errors'] = void_errors
+        metrics['timed_out'] = bool(metrics.get('timed_out')) or any(
+            vmet.get('timed_out') for _, _, vmet in voids)
     if 'build' in metrics:
         metrics['build'] = dict(metrics['build'], voids=void_builds)
     vol_mesh = body.volume()
@@ -453,7 +769,7 @@ def _log_check(metrics, verbose, tag='[check]'):
 
 def _convert_body(mesh, is_scan, force_prismatic, verbose, tol, accept_p95,
                   accept_max, accept_hole_max, accept_vol_pct, reduce_tol=0.05,
-                  face_groups=True):
+                  face_groups=True, pool=None):
     """Convert one closed body. Returns (TopoDS_Shape, mode, metrics).
 
     Route ladder, every rung held to the same gate:
@@ -466,8 +782,7 @@ def _convert_body(mesh, is_scan, force_prismatic, verbose, tol, accept_p95,
          gate; raises if even that cannot represent the body).
     Any exception on a rung falls through to the next.
     """
-    from .extrusion import (dominant_axis, score_axis, _axis_basis,
-                            AxisSearchTimeout, MAX_LEVELS)
+    from .extrusion import dominant_axis, _axis_basis, MAX_LEVELS
     from .rebuild import build_solid
     gates = dict(accept_p95=accept_p95, accept_max=accept_max,
                  accept_hole_max=accept_hole_max, accept_vol_pct=accept_vol_pct)
@@ -485,30 +800,24 @@ def _convert_body(mesh, is_scan, force_prismatic, verbose, tol, accept_p95,
     try:
         cands = dominant_axis(mesh)
         best = None
-        budget = AXIS_SEARCH_BUDGET_S
-        deadline = time.monotonic() + budget if budget and budget > 0 else None
-        for frac, ax in cands:
+        budget = AXIS_SEARCH_BUDGET_S if AXIS_SEARCH_BUDGET_S > 0 else None
+        for frac, ax, res in _scored_candidates(mesh, cands, budget, verbose, pool):
             # candidates come largest area fraction first and a score is at
             # most 1, so once the best rank is beyond what the next
             # candidate could reach the rest cannot win
             if best is not None and best[0] >= 1.0 + 0.5 * frac + 1e-9:
                 break
-            if best is not None and deadline is not None and time.monotonic() > deadline:
-                if verbose:
-                    print(f"[axis] search budget ({budget:.0f} s) spent; "
-                          f"keeping the best candidate so far")
-                break
-            try:
-                sc, levels, slabs = score_axis(mesh, ax, deadline=deadline)
-            except AxisSearchTimeout:
+            if isinstance(res, AxisSearchTimeout):
+                spent = f"search budget ({budget:.0f} s) spent" if budget else str(res)
                 if best is None:
-                    raise AxisSearchTimeout(
-                        f"axis search budget ({budget:.0f} s) spent before any "
-                        f"candidate was scored")
+                    raise AxisSearchTimeout(f"axis {spent} before any candidate was scored")
                 if verbose:
-                    print(f"[axis] candidate {np.round(ax,3)} abandoned: search "
-                          f"budget ({budget:.0f} s) spent; keeping the best so far")
+                    print(f"[axis] {spent}; keeping the best candidate so far"
+                          if isinstance(res, _NotStarted) else
+                          f"[axis] candidate {np.round(ax,3)} abandoned: {spent}; "
+                          f"keeping the best so far")
                 break
+            sc, levels, slabs = res
             # perpendicular-face area is a strong prior for the extrusion
             # direction (the 'base faces'); use it to break near-ties
             rank = sc * (1.0 + 0.5 * frac)
@@ -616,6 +925,63 @@ def _convert_body(mesh, is_scan, force_prismatic, verbose, tol, accept_p95,
 
     # --- 4. faceted -----------------------------------------------------------
     return _faceted_body(mesh, verbose, reduce_tol=reduce_tol)
+
+
+class _NotStarted(AxisSearchTimeout):
+    """A candidate the budget ran out before it was started."""
+
+
+def _scored_candidates(mesh, cands, budget, verbose, pool):
+    """(frac, axis, result) per candidate, in rank order; the result is
+    (score, levels, slabs) or the AxisSearchTimeout that stopped it.
+
+    One after another by default, lazily, so the caller can stop once a
+    candidate cannot be beaten, under one budget for the whole search. A
+    big shell (POOL_MIN_FACES) with a pool scores its candidates at once,
+    under the same one budget (the clock is shared across processes):
+    the candidates are independent, and on such a shell each takes
+    seconds, well past a worker's start-up. Workers hold a copy of the
+    mesh each, so they are held to POOL_ONE_WORKER_FACES together."""
+    from .extrusion import score_axis, AxisSearchTimeout
+    deadline = time.monotonic() + budget if budget else None
+    n_workers = 0
+    if pool is not None and len(cands) > 1 and len(mesh.faces) >= POOL_MIN_FACES:
+        n_workers = min(pool.size, len(cands),
+                        max(1, POOL_ONE_WORKER_FACES // len(mesh.faces)))
+    if n_workers > 1:
+        import tempfile
+        if verbose:
+            print(f"[axis] {len(cands)} candidates scored on {n_workers} worker(s)")
+        with tempfile.TemporaryDirectory(prefix='stl2prism-axis-') as td:
+            payload = _mesh_payload(mesh, td, 'shell')
+            got = pool.run(_score_axis_task,
+                           [{'mesh': payload, 'axis': np.asarray(ax, float),
+                             'deadline': deadline} for _, ax in cands],
+                           timeout=budget * 1.5 + 60 if budget else None,
+                           deadline=deadline, workers=n_workers)
+        for (frac, ax), entry in zip(cands, got):
+            if entry['ok']:
+                yield frac, ax, entry['result']
+            elif entry['kind'] == 'timeout' or entry['exc_type'] == 'AxisSearchTimeout':
+                yield frac, ax, AxisSearchTimeout(entry['error'])
+            else:
+                raise RuntimeError(f"scoring axis {np.round(ax, 3)} failed: {entry['error']}")
+        return
+    for frac, ax in cands:
+        if deadline is not None and time.monotonic() > deadline:
+            yield frac, ax, _NotStarted('axis search budget spent')
+            return
+        try:
+            yield frac, ax, score_axis(mesh, ax, deadline=deadline)
+        except AxisSearchTimeout as e:
+            yield frac, ax, e
+            return
+
+
+def _score_axis_task(task):
+    """In a worker: score one axis candidate of one shell."""
+    from .extrusion import score_axis
+    return score_axis(_payload_mesh(task), task['axis'], deadline=task['deadline'])
 
 
 def _facegroup_body(mesh, verbose, tol, gates):
@@ -726,6 +1092,15 @@ def main():
     ap.add_argument('--units', choices=sorted(UNIT_SCALE), default='mm',
                     help='unit the input file is in; STL/OBJ carry none, '
                          'and the tool works in mm (default mm)')
+    ap.add_argument('--workers', type=int, default=None,
+                    help='shells (bodies and cavities) converted at once in '
+                         'worker processes; 0 converts in this process '
+                         '(default: STL2PRISM_WORKERS, else half the cores, '
+                         'and in-process for files under 20k faces)')
+    ap.add_argument('--shell-timeout', type=float, default=None,
+                    help='seconds a shell may run in a worker before it is '
+                         'built faceted instead; 0 for no limit '
+                         '(default: STL2PRISM_SHELL_TIMEOUT, else 900)')
     ap.add_argument('--quiet', action='store_true')
     args = ap.parse_args()
     out = args.output or args.input.rsplit('.', 1)[0] + '.step'
@@ -736,7 +1111,8 @@ def main():
                 accept_vol_pct=args.accept_vol_pct,
                 force_prismatic=args.force_prismatic, verbose=not args.quiet,
                 units=args.units, reduce_tol=args.reduce_tol,
-                face_groups=not args.no_face_groups)
+                face_groups=not args.no_face_groups,
+                workers=args.workers, shell_timeout=args.shell_timeout)
     except Exception as e:
         # A crash must not look like a success to a calling script.
         print(f"[error] {type(e).__name__}: {e}", file=sys.stderr)

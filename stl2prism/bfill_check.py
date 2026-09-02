@@ -17,6 +17,7 @@ itself tells the two apart. Fusion's kernel is still the final judge (it has
 its own quirks the emulation cannot see), but a closure failure here is a
 reliable FAIL. `tools/emulate_bfill.py` is the CLI over the same code."""
 import math
+import os
 import time
 import numpy as np
 from OCP.gp import gp_Pnt, gp_Dir, gp_Ax2, gp_Pnt2d
@@ -195,6 +196,20 @@ def _cell_is_material(cell, gprops, pts, pt_hit, mesh, sliver_cm):
     return False, None
 
 
+def _empty_result(bd, error=None):
+    """The result of a body before (or without) its cells: every probe
+    unenclosed, nothing kept, `error` when it was not checked."""
+    from collections import Counter
+    mesh_vol = float(bd.get('volume', 0.0)) or 1e-12
+    labels = [p[3] if len(p) > 3 else '?' for p in bd['inside']]
+    return {'name': bd.get('name', '?'), 'tool_faces': 0, 'tools_failed': 0,
+            'tools_skipped': 0, 'cells': 0, 'kept_cells': 0, 'by_centre': 0,
+            'by_face': 0, 'fallback': False, 'kept_volume': 0.0,
+            'mesh_volume': mesh_vol, 'enclosed_pct': 0.0, 'unenclosed': list(labels),
+            'n_probes': len(labels), 'probes_by_region': dict(Counter(labels)),
+            'kept': [], 'cell_volumes': [], 'error': error}
+
+
 def check_body(bd, ns):
     """Cells + classification for one BODIES entry, the way the Fusion
     runtime does it: tools that cannot be built are skipped and counted,
@@ -204,15 +219,9 @@ def check_body(bd, ns):
     a dict with the counts and the enclosed volume fraction — the outlook
     signal — or with 'error' set when the kernel could not compute the
     cells."""
-    from collections import Counter
-    mesh_vol = float(bd.get('volume', 0.0)) or 1e-12
-    labels = [p[3] if len(p) > 3 else '?' for p in bd['inside']]
-    res = {'name': bd.get('name', '?'), 'tool_faces': 0, 'tools_failed': 0,
-           'tools_skipped': 0, 'cells': 0, 'kept_cells': 0, 'by_centre': 0,
-           'by_face': 0, 'fallback': False, 'kept_volume': 0.0,
-           'mesh_volume': mesh_vol, 'enclosed_pct': 0.0, 'unenclosed': list(labels),
-           'n_probes': len(labels), 'probes_by_region': dict(Counter(labels)),
-           'kept': [], 'cell_volumes': [], 'error': None}
+    res = _empty_result(bd)
+    mesh_vol = res['mesh_volume']
+    labels = list(res['unenclosed'])
     skip = {int(i) for i in (ns.get('SKIP') or [])}
     args = TopTools_ListOfShape()
     built = 0
@@ -277,21 +286,63 @@ def check_body(bd, ns):
     return res
 
 
-def check_script(text, budget_s=None):
+def check_script(text, budget_s=None, pool=None, workers=2, progress=None):
     """check_body over every body of an emitted script's text. With a time
     budget (seconds) the bodies past it are not checked (the first always
-    is): their result has 'error' set and no cells."""
+    is): their result has 'error' set and no cells.
+
+    With a `pool` (parallel.Pool) and several bodies, up to `workers`
+    bodies are checked at once (MakerVolume is threaded inside already,
+    so few); the budget then bounds the whole check and each body in it,
+    the first included: a body killed at the budget, or not started by
+    it, or whose worker died, is 'not checked' with the reason. The 'kept'
+    cells, OCC shapes, are not brought back. `progress(k, n)` is called
+    as bodies finish."""
     ns = parse_script(text)
+    bodies = ns['BODIES']
+    if pool is not None and len(bodies) > 1:
+        import tempfile
+        with tempfile.TemporaryDirectory(prefix='stl2prism-bfill-') as td:
+            path = os.path.join(td, 'script.py')
+            with open(path, 'w') as f:
+                f.write(text)
+            deadline = time.monotonic() + budget_s if budget_s else None
+            got = pool.run(_check_body_task,
+                           [{'script': path, 'index': i} for i in range(len(bodies))],
+                           timeout=budget_s, deadline=deadline, workers=workers,
+                           on_done=(lambda j, e, k, n: progress(k, n)) if progress else None)
+        out = []
+        for bd, entry in zip(bodies, got):
+            if entry['ok']:
+                out.append(entry['result'])
+            else:
+                why = (f'not checked: past the {budget_s:.0f} s budget'
+                       if entry['kind'] == 'timeout' else f"not checked: {entry['error']}")
+                out.append(_empty_result(bd, why))
+        return out
     t0 = time.time()
     out = []
-    for bd in ns['BODIES']:
+    for bd in bodies:
         if budget_s is not None and out and time.time() - t0 > budget_s:
-            out.append({'name': bd.get('name', '?'), 'cells': 0, 'kept_cells': 0,
-                        'enclosed_pct': 0.0, 'unenclosed': [], 'n_probes': len(bd['inside']),
-                        'error': f'not checked: past the {budget_s:.0f} s budget'})
+            out.append(_empty_result(bd, f'not checked: past the {budget_s:.0f} s budget'))
             continue
         out.append(check_body(bd, ns))
     return out
+
+
+_NS_CACHE = {}       # a worker parses a script once, however many of its bodies it checks
+
+
+def _check_body_task(task):
+    """In a worker: the dry run of one body of a script."""
+    path = task['script']
+    if _NS_CACHE.get('path') != path:
+        with open(path) as f:
+            _NS_CACHE.update(path=path, ns=parse_script(f.read()))
+    ns = _NS_CACHE['ns']
+    res = check_body(ns['BODIES'][task['index']], ns)
+    res['kept'] = []            # OCC solids: not for the pipe
+    return res
 
 
 def outlook(results, dropped=()):

@@ -33,6 +33,8 @@ ENV STL2PRISM_BUILD_SHA=$GIT_SHA
 ENV STL2PRISM_BUILD_TIME=$BUILD_TIME
 
 ENV STL2PRISM_DATA=/data
+# shells converted at once inside a job; docker-compose.yml overrides
+ENV STL2PRISM_WORKERS=2
 VOLUME /data
 EXPOSE 8000
 CMD ["uvicorn", "backend.main:app", "--host", "0.0.0.0", "--port", "8000"]

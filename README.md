@@ -141,10 +141,19 @@ QNAP; clone on the NAS, build natively, optional Tailscale HTTPS front), follow
 Environment knobs: `STL2PRISM_DATA` (job storage dir, default `/data` in
 the container), `STL2PRISM_JOB_TTL` (seconds before old jobs are purged,
 default 86400), `STL2PRISM_MAX_UPLOAD` (bytes, default 200 MB),
-`STL2PRISM_AXIS_BUDGET` (seconds one shell's extrusion-axis search may take
-before the best candidate so far is used, default 120; 0 means no limit).
-The budget is a backstop: a shell that reaches it is scored on what was
-done by then, so its result can depend on machine load.
+`STL2PRISM_WORKERS` (shells converted at once in worker processes, default
+half the cores; 0 converts in-process, as does any file under 20k faces
+when the count is not set explicitly), `STL2PRISM_SHELL_TIMEOUT` (seconds
+a shell may run in a worker before it is built faceted instead, default
+900; 0 means no limit), `STL2PRISM_AXIS_BUDGET` (seconds one shell's extrusion-axis search may
+take before the best candidate so far is used, default 120; 0 means no
+limit). The budgets are backstops: a shell that reaches one is scored on
+what was done by then, so its result can depend on machine load. The CLI
+takes the first two as `--workers` and `--shell-timeout`. The same workers
+score a big single shell's axis candidates side by side and run the
+Boundary Fill dry run two bodies at a time; the log ends with a `[time]`
+line giving the wall clock per stage (conversion, STEP write, scripts and
+dry run).
 
 ## How it works
 
@@ -263,6 +272,25 @@ volume ≤ 2 %). "faces" = ADVANCED_FACE count in the STEP.
 
 The remaining planar faces on the face-group parts are blends (tapered
 corner fillets, free-form) that v1 keeps as exact facets.
+
+v0.3.7 (shells in parallel): a file's shells (each body's outer surface
+and each cavity) are converted side by side in spawned worker processes,
+largest first, and each body reassembled afterwards exactly as before: the
+same STEP, per-solid faces and volumes, with one worker or four. A shell
+past its wall clock (`STL2PRISM_SHELL_TIMEOUT`, 900 s) or whose worker
+died under it (an OCC crash costs that shell, not the job) is built
+faceted in the pool on a shorter clock and says so in its metrics
+(`timed_out`, `shell_error`). The pool is one per run: its workers start
+on first use and serve the shells, a big single shell's axis candidates
+(scored side by side from 20k faces) and the Boundary Fill dry run (two
+bodies at a time, each and all under the 120 s budget). Small files stay
+in-process, where a worker's start-up would outlast the conversion. The
+log carries one block per shell as it finishes, `[progress] k/n shells`,
+and a closing `[time]` line per stage. On the 68-body controller (72
+shells) four workers convert every shell in about 18 minutes; the file
+previously never finished. Knobs: `STL2PRISM_WORKERS`,
+`STL2PRISM_SHELL_TIMEOUT`, `--workers`, `--shell-timeout`; the NAS runs
+two workers.
 
 v0.3.6 (the extrusion search made finite): a 12k-face textured cavity in
 a 68-body controller offered 772 perpendicular levels on one axis and kept

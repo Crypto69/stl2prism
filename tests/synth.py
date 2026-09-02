@@ -259,45 +259,92 @@ def step_faces(path):
     return faces, kinds
 
 
-def reimport(path):
-    """Round-trip through OCC: solids, faces, naked edges, validity, volume."""
+def read_step(path):
+    """The one shape a STEP file holds, read back through OCC."""
     from OCP.STEPControl import STEPControl_Reader
-    from OCP.TopExp import TopExp_Explorer
-    from OCP.TopAbs import TopAbs_SOLID, TopAbs_FACE
-    from OCP.BRepCheck import BRepCheck_Analyzer
-    from OCP.GProp import GProp_GProps
-    from OCP.BRepGProp import BRepGProp
-    from stl2prism.rebuild import _naked_edges
     r = STEPControl_Reader()
     r.ReadFile(str(path))
     r.TransferRoots()
-    s = r.OneShape()
+    return r.OneShape()
 
-    def n(kind):
-        e = TopExp_Explorer(s, kind)
-        c = 0
-        while e.More():
-            c += 1
-            e.Next()
-        return c
+
+def _count(shape, kind):
+    from OCP.TopExp import TopExp_Explorer
+    e = TopExp_Explorer(shape, kind)
+    c = 0
+    while e.More():
+        c += 1
+        e.Next()
+    return c
+
+
+def _volume(shape):
+    from OCP.GProp import GProp_GProps
+    from OCP.BRepGProp import BRepGProp
     g = GProp_GProps()
-    BRepGProp.VolumeProperties_s(s, g)
-    return {'solids': n(TopAbs_SOLID), 'faces': n(TopAbs_FACE),
+    BRepGProp.VolumeProperties_s(shape, g)
+    return abs(g.Mass())
+
+
+def reimport(path):
+    """Round-trip through OCC: solids, faces, naked edges, validity, volume."""
+    from OCP.TopAbs import TopAbs_SOLID, TopAbs_FACE
+    from OCP.BRepCheck import BRepCheck_Analyzer
+    from stl2prism.rebuild import _naked_edges
+    s = read_step(path)
+    return {'solids': _count(s, TopAbs_SOLID), 'faces': _count(s, TopAbs_FACE),
             'naked_edges': _naked_edges(s), 'valid': BRepCheck_Analyzer(s).IsValid(),
-            'volume': abs(g.Mass())}
+            'volume': _volume(s)}
+
+
+def solid_stats(path):
+    """(faces, volume) of every solid in the STEP, sorted, so two files can
+    be compared body by body whatever their write order."""
+    from OCP.TopExp import TopExp_Explorer
+    from OCP.TopAbs import TopAbs_SOLID, TopAbs_FACE
+    out = []
+    e = TopExp_Explorer(read_step(path), TopAbs_SOLID)
+    while e.More():
+        out.append((_count(e.Current(), TopAbs_FACE), round(_volume(e.Current()), 6)))
+        e.Next()
+    return sorted(out)
+
+
+def assembly(path, sphere=True, hollow=False, sliver=False):
+    """Several bodies in one STL: a 20x10x5 plate and an 8 mm cube, plus a
+    5 mm sphere (not prismatic), a 30 mm box with a 10 mm cavity (two
+    shells) and the kind of 2-triangle fragment exporters leave behind."""
+    import trimesh
+    parts = [trimesh.creation.box((20, 10, 5))]
+    b = trimesh.creation.box((8, 8, 8))
+    b.apply_translation((40, 0, 0))
+    parts.append(b)
+    if sphere:
+        c = trimesh.creation.icosphere(subdivisions=3, radius=5)
+        c.apply_translation((0, 40, 0))
+        parts.append(c)
+    if hollow:
+        h = trimesh.creation.box((30, 30, 30))
+        h.apply_translation((0, -60, 0))
+        v = trimesh.creation.box((10, 10, 10))
+        v.apply_translation((0, -60, 0))
+        v.invert()
+        parts += [h, v]
+    if sliver:
+        parts.append(trimesh.Trimesh(
+            vertices=[[80, 0, 0], [81, 0, 0], [80, 1, 0], [80, 0, 1]],
+            faces=[[0, 1, 2], [0, 2, 3]], process=False))
+    trimesh.util.concatenate(parts).export(str(path))
+    return str(path)
 
 
 def face_areas(path):
     """Areas of every face in the STEP (for sliver checks)."""
-    from OCP.STEPControl import STEPControl_Reader
     from OCP.TopExp import TopExp_Explorer
     from OCP.TopAbs import TopAbs_FACE
     from OCP.GProp import GProp_GProps
     from OCP.BRepGProp import BRepGProp
-    r = STEPControl_Reader()
-    r.ReadFile(str(path))
-    r.TransferRoots()
-    s = r.OneShape()
+    s = read_step(path)
     out = []
     e = TopExp_Explorer(s, TopAbs_FACE)
     while e.More():
