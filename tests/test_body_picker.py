@@ -238,3 +238,64 @@ def test_scale_is_refused_before_any_conversion(tmp_path):
     _box(40).export(stl)
     with pytest.raises(PrepError):
         pipeline.run(stl, str(tmp_path / 'x.step'), verbose=False, scale=0)
+
+
+# --- a worker the kernel kills ---------------------------------------------
+
+def test_killed_by_is_quiet_for_a_normal_exit():
+    from backend.jobs import _killed_by
+    assert _killed_by(0) is None
+    assert _killed_by(1) is None          # the worker failed and reported
+
+
+def test_killed_by_names_the_out_of_memory_case():
+    """SIGKILL is what Docker's memory limit and the OOM killer send. The
+    worker never writes a result or a traceback, so this is the only thing
+    that can explain the empty log."""
+    from backend.jobs import _killed_by
+    k = _killed_by(-9)
+    assert k['kind'] == 'oom' and k['signal'] == 9
+    assert 'ran out of memory' in k['message']
+    assert 'fewer bodies' in k['message']
+
+
+def test_killed_by_reports_other_signals_without_guessing():
+    from backend.jobs import _killed_by
+    k = _killed_by(-15)
+    assert k['kind'] == 'stopped' and 'signal 15' in k['message']
+
+
+def test_public_state_explains_a_killed_worker(tmp_path, monkeypatch):
+    """The bug this fixes: a killed worker left the UI saying 'see log',
+    and the log stops mid-sentence."""
+    from backend import jobs
+    monkeypatch.setattr(jobs, 'DATA_DIR', str(tmp_path))
+    jid = 'deadbeef'
+    d = tmp_path / jid
+    d.mkdir()
+    (d / 'log.txt').write_text('[prep] 158342 faces\n')
+    with jobs._lock:
+        jobs._jobs[jid] = {'status': 'error', 'filename': 'x.stl',
+                           'killed': jobs._killed_by(-9)}
+    st = jobs.public_state(jid)
+    assert st['status'] == 'error'
+    assert st['result']['ok'] is False
+    assert st['result']['failure'] == 'oom'
+    assert 'ran out of memory' in st['result']['error']
+
+
+def test_public_state_keeps_a_real_error_over_the_kill_note(tmp_path, monkeypatch):
+    """A worker that reported its own failure keeps that message."""
+    import json as _json
+    from backend import jobs
+    monkeypatch.setattr(jobs, 'DATA_DIR', str(tmp_path))
+    jid = 'realfail'
+    d = tmp_path / jid
+    d.mkdir()
+    (d / 'log.txt').write_text('boom\n')
+    (d / 'result.json').write_text(_json.dumps({'ok': False, 'error': 'PrepError: bad mesh'}))
+    with jobs._lock:
+        jobs._jobs[jid] = {'status': 'error', 'filename': 'x.stl',
+                           'killed': jobs._killed_by(-9)}
+    st = jobs.public_state(jid)
+    assert st['result']['error'] == 'PrepError: bad mesh'

@@ -286,6 +286,10 @@ const reduction = computed(() => {
     <section v-if="store.error" ref="verdictEl" class="errorbox">
       <h2 class="micro">Failed</h2>
       <p>{{ store.error }}</p>
+      <p v-if="store.result?.failure === 'oom'" class="fix">
+        The most likely fix is to tick fewer bodies: each one converted at the
+        same time can hold several gigabytes.
+      </p>
     </section>
 
     <details v-if="store.log" class="logbox" :open="store.status === 'running'">
@@ -365,6 +369,7 @@ th { text-align: left; font-weight: 600; }
   padding: 10px 12px;
 }
 .errorbox p { color: var(--fail); font-size: 13px; word-break: break-word; }
+.errorbox p.fix { color: var(--muted); margin-top: 6px; }
 
 .logbox summary { cursor: pointer; }
 .logbox pre {
