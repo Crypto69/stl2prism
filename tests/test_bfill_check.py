@@ -152,6 +152,10 @@ def test_unbuildable_tools_are_skipped_not_fatal(tmp_path):
 
 def test_cli_module_has_no_import_side_effects():
     path = os.path.join(os.path.dirname(__file__), '..', 'tools', 'emulate_bfill.py')
+    if not os.path.exists(path):
+        # tools/ is not shipped in the Docker image; when the suite runs in
+        # the container (DEPLOY-NAS.md step 9) this test has nothing to check.
+        pytest.skip('tools/emulate_bfill.py not present (containerized run)')
     spec = importlib.util.spec_from_file_location('emulate_bfill', path)
     m = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(m)                  # used to run main() here and die on sys.argv
