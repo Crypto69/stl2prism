@@ -12,6 +12,9 @@ export const UNITS = [
 
 export const DEFAULT_PARAMS = {
   units: 'mm',
+  // Free multiplier on top of the unit. Units only ever enlarge, so a file
+  // written 10x too big can only be fixed here, with 0.1.
+  scale: 1,
   reduce_tol: 0.05,
   tol: 0.08,
   accept_p95: 0.25,
@@ -53,7 +56,11 @@ export const useConvertStore = defineStore('convert', {
     hasBodyPicker: (s) => s.bodies.length > 1,
     selectedCount: (s) => (s.selected.length || s.bodies.length),
     // file units -> mm, for showing input numbers the way the pipeline sees them
-    unitScale: (s) => UNITS.find((u) => u.key === s.params.units)?.scale ?? 1,
+    // file units -> mm: the unit's factor times the free scale, which is
+    // what the pipeline applies and so what the previews must use.
+    unitScale: (s) =>
+      (UNITS.find((u) => u.key === s.params.units)?.scale ?? 1)
+      * (Number(s.params.scale) > 0 ? Number(s.params.scale) : 1),
     downloadUrl: (s) =>
       s.status === 'done' && s.result?.ok
         ? `/api/jobs/${s.jobId}/download`

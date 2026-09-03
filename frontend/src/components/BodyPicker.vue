@@ -82,7 +82,11 @@ h2 { font-size: 13px; letter-spacing: 0.08em; text-transform: uppercase; margin:
 }
 .list {
   list-style: none; margin: 0; padding: 0;
-  max-height: 260px; overflow-y: auto;
+  /* A floor as well as a ceiling: without it the rail's flex layout can
+     squeeze the list to nothing, which reads as "no way to tick a body". */
+  min-height: 120px;
+  max-height: 260px;
+  overflow-y: auto;
   border: 1px solid var(--line); border-radius: 6px;
 }
 li {
@@ -98,7 +102,12 @@ li {
 li:last-child { border-bottom: none; }
 li:hover, li.hot { background: rgba(90, 210, 234, 0.08); }
 li.on { background: rgba(90, 210, 234, 0.05); }
-input { grid-area: check; }
+input {
+  grid-area: check;
+  width: 15px; height: 15px;
+  accent-color: var(--edge);
+  cursor: pointer;
+}
 .swatch {
   grid-area: swatch; width: 10px; height: 10px; border-radius: 2px;
   opacity: 0.35;

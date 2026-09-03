@@ -185,3 +185,56 @@ def test_upload_stats_carry_the_warning(tmp_path):
     p = str(tmp_path / 'big.stl')
     _box(1500).export(p)
     assert mesh_stats(p)['unit_warning']['too'] == 'big'
+
+
+# --- rescaling --------------------------------------------------------------
+
+def test_resolve_scale_combines_units_and_the_free_factor():
+    from stl2prism.mesh_prep import resolve_scale
+    assert resolve_scale('mm', 1.0) == 1.0
+    assert resolve_scale('mm', 0.1) == pytest.approx(0.1)     # the 10x-too-big case
+    assert resolve_scale('cm', 1.0) == 10.0
+    assert resolve_scale('cm', 0.5) == pytest.approx(5.0)
+
+
+@pytest.mark.parametrize('bad', [0, -1, 'x', float('nan'), float('inf')])
+def test_resolve_scale_refuses_nonsense(bad):
+    from stl2prism.mesh_prep import PrepError, resolve_scale
+    with pytest.raises(PrepError):
+        resolve_scale('mm', bad)
+
+
+def test_resolve_scale_refuses_an_absurd_total():
+    from stl2prism.mesh_prep import PrepError, resolve_scale
+    with pytest.raises(PrepError, match='sensible range'):
+        resolve_scale('m', 1e9)
+
+
+def test_scale_shrinks_the_converted_solid(tmp_path):
+    """The case the free factor exists for: a mesh written ten times too
+    big converts at its real size, with the shape untouched."""
+    stl = str(tmp_path / 'big.stl')
+    _box(400).export(stl)
+    out = str(tmp_path / 'small.step')
+    r = pipeline.run(stl, out, verbose=False, write_script=False, scale=0.1)
+    (faces, vol), = synth.solid_stats(out)
+    assert faces == 6
+    assert vol == pytest.approx(40 ** 3, rel=1e-6)
+    assert r['metrics']['vol_err_pct'] < 0.01
+
+
+def test_scale_one_is_unchanged(tmp_path):
+    stl = str(tmp_path / 'plain.stl')
+    _box(40).export(stl)
+    a, b = str(tmp_path / 'a.step'), str(tmp_path / 'b.step')
+    pipeline.run(stl, a, verbose=False, write_script=False)
+    pipeline.run(stl, b, verbose=False, write_script=False, scale=1.0)
+    assert synth.solid_stats(a) == synth.solid_stats(b)
+
+
+def test_scale_is_refused_before_any_conversion(tmp_path):
+    from stl2prism.mesh_prep import PrepError
+    stl = str(tmp_path / 'plain.stl')
+    _box(40).export(stl)
+    with pytest.raises(PrepError):
+        pipeline.run(stl, str(tmp_path / 'x.step'), verbose=False, scale=0)

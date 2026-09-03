@@ -232,6 +232,10 @@ const canConvert = computed(
   flex-direction: column;
   gap: 16px;
 }
+/* A flex column shrinks its children to fit by default, which squeezed the
+   body list to nothing and overlapped the panel headings. The rail scrolls
+   instead: every child keeps the height its content needs. */
+.rail > * { flex: 0 0 auto; }
 
 .convert {
   padding: 12px;

@@ -193,7 +193,7 @@ def load_and_prep(path, target_faces=40000, verbose=True,
 
 def load_and_prep_bodies(path, target_faces=40000, verbose=True,
                          scan_dihedral_deg=SCAN_DIHEDRAL_DEG,
-                         scan_min_faces=SCAN_MIN_FACES, units='mm'):
+                         scan_min_faces=SCAN_MIN_FACES, units='mm', scale=1.0):
     """Like load_and_prep, but one prepared `Body` per solid.
 
     Returns (bodies, is_scan, n_dropped). Bodies are sorted largest first.
@@ -201,7 +201,7 @@ def load_and_prep_bodies(path, target_faces=40000, verbose=True,
     scan repair fails is dropped with a log line rather than failing the
     whole file. Internal voids are repaired like their bodies.
     """
-    m = _load_scaled(path, units, verbose)
+    m = _load_scaled(path, units, verbose, scale)
     is_scan = classify(m, verbose, scan_dihedral_deg, scan_min_faces)
     groups, n_dropped = split_bodies(m, is_scan, verbose)
     if len(groups) == 1 and not groups[0].voids:
@@ -241,15 +241,47 @@ def load_and_prep_bodies(path, target_faces=40000, verbose=True,
     return bodies, is_scan, n_dropped
 
 
-def _load_scaled(path, units, verbose):
+# A scale outside this range is a typo, not a unit: refuse it rather than
+# convert a part that is microscopic or the size of a suburb.
+SCALE_LIMITS = (1e-6, 1e6)
+
+
+def resolve_scale(units, scale=1.0):
+    """The single factor that takes the file's numbers to millimetres.
+
+    `units` names what the file's numbers mean (UNIT_SCALE, all >= 1) and
+    `scale` is a free multiplier applied on top. The free factor exists
+    because units can only ever enlarge: a file authored in cm but written
+    as mm reads ten times too big, and no unit divides.
+    """
     if units not in UNIT_SCALE:
         raise PrepError(f"unknown units '{units}'; "
                         f"expected one of: {', '.join(UNIT_SCALE)}")
+    try:
+        scale = float(scale)
+    except (TypeError, ValueError):
+        raise PrepError(f"scale must be a number, got {scale!r}")
+    if not np.isfinite(scale) or scale <= 0:
+        raise PrepError(f"scale must be a positive number, got {scale:g}")
+    total = UNIT_SCALE[units] * scale
+    lo, hi = SCALE_LIMITS
+    if not lo <= total <= hi:
+        raise PrepError(
+            f"scale {total:g} (units {units} x {scale:g}) is outside the "
+            f"sensible range {lo:g} to {hi:g}")
+    return total
+
+
+def _load_scaled(path, units, verbose, scale=1.0):
+    factor = resolve_scale(units, scale)
     m = load_mesh(path)
-    if UNIT_SCALE[units] != 1.0:
-        m.apply_scale(UNIT_SCALE[units])
+    if factor != 1.0:
+        m.apply_scale(factor)
         if verbose:
-            print(f"[prep] input units {units}: scaled x{UNIT_SCALE[units]:g} to mm")
+            how = f"units {units}"
+            if float(scale) != 1.0:
+                how += f" x scale {float(scale):g}"
+            print(f"[prep] input {how}: scaled x{factor:g} to mm")
     return m
 
 

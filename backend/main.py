@@ -71,6 +71,10 @@ class ConvertParams(BaseModel):
                               description='faceted output: decimate curved regions within this deviation, mm (0 = off)')
     # STL/OBJ carry no units; this says what the file's numbers mean.
     units: Literal['mm', 'cm', 'm', 'in', 'ft'] = 'mm'
+    # Free multiplier on top of `units`, because units only ever enlarge:
+    # a cm design exported as mm reads 10x too big and needs 0.1.
+    scale: float = Field(1.0, gt=0, le=1e6,
+                         description='extra scale factor applied after units')
     # Which shells to convert, as indices into /bodies (largest first).
     # None converts every body, as before.
     bodies: list[int] | None = None

@@ -141,7 +141,7 @@ def run(in_path, out_path, tol=0.08, accept_p95=0.25, accept_vol_pct=2.0,
         accept_max=0.26, accept_hole_max=0.10,
         force_prismatic=False, verbose=True, units='mm', reduce_tol=0.05,
         write_script=True, face_groups=True, workers=None, shell_timeout=None,
-        bodies=None):
+        bodies=None, scale=1.0):
     """Convert one mesh file to one STEP file.
 
     Every connected body is converted on its own — prismatic where it passes
@@ -161,13 +161,18 @@ def run(in_path, out_path, tol=0.08, accept_p95=0.25, accept_vol_pct=2.0,
     reports). None converts all of them. Converting the two halves of a
     72-shell housing takes minutes where the whole file takes hours, so
     this is the difference between a usable answer and an unusable one.
+
+    `scale` multiplies the mesh on load, on top of `units`. Units can only
+    enlarge (mm 1, cm 10, in 25.4 ...), so a file written ten times too
+    big — a cm design exported as mm — can only be corrected here, with
+    scale=0.1.
     """
     from .mesh_prep import load_and_prep_bodies
     from .rebuild import write_step
 
     picked = bodies
     bodies, is_scan, n_dropped = load_and_prep_bodies(
-        in_path, verbose=verbose, units=units)
+        in_path, verbose=verbose, units=units, scale=scale)
     if picked is not None:
         bodies = _pick_bodies(bodies, picked, verbose)
     gates = dict(tol=tol, accept_p95=accept_p95, accept_max=accept_max,

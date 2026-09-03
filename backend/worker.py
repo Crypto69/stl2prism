@@ -37,6 +37,7 @@ def main():
                 accept_vol_pct=params['accept_vol_pct'],
                 force_prismatic=params['force_prismatic'],
                 units=params.get('units', 'mm'),
+                scale=params.get('scale', 1.0),
                 reduce_tol=params.get('reduce_tol', 0.05),
                 face_groups=params.get('face_groups', True),
                 bodies=picked or None,
