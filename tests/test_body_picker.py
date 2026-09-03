@@ -19,6 +19,16 @@ def _box(size, at=(0, 0, 0)):
 
 _tbox = _box          # the mesh-level helper, named for the geometry tests
 
+def _open_sheet(at=(0, 0, 0), w=10.0, h=5.0):
+    """A shell that stays open through trimesh's split(): a folded strip.
+    A box with one face removed does not work — split() re-processes each
+    part and closes it again."""
+    V = np.array([[0, 0, 0], [w, 0, 0], [0, w, 0], [w, w, 0],
+                  [0, 0, h], [w, 0, h]], float) + np.asarray(at, float)
+    F = np.array([[0, 1, 2], [1, 3, 2], [0, 4, 1], [1, 4, 5]], np.int64)
+    return trimesh.Trimesh(V, F, process=False)
+
+
 
 def _three_parts(path):
     """A 40 cube, a 20 cube and a 10 cube, far apart: three plain bodies."""
@@ -381,17 +391,15 @@ def test_suggested_ranks_open_shells_by_size(tmp_path):
     """An open shell has no volume. Ranking on volume alone made an OBJ
     whose two housing halves are open suggest a single tiny closed screw
     and none of the part the user wanted."""
-    from backend.analysis import body_list
-    big = trimesh.creation.box((100, 60, 20))
-    big.update_faces(np.arange(len(big.faces)) > 0)      # open: drop one face
-    small = trimesh.creation.box((4, 4, 4))
-    small.apply_translation((200, 0, 0))                 # closed, tiny
+    big = _open_sheet(w=100.0, h=60.0)                   # open, large
+    small = _box(4, (400, 0, 0))                         # closed, tiny
     stl = str(tmp_path / 'mixed.stl')
     trimesh.util.concatenate([big, small]).export(stl)
     d = body_list(stl)
-    by_faces = {b['triangles']: b for b in d['bodies']}
-    assert by_faces[11]['suggested'] is True             # the big open shell
-    assert by_faces[12]['suggested'] is False            # the tiny closed one
+    by = {b['triangles']: b for b in d['bodies']}
+    assert by[4]['watertight'] is False and by[4]['volume'] is None
+    assert by[4]['suggested'] is True                    # ranked by size
+    assert by[12]['suggested'] is False                  # the tiny closed one
 
 
 # --- filtering before repair ------------------------------------------------
@@ -443,3 +451,16 @@ def test_run_with_a_selection_still_writes_the_right_solids(tmp_path):
                      bodies=[keys[0], keys[2]])
     assert r['n_written'] == 2
     assert [round(v) for _, v in synth.solid_stats(out)] == [1000, 64000]
+
+
+def test_body_list_marks_open_shells(tmp_path):
+    """The UI warns before a long conversion that an open body cannot
+    become a solid. That warning needs the flag to be right."""
+    stl = str(tmp_path / 'mixed.stl')
+    trimesh.util.concatenate([_box(40), _open_sheet((100, 0, 0))]).export(stl)
+    d = body_list(stl)
+    by = {b['triangles']: b for b in d['bodies']}
+    assert by[12]['watertight'] is True
+    assert by[12]['volume'] == pytest.approx(64000)
+    assert by[4]['watertight'] is False
+    assert by[4]['volume'] is None             # no volume without a closed shell

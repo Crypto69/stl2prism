@@ -8,6 +8,12 @@ const store = useConvertStore()
 // will read them, so a wrongly-set unit is visible here rather than after
 // a long conversion.
 const scale = computed(() => store.unitScale)
+// A body that is not closed cannot become a solid: it converts to an open
+// shell, which imports as surfaces and cannot be modelled against. Worth
+// saying before a long conversion, not after.
+const openPicked = computed(() =>
+  store.bodies.filter((b) => store.selected.includes(b.index) && !b.watertight).length)
+
 const rows = computed(() => store.bodies.map((b) => ({
   ...b,
   mm: b.size.map((v) => v * scale.value),
@@ -45,6 +51,11 @@ function fmtVol(v) {
       <button class="link micro" @click="store.selectSuggestedBodies()">Largest only</button>
       <button class="link micro" @click="store.selectAllBodies()">All</button>
     </div>
+    <p v-if="openPicked" class="warn micro">
+      {{ openPicked === 1 ? 'One selected body is' : openPicked + ' selected bodies are' }}
+      not closed. {{ openPicked === 1 ? 'It' : 'They' }} will convert to open
+      surfaces rather than a solid you can model against.
+    </p>
     <ul
       class="list"
       @mouseleave="store.hovered = -1"
@@ -60,7 +71,8 @@ function fmtVol(v) {
         <span class="swatch" :style="{ background: bodyHue(r.index) }"></span>
         <span class="name">Body {{ r.index + 1 }}</span>
         <span class="num size">{{ fmtSize(r.mm) }} mm</span>
-        <span class="num vol" :class="{ open: r.volume == null }">{{ fmtVol(r.volMm3) }}</span>
+        <span class="num vol" :class="{ open: r.volume == null }"
+              :title="r.watertight ? '' : 'not closed: converts to surfaces, not a solid'">{{ fmtVol(r.volMm3) }}</span>
       </li>
     </ul>
     <p v-if="store.bodiesTruncated" class="micro help">
@@ -75,6 +87,15 @@ header { display: flex; align-items: baseline; gap: 8px; }
 h2 { font-size: 13px; letter-spacing: 0.08em; text-transform: uppercase; margin: 0; }
 .count { margin-left: auto; color: var(--edge); }
 .help { color: var(--muted); line-height: 1.45; }
+.warn {
+  color: var(--text);
+  background: rgba(240, 173, 78, 0.10);
+  border: 1px solid rgba(240, 173, 78, 0.45);
+  border-left-width: 3px;
+  border-radius: 4px;
+  padding: 7px 9px;
+  line-height: 1.45;
+}
 .actions { display: flex; gap: 12px; }
 .link {
   background: none; border: none; color: var(--edge); padding: 0;
