@@ -989,6 +989,182 @@ def _volume(shape):
     return abs(g.Mass())
 
 
+def _signed_volume(shape):
+    """Volume with the sign the orientation gives it: positive for a solid
+    whose shells face outwards, negative for one turned inside out."""
+    from OCP.GProp import GProp_GProps
+    from OCP.BRepGProp import BRepGProp
+    g = GProp_GProps()
+    BRepGProp.VolumeProperties_s(shape, g)
+    return float(g.Mass())
+
+
+def _solids_of(shape):
+    from OCP.TopExp import TopExp_Explorer
+    from OCP.TopAbs import TopAbs_SOLID
+    from OCP.TopoDS import TopoDS
+    out = []
+    e = TopExp_Explorer(shape, TopAbs_SOLID)
+    while e.More():
+        out.append(TopoDS.Solid_s(e.Current()))
+        e.Next()
+    return out
+
+
+def _shells_of(solid):
+    from OCP.TopExp import TopExp_Explorer
+    from OCP.TopAbs import TopAbs_SHELL
+    from OCP.TopoDS import TopoDS
+    out = []
+    e = TopExp_Explorer(solid, TopAbs_SHELL)
+    while e.More():
+        out.append(TopoDS.Shell_s(e.Current()))
+        e.Next()
+    return out
+
+
+# Points of a cavity shell classified against its outer solid: the six
+# bounding-box extremes (where a cavity fitted a little large pokes through
+# a thin wall first) plus a spread of the rest.
+CAVITY_PROBE_POINTS = 32
+
+
+def _probe_points(shape, n=CAVITY_PROBE_POINTS):
+    """A few vertices of `shape` as (x, y, z) rows: the extremes along each
+    axis and `n` more spread evenly through the vertex list."""
+    from OCP.TopExp import TopExp_Explorer
+    from OCP.TopAbs import TopAbs_VERTEX
+    from OCP.TopoDS import TopoDS
+    from OCP.BRep import BRep_Tool
+    P = []
+    e = TopExp_Explorer(shape, TopAbs_VERTEX)
+    while e.More():
+        p = BRep_Tool.Pnt_s(TopoDS.Vertex_s(e.Current()))
+        P.append((p.X(), p.Y(), p.Z()))
+        e.Next()
+    if not P:
+        return np.zeros((0, 3))
+    P = np.unique(np.asarray(P, float), axis=0)
+    idx = set(np.argmin(P, axis=0)) | set(np.argmax(P, axis=0))
+    idx |= set(np.linspace(0, len(P) - 1, min(n, len(P))).astype(int))
+    return P[sorted(idx)]
+
+
+def _classify(solid, pts, tol=1e-6):
+    """TopAbs state of every point of `pts` against `solid`."""
+    from OCP.BRepClass3d import BRepClass3d_SolidClassifier
+    from OCP.gp import gp_Pnt
+    cl = BRepClass3d_SolidClassifier(solid)
+    out = []
+    for x, y, z in pts:
+        cl.Perform(gp_Pnt(float(x), float(y), float(z)), tol)
+        out.append(cl.State())
+    return out
+
+
+def add_cavities(outer, voids, clear=None, rel_tol=1e-6):
+    """Make `outer` hollow by adding each solid of `voids` as an inner shell.
+
+    A cavity in this pipeline is a closed shell strictly inside its body
+    that touches nothing (split_bodies nests it that way), so the outer
+    surface and the cavity surface never meet and there is nothing for a
+    boolean to compute. OCC and STEP have the right object already: a solid
+    is one outer shell plus any number of inner shells facing inwards. This
+    is that topology edit: no geometry is touched, the cavity's faces come
+    through as they are.
+
+    Checks before trusting it, any failure returning (None, reason) so the
+    caller can fall back to a boolean cut:
+      * every probe point of a cavity lies strictly inside exactly one solid
+        of `outer` (a compound of touching solids picks the one that holds
+        it), and no cavity lies inside another. `clear(k, pts)` answers
+        that per point: True where a point sits clear inside the outer
+        material (k None) or clear outside cavity k. Without it the OCC
+        point classifier answers, which on big fitted solids has been seen
+        to get points hundreds of mm away wrong; the pipeline passes one
+        built on the source meshes;
+      * the result passes BRepCheck;
+      * its volume equals outer minus the cavities to `rel_tol` (a shell
+        added with the wrong orientation adds volume instead).
+    Returns (shape, info): the hollow solid (a compound of the same solids
+    when `outer` was one) and {'solids', 'cavities', 'volume'}.
+    """
+    from OCP.BRep import BRep_Builder
+    from OCP.TopoDS import TopoDS_Solid, TopoDS_Compound
+    from OCP.TopAbs import TopAbs_IN, TopAbs_OUT
+    from OCP.BRepCheck import BRepCheck_Analyzer
+    solids = _solids_of(outer)
+    if not solids:
+        return None, 'outer shape holds no solid'
+    cavities = []                              # (solid, probe points)
+    for k, v in enumerate(voids):
+        vs = _solids_of(v)
+        if len(vs) != 1:
+            return None, f'cavity {k + 1} is {len(vs)} solids, not one'
+        pts = _probe_points(vs[0])
+        if not len(pts):
+            return None, f'cavity {k + 1} has no vertices'
+        cavities.append((vs[0], pts))
+    # which outer solid holds each cavity: all probe points strictly inside
+    # one solid; a point on or outside every solid is a cavity that touches
+    # or pokes through the wall
+    if clear is None:
+        def clear(k, pts):
+            if k is None:
+                return [any(st == TopAbs_IN for st in states)
+                        for states in zip(*(_classify(sol, pts) for sol in solids))]
+            return [st == TopAbs_OUT for st in _classify(cavities[k][0], pts)]
+    holder = []
+    for k, (cav, pts) in enumerate(cavities):
+        if not all(clear(None, pts)):
+            return None, f'cavity {k + 1} is not strictly inside the outer solid'
+        if len(solids) == 1:
+            home = 0
+        else:
+            home = next((j for j, sol in enumerate(solids)
+                         if all(st == TopAbs_IN for st in _classify(sol, pts))), None)
+            if home is None:
+                return None, f'cavity {k + 1} is not inside one solid of the outer'
+        holder.append(home)
+    for a, (cav_a, _) in enumerate(cavities):
+        for b, (_, pts_b) in enumerate(cavities):
+            if a != b and holder[a] == holder[b] and not all(clear(a, pts_b)):
+                return None, f'cavity {b + 1} is not outside cavity {a + 1}'
+    expected = sum(_volume(s) for s in solids) - sum(_volume(c) for c, _ in cavities)
+    b = BRep_Builder()
+    rebuilt = []
+    for j, sol in enumerate(solids):
+        mine = [cav for cav, hold in zip(cavities, holder) if hold == j]
+        if not mine:
+            rebuilt.append(sol)
+            continue
+        new = TopoDS_Solid()
+        b.MakeSolid(new)
+        for shell in _shells_of(sol):
+            b.Add(new, shell)
+        for cav, _ in mine:
+            # a cavity built as a positive solid faces outwards: turn its
+            # shells to face the material. One already inside out stays.
+            flip = _signed_volume(cav) > 0
+            for shell in _shells_of(cav):
+                b.Add(new, shell.Reversed() if flip else shell)
+        rebuilt.append(new)
+    if len(rebuilt) == 1:
+        shape = rebuilt[0]
+    else:
+        shape = TopoDS_Compound()
+        b.MakeCompound(shape)
+        for s in rebuilt:
+            b.Add(shape, s)
+    if not BRepCheck_Analyzer(shape).IsValid():
+        return None, 'hollow solid failed BRepCheck'
+    got = _volume(shape)
+    if abs(got - expected) > rel_tol * max(abs(expected), 1e-9):
+        return None, (f'hollow volume {got:.6g} is not outer minus cavities '
+                      f'{expected:.6g}')
+    return shape, {'solids': len(solids), 'cavities': len(cavities), 'volume': got}
+
+
 def _largest_solid(shape, what):
     """Build a solid per shell and return the one enclosing the most volume.
 

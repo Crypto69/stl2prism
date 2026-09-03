@@ -170,7 +170,8 @@ features and local patching so that one axis need not explain everything.
    merged away. Units (`--units mm|cm|in|ft|m`) scale the mesh on load; the UI
    suggests a unit from the bounding box. Connected shells are split into
    bodies; a shell *inside* another is an internal cavity and is attached to
-   its body as a void, so a hollow part becomes one hollow solid. Scan-like
+   its body as a void, so a hollow part becomes one hollow solid (the
+   cavity goes in as an inner shell of the solid, not a boolean). Scan-like
    input (dense, low dihedral, no exactly-coplanar facets) is rebuilt via the
    pymeshlab repair ladder and decimated with topology preservation.
 2. **Axis discovery** (`extrusion`) — face normals are clustered on the
@@ -272,6 +273,22 @@ volume ≤ 2 %). "faces" = ADVANCED_FACE count in the STEP.
 
 The remaining planar faces on the face-group parts are blends (tapered
 corner fillets, free-form) that v1 keeps as exact facets.
+
+v0.3.8 (cavities as inner shells): a body's cavities are added to its
+solid as inner shells, the way OCC and STEP represent a hollow solid,
+instead of being subtracted with a fuzzy boolean. The cut had the kernel
+compare every outer face with every cavity face: on the 68-body
+controller's hollow body (a 15.8k-face outer, two cavities of 20k and 6k
+faces) that took 77 minutes and returned an empty solid. The inner shell
+takes milliseconds, keeps every fitted face as it was, and the volume is
+outer minus cavities exactly. A cavity that touches or pokes through the
+wall after fitting, or sits inside another, still takes the boolean
+(`void_method` in the metrics says which route a body took, and why).
+The nesting that finds cavities now checks every vertex of an inner
+shell, not one: a shell that crosses its container's surface (that
+controller's two "cavities" reached 29 mm and 3.7 mm outside the body)
+is an overlapping part, not a cavity, and is kept as a solid of its own
+with a `[bodies]` line saying so.
 
 v0.3.7 (shells in parallel): a file's shells (each body's outer surface
 and each cavity) are converted side by side in spawned worker processes,

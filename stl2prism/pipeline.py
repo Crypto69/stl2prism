@@ -689,15 +689,49 @@ def _convert_group(body, is_scan, force_prismatic, verbose, i=0, n=1, pool=None,
     return _assemble_group(body, outer, voids, verbose)
 
 
+def _mesh_clearance(body, outer_metrics, void_metrics, default_dev=0.08):
+    """The containment oracle add_cavities asks before it trusts an inner
+    shell, answered from the source meshes: a fitted surface lies within
+    its measured max deviation of its mesh, so a cavity point is safely
+    inside the material when it sits further inside the outer mesh than
+    the two deviations add up to, and safely outside another cavity when
+    it sits that far outside its mesh. None when a mesh is not closed (the
+    OCC classifier then answers)."""
+    meshes = [body.mesh] + list(body.voids)
+    if not all(m.is_watertight for m in meshes):
+        return None
+    import trimesh
+
+    def dev(m):
+        d = m.get('dev_max', float('nan'))
+        return float(d) if d == d else default_dev
+    clearance = dev(outer_metrics) + max([dev(m) for m in void_metrics] + [0.0])
+
+    def clear(k, pts):
+        m = meshes[0 if k is None else k + 1]
+        sd = trimesh.proximity.signed_distance(m, np.asarray(pts, float))   # + inside
+        return list(sd > clearance if k is None else sd < -clearance)
+    return clear
+
+
 def _assemble_group(body, outer, voids, verbose):
     """One (shape, mode, metrics) for a body from its converted outer shell
-    and converted voids (each a (shape, mode, metrics)): the voids are
-    subtracted and the volume error recomputed for the hollow result."""
+    and converted voids (each a (shape, mode, metrics)).
+
+    The cavities go in as inner shells of the outer solid (rebuild.
+    add_cavities): a topology edit that takes milliseconds whatever the
+    face count, and the only route that leaves every fitted face as it
+    was. A body it refuses (a cavity that touches or pokes through the
+    wall after fitting, a nested cavity, a result that fails BRepCheck)
+    takes the fuzzy boolean cut instead. metrics['void_method'] says which,
+    'void_reason' why the boolean was needed, 'void_s' how long it took;
+    the volume error is recomputed for the hollow result either way."""
     shape, mode, metrics = outer
     if not voids:
         return shape, mode, metrics
     import cadquery as cq
-    outer = cq.Shape.cast(shape)
+    from .rebuild import add_cavities
+    t0 = time.time()
     void_modes = []
     void_builds = []
     void_errors = []
@@ -705,10 +739,27 @@ def _assemble_group(body, outer, voids, verbose):
         void_modes.append(vmode)
         void_builds.append(vmet.get('build', {'mode': vmode}))
         void_errors.append(vmet.get('shell_error'))
-        outer = outer.cut(cq.Shape.cast(vshape), tol=1e-4)
+    hollow, why = add_cavities(shape, [v for v, _, _ in voids],
+                               clear=_mesh_clearance(body, metrics, [m for _, _, m in voids]))
+    if hollow is not None:
+        result = cq.Shape.cast(hollow)
+        method, reason = 'inner_shell', None
+    else:
+        # the boolean is the general tool; it is slow on big fitted
+        # surfaces and this is the one place the pipeline still needs it
+        if verbose:
+            print(f"[void] inner shells refused ({why}); cutting instead", flush=True)
+        result = cq.Shape.cast(shape)
+        for vshape, _, _ in voids:
+            result = result.cut(cq.Shape.cast(vshape), tol=1e-4)
+        method, reason = 'boolean', why
     metrics = dict(metrics)
     metrics['voids'] = len(body.voids)
     metrics['void_modes'] = void_modes
+    metrics['void_method'] = method
+    if reason:
+        metrics['void_reason'] = reason
+    metrics['void_s'] = time.time() - t0
     if any(void_errors):
         # a cavity given up on (timed out, worker died) is not one that
         # merely fitted no surface; the report must be able to tell
@@ -718,7 +769,7 @@ def _assemble_group(body, outer, voids, verbose):
     if 'build' in metrics:
         metrics['build'] = dict(metrics['build'], voids=void_builds)
     vol_mesh = body.volume()
-    vol_solid = float(outer.Volume())
+    vol_solid = float(result.Volume())
     metrics['vol_mesh'] = vol_mesh
     metrics['vol_solid'] = vol_solid
     metrics['vol_err_pct'] = (abs(vol_solid - vol_mesh) / vol_mesh * 100
@@ -726,9 +777,11 @@ def _assemble_group(body, outer, voids, verbose):
                               else float('nan'))
     metrics['vol_verified'] = bool(vol_mesh == vol_mesh and vol_mesh > 0)
     if verbose:
-        print(f"[void] {len(body.voids)} cavity(ies) subtracted; hollow volume "
-              f"{vol_solid:.0f}mm^3, err {metrics['vol_err_pct']:.2f}%")
-    return outer.wrapped, mode, metrics
+        what = 'added as inner shells' if method == 'inner_shell' else 'subtracted'
+        print(f"[void] {len(body.voids)} cavity(ies) {what} in {metrics['void_s']:.2f} s; "
+              f"hollow volume {vol_solid:.0f}mm^3, err {metrics['vol_err_pct']:.2f}%",
+              flush=True)
+    return result.wrapped, mode, metrics
 
 
 def _passes(metrics, accept_p95, accept_max, accept_hole_max, accept_vol_pct):

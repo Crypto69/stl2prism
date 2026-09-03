@@ -344,7 +344,9 @@ def split_bodies(m, is_scan, verbose=True):
     A shell that lies inside another (odd nesting depth) is a cavity, not a
     part: it is attached to its container as a void so the result is one
     hollow solid rather than two overlapping positive solids. A shell inside
-    a cavity (even depth) is a separate part again.
+    a cavity (even depth) is a separate part again. A shell that crosses
+    its container's surface is neither: it stays a body of its own (see
+    nest_shells).
     """
     parts = m.split(only_watertight=False)
     if len(parts) <= 1:
@@ -372,18 +374,46 @@ def split_bodies(m, is_scan, verbose=True):
         if n_voids:
             msg += f"; {n_voids} internal void(s) attached to their bodies"
         print(msg + f"; converting {len(bodies)}")
+        for i, j, reach in nest_shells.last_crossings:
+            print(f"[bodies] a {len(kept[i].faces)}-face shell inside the box of a "
+                  f"{len(kept[j].faces)}-face body crosses its surface by "
+                  f"{reach:.1f} mm: not a cavity, kept as a body of its own")
     return bodies, dropped
+
+
+# A cavity vertex this far (mm) outside its container is touching the wall
+# (a numerical hair), not through it.
+CAVITY_TOUCH_TOL = 1e-3
+
+
+def _reach_outside(container, shell):
+    """How far (mm) the vertices of `shell` reach outside `container`: 0 for
+    a shell that lies wholly inside it (or on its surface)."""
+    inside = container.contains(shell.vertices)
+    if inside.all():
+        return 0.0
+    _, d, _ = trimesh.proximity.closest_point(container, shell.vertices[~inside])
+    return float(d.max()) if len(d) else 0.0
 
 
 def nest_shells(parts):
     """Group shells into Bodies by containment.
 
     `parts` are Trimesh shells sorted largest first. Shell j contains shell i
-    if j is watertight, j's bounding box contains i's, and a vertex of i is
-    inside j. Depth = number of containers; odd depth => void of the deepest
-    container; even depth => positive body.
+    if j is watertight, j's bounding box contains i's, a vertex of i is
+    inside j, and then every vertex of i is inside j (or on its surface
+    within CAVITY_TOUCH_TOL). Depth = number of containers; odd depth =>
+    void of the deepest container; even depth => positive body.
+
+    The every-vertex check is what tells a cavity from an overlapping part:
+    a shell that starts inside j but crosses its surface (a component
+    modelled through the housing, a repair artefact) is no cavity, and
+    cutting it out of j is the wrong operation (on the 68-body controller
+    it cost 77 minutes and emptied the body). Such a shell stays a body of
+    its own; nest_shells.last_crossings lists them as (i, j, reach_mm).
     """
     n = len(parts)
+    nest_shells.last_crossings = []
     if n == 1:
         return [Body(parts[0])]
     lo = [p.bounds[0] for p in parts]
@@ -410,8 +440,13 @@ def nest_shells(parts):
         except Exception:
             continue
         for i, ok in zip(cand, inside):
-            if ok:
-                containers[i].append(j)
+            if not ok:
+                continue
+            reach = _reach_outside(pj, parts[i])
+            if reach > CAVITY_TOUCH_TOL:
+                nest_shells.last_crossings.append((i, j, reach))
+                continue
+            containers[i].append(j)
     depth = [len(c) for c in containers]
     bodies = {}
     for i in range(n):
