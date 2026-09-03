@@ -171,8 +171,11 @@ def run(in_path, out_path, tol=0.08, accept_p95=0.25, accept_vol_pct=2.0,
     from .rebuild import write_step
 
     picked = bodies
+    # Filter before repair, not after: repairing sixty-nine bodies the user
+    # did not ask for is the slow part, and for a scan it dominates.
+    keep = _keep_selected(picked) if picked is not None else None
     bodies, is_scan, n_dropped = load_and_prep_bodies(
-        in_path, verbose=verbose, units=units, scale=scale)
+        in_path, verbose=verbose, units=units, scale=scale, keep=keep)
     if picked is not None:
         bodies = _pick_bodies(bodies, picked, verbose)
     gates = dict(tol=tol, accept_p95=accept_p95, accept_max=accept_max,
@@ -258,6 +261,33 @@ def shell_keys(meshes):
     return [shell_key_in(m, lo, span) for m in meshes]
 
 
+def _keep_selected(picked):
+    """A `keep` predicate for load_and_prep_bodies from a selection, or None.
+
+    Repair is the expensive half of preparation, so bodies nobody asked for
+    should not be repaired. The exact match cannot happen here: a shell key
+    is measured against the whole file's bounding box, and preparation has
+    not built that list yet. Face count can be, and it is stable across
+    preparation for everything except a scan (where decimation changes it),
+    so this narrows the set and _pick_bodies still makes the exact choice
+    afterwards.
+
+    Returns None — keep everything — when the selection is plain indices
+    (they name positions in the prepared list, which does not exist yet) or
+    when there is nothing to narrow by.
+    """
+    counts = {int(w[0]) for w in picked
+              if isinstance(w, (tuple, list)) and len(w) >= 4}
+    if not counts or len(counts) != len(list(picked)):
+        return None
+
+    def keep(group):
+        if len(group.mesh.faces) in counts:
+            return True
+        return any(len(v.faces) in counts for v in group.voids)
+    return keep
+
+
 def _as_key(want):
     """A key tuple as it arrives from JSON (a list) or from shell_keys."""
     return (int(want[0]),) + tuple(round(float(v), 5) for v in want[1:])
@@ -279,15 +309,34 @@ def _pick_bodies(bodies, picked, verbose):
     rather than convert the wrong thing on an out-of-range index, or
     convert nothing at all.
     """
+    # Keys are measured against the box the shells share, so they only
+    # match a list built from the same set. When the caller narrowed the
+    # list before repair (_keep_selected) that box has changed and the keys
+    # cannot be reproduced, so face count is the fallback.
+    #
+    # It is only safe where it is unambiguous. A cavity often has the same
+    # face count as some other body, and matching one to the other is the
+    # silent wrong-body bug this whole mechanism exists to avoid — so a
+    # count shared with any cavity, or with more than one body, matches
+    # nothing and the caller is told.
+    keys = shell_keys([b.mesh for b in bodies])
     by_key = {}
-    for j, key in enumerate(shell_keys([b.mesh for b in bodies])):
+    for j, key in enumerate(keys):
         by_key.setdefault(key, []).append(j)
+    counts = {}
+    for j, b in enumerate(bodies):
+        counts.setdefault(int(len(b.mesh.faces)), []).append(j)
+    void_counts = {int(len(v.faces)) for b in bodies for v in b.voids}
+    by_faces = {n: js for n, js in counts.items()
+                if len(js) == 1 and n not in void_counts}
     chosen, unmatched = [], []
     for want in picked:
         if isinstance(want, (tuple, list)) and len(want) >= 4:
             # Twins share a key; hand out each match once so picking two of
             # four identical screws converts two of them, not one.
             pool = by_key.get(_as_key(want))
+            if not pool:
+                pool = by_faces.get(int(want[0]))
             j = next((x for x in pool if x not in chosen), None) if pool else None
         else:
             i = int(want)

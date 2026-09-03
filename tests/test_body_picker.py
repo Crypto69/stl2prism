@@ -1,5 +1,6 @@
 """Picking which bodies to convert: the shell list the UI shows, and the
 filter run() applies to it."""
+import numpy as np
 import pytest
 import trimesh
 
@@ -14,6 +15,9 @@ def _box(size, at=(0, 0, 0)):
     b = trimesh.creation.box((size, size, size))
     b.apply_translation(at)
     return b
+
+
+_tbox = _box          # the mesh-level helper, named for the geometry tests
 
 
 def _three_parts(path):
@@ -299,3 +303,143 @@ def test_public_state_keeps_a_real_error_over_the_kill_note(tmp_path, monkeypatc
                            'killed': jobs._killed_by(-9)}
     st = jobs.public_state(jid)
     assert st['result']['error'] == 'PrepError: bad mesh'
+
+
+# --- memory and determinism in the body split -------------------------------
+
+def test_contains_is_batched_and_matches_the_unbatched_answer():
+    """trimesh's contains() allocates points x triangles in one go: 21,833
+    vertices against an 18,664-face housing asked for 15.5 GB and the
+    kernel killed the conversion before it converted anything."""
+    from stl2prism import mesh_prep
+    outer = trimesh.creation.icosphere(subdivisions=3, radius=20)
+    pts = trimesh.creation.icosphere(subdivisions=4, radius=10).vertices
+    assert len(pts) > mesh_prep.CONTAINS_BATCH
+    got = mesh_prep._contains(outer, pts)
+    assert got.all()                                   # all well inside
+    mixed = np.vstack([pts, pts * 10])                 # half outside
+    got2 = mesh_prep._contains(outer, mixed)
+    assert got2[:len(pts)].all() and not got2[len(pts):].any()
+
+
+def test_reach_outside_is_zero_for_a_contained_shell():
+    from stl2prism.mesh_prep import _reach_outside
+    assert _reach_outside(_tbox(40), _tbox(20)) == pytest.approx(0.0, abs=1e-6)
+
+
+def test_reach_outside_measures_how_far_a_shell_pokes_out():
+    from stl2prism.mesh_prep import _reach_outside
+    # a 20 cube centred 15 from the origin reaches 5 mm past a 40 cube's wall
+    assert _reach_outside(_tbox(40), _tbox(20, (15, 0, 0))) == pytest.approx(5.0, abs=0.05)
+
+
+def test_reach_outside_is_deterministic():
+    """This decides whether a shell is a cavity or a body of its own, so
+    the same file must always give the same answer. An unseeded surface
+    sample once gave 0.4 mm on one run and 1.5 mm on the next."""
+    from stl2prism.mesh_prep import _reach_outside
+    a, b = _tbox(40), _tbox(20, (12, 3, 0))
+    first = _reach_outside(a, b)
+    for _ in range(4):
+        assert _reach_outside(a, b) == first
+
+
+def test_reach_outside_stays_accurate_on_a_dense_shell():
+    """The sample must not change the verdict on a shell with far more
+    vertices than REACH_SAMPLE."""
+    from stl2prism import mesh_prep
+    outer = trimesh.creation.icosphere(subdivisions=3, radius=20)
+    inner = trimesh.creation.icosphere(subdivisions=5, radius=10)   # 10242 verts
+    inner.apply_translation((15, 0, 0))
+    assert len(inner.vertices) > mesh_prep.REACH_SAMPLE
+    got = mesh_prep._reach_outside(outer, inner)
+    exact = max(0.0, -float(trimesh.proximity.signed_distance(outer, inner.vertices).min()))
+    assert got == pytest.approx(exact, abs=0.05)
+
+
+def test_split_bodies_stays_within_memory_on_many_shells(tmp_path):
+    """A regression guard for the out-of-memory kill: prep runs over every
+    shell whatever the user picked, so it must stay bounded."""
+    import resource
+    from stl2prism.mesh_prep import classify, split_bodies
+    parts = [trimesh.creation.icosphere(subdivisions=4, radius=20)]
+    for k in range(6):
+        s = trimesh.creation.icosphere(subdivisions=3, radius=3)
+        s.apply_translation((k * 8 - 20, 0, 0))
+        parts.append(s)
+    m = trimesh.util.concatenate(parts)
+    before = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+    split_bodies(m, classify(m, False), verbose=False)
+    after = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+    grew_gb = (after - before) / 1e9        # ru_maxrss is bytes on macOS
+    assert grew_gb < 2.0, f'split_bodies grew {grew_gb:.1f} GB'
+
+
+# --- suggestions on meshes that are not closed ------------------------------
+
+def test_suggested_ranks_open_shells_by_size(tmp_path):
+    """An open shell has no volume. Ranking on volume alone made an OBJ
+    whose two housing halves are open suggest a single tiny closed screw
+    and none of the part the user wanted."""
+    from backend.analysis import body_list
+    big = trimesh.creation.box((100, 60, 20))
+    big.update_faces(np.arange(len(big.faces)) > 0)      # open: drop one face
+    small = trimesh.creation.box((4, 4, 4))
+    small.apply_translation((200, 0, 0))                 # closed, tiny
+    stl = str(tmp_path / 'mixed.stl')
+    trimesh.util.concatenate([big, small]).export(stl)
+    d = body_list(stl)
+    by_faces = {b['triangles']: b for b in d['bodies']}
+    assert by_faces[11]['suggested'] is True             # the big open shell
+    assert by_faces[12]['suggested'] is False            # the tiny closed one
+
+
+# --- filtering before repair ------------------------------------------------
+
+def test_keep_selected_narrows_by_face_count():
+    from stl2prism.pipeline import _keep_selected
+    keep = _keep_selected([(12, 1.0, 1.0, 1.0, 0.5, 0.5, 0.5, 1.0)])
+    assert keep is not None
+    assert keep(Body(_box(40)))                        # 12 faces
+    assert not keep(Body(trimesh.creation.icosphere(subdivisions=1)))
+
+
+def test_keep_selected_keeps_a_body_whose_cavity_was_picked():
+    from stl2prism.pipeline import _keep_selected
+    keep = _keep_selected([(12, 1.0, 1.0, 1.0, 0.5, 0.5, 0.5, 0.5)])
+    body = Body(trimesh.creation.icosphere(subdivisions=2), [_box(2)])
+    assert keep(body)                                  # matched via the void
+
+
+def test_keep_selected_declines_plain_indices():
+    """Indices name positions in the prepared list, which does not exist
+    when the filter runs: keep everything and decide afterwards."""
+    from stl2prism.pipeline import _keep_selected
+    assert _keep_selected([0, 2]) is None
+
+
+def test_early_filter_and_late_filter_agree(tmp_path):
+    """The point of the whole mechanism: repairing only what was asked for
+    must give exactly what repairing everything would have given."""
+    from stl2prism.mesh_prep import load_and_prep_bodies
+    from stl2prism.pipeline import _keep_selected, _pick_bodies
+    stl = _three_parts(tmp_path / 'three.stl')
+    keys = [tuple(b['key']) for b in body_list(stl)['bodies']]
+    want = [keys[0], keys[2]]
+
+    early, _, _ = load_and_prep_bodies(stl, verbose=False, keep=_keep_selected(want))
+    a = _pick_bodies(early, want, False)
+    late, _, _ = load_and_prep_bodies(stl, verbose=False)
+    b = _pick_bodies(late, want, False)
+    assert [len(x.mesh.faces) for x in a] == [len(x.mesh.faces) for x in b]
+    assert [round(abs(x.mesh.volume)) for x in a] == [round(abs(x.mesh.volume)) for x in b]
+
+
+def test_run_with_a_selection_still_writes_the_right_solids(tmp_path):
+    stl = _three_parts(tmp_path / 'three.stl')
+    keys = [tuple(b['key']) for b in body_list(stl)['bodies']]
+    out = str(tmp_path / 'picked.step')
+    r = pipeline.run(stl, out, verbose=False, write_script=False,
+                     bodies=[keys[0], keys[2]])
+    assert r['n_written'] == 2
+    assert [round(v) for _, v in synth.solid_stats(out)] == [1000, 64000]

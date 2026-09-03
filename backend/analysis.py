@@ -110,13 +110,24 @@ def body_list(path, max_bodies=400):
     from stl2prism.mesh_prep import load_mesh
     m = load_mesh(path)
     n_faces = len(m.faces)
-    # split() does not hand back which face went where, so label the faces
-    # directly from the same connectivity split() uses.
+    # Label faces from the connectivity split() uses, because split() does
+    # not hand back which face went where — but build each body's mesh with
+    # split() itself. Its parts are what the pipeline will convert, and it
+    # re-processes each one (merging and dropping faces), so a submesh of
+    # the same component can differ by a few faces. Reporting the component
+    # count made a selection silently lose a body whose count moved by 4.
     comps = connected_components(m.face_adjacency, nodes=np.arange(n_faces))
     tri_body = np.full(n_faces, -1, dtype=np.int64)
     order = sorted(range(len(comps)), key=lambda i: -len(comps[i]))
-    subs = [m.submesh([comps[i]], append=True, repair=False)
-            for i in order[:max_bodies]]
+    parts = sorted(m.split(only_watertight=False), key=lambda p: -len(p.faces))
+    subs = []
+    for rank, i in enumerate(order[:max_bodies]):
+        # split() sorts by size as we do, so ranks line up; fall back to a
+        # submesh if the two disagree in length for any reason.
+        if rank < len(parts) and abs(len(parts[rank].faces) - len(comps[i])) <= 8:
+            subs.append(parts[rank])
+        else:
+            subs.append(m.submesh([comps[i]], append=True, repair=False))
     # Keys are measured against the whole file's box, so they must all be
     # built together (see pipeline.shell_keys).
     from stl2prism.pipeline import shell_keys
@@ -131,15 +142,26 @@ def body_list(path, max_bodies=400):
         bodies.append({
             'index': new_i,
             'key': list(keys[new_i]),
-            'triangles': int(len(faces)),
+            # the body the pipeline will convert, not the raw component:
+            # split() re-processes each part, and reporting the component's
+            # count made the shell key miss by a few faces
+            'triangles': int(len(sub.faces)),
             'watertight': closed,
             'volume': round(float(abs(sub.volume)), 4) if closed else None,
             'size': [round(float(v), 4) for v in ext],
             'center': [round(float(v), 4) for v in (sub.bounds[0] + ext / 2)],
         })
-    vols = [b['volume'] or 0.0 for b in bodies]
-    biggest = max(vols) if vols else 0.0
-    for b, v in zip(bodies, vols):
-        b['suggested'] = bool(biggest > 0 and v >= DEFAULT_PICK_FRAC * biggest)
+    # Rank by volume where the shell is closed, and by the cube of its
+    # longest side where it is not. An open shell has no volume, and
+    # ranking on volume alone made an OBJ whose two housing halves are open
+    # suggest a single 2 mm3 screw and none of the part the user wanted.
+    def weight(b):
+        if b['volume']:
+            return float(b['volume'])
+        return float(max(b['size'])) ** 3 if b['size'] else 0.0
+    ws = [weight(b) for b in bodies]
+    biggest = max(ws) if ws else 0.0
+    for b, w in zip(bodies, ws):
+        b['suggested'] = bool(biggest > 0 and w >= DEFAULT_PICK_FRAC * biggest)
     return {'bodies': bodies, 'triangle_body': tri_body.tolist(),
             'truncated': len(comps) > max_bodies}

@@ -193,13 +193,20 @@ def load_and_prep(path, target_faces=40000, verbose=True,
 
 def load_and_prep_bodies(path, target_faces=40000, verbose=True,
                          scan_dihedral_deg=SCAN_DIHEDRAL_DEG,
-                         scan_min_faces=SCAN_MIN_FACES, units='mm', scale=1.0):
+                         scan_min_faces=SCAN_MIN_FACES, units='mm', scale=1.0,
+                         keep=None):
     """Like load_and_prep, but one prepared `Body` per solid.
 
     Returns (bodies, is_scan, n_dropped). Bodies are sorted largest first.
     Sliver bodies (see split_bodies) are dropped and counted; a body whose
     scan repair fails is dropped with a log line rather than failing the
     whole file. Internal voids are repaired like their bodies.
+
+    `keep(body) -> bool` selects which split bodies are worth repairing.
+    Repair is the expensive part for a scan, so a user who asked for two
+    bodies of seventy-one should not pay to repair the other sixty-nine.
+    The decimation budget is shared over the kept bodies only, so a small
+    selection keeps more of its detail rather than less.
     """
     m = _load_scaled(path, units, verbose, scale)
     is_scan = classify(m, verbose, scan_dihedral_deg, scan_min_faces)
@@ -210,6 +217,14 @@ def load_and_prep_bodies(path, target_faces=40000, verbose=True,
 
     if is_scan:
         _require_pymeshlab()   # fail once, loudly, not once per body
+    if keep is not None:
+        wanted = [g for g in groups if keep(g)]
+        if not wanted:
+            raise PrepError('no body matched the selection')
+        if verbose and len(wanted) < len(groups):
+            print(f"[bodies] preparing {len(wanted)} of {len(groups)} "
+                  f"(the rest were not selected)")
+        groups = wanted
     total = sum(g.n_faces_total for g in groups)
     bodies = []
     for i, g in enumerate(groups):
@@ -456,14 +471,56 @@ def split_bodies(m, is_scan, verbose=True):
 CAVITY_TOUCH_TOL = 1e-3
 
 
+# Points per trimesh contains() call. Its ray engine allocates work
+# proportional to points x triangles in one go: 21,833 vertices against an
+# 18,664-face housing asked for 15.5 GB and the kernel killed the whole
+# conversion before it had converted anything.
+CONTAINS_BATCH = 2000
+
+
+def _contains(mesh, pts):
+    """mesh.contains(pts) in bounded memory."""
+    pts = np.asarray(pts, float)
+    if len(pts) <= CONTAINS_BATCH:
+        return np.asarray(mesh.contains(pts), bool)
+    out = np.empty(len(pts), bool)
+    for i in range(0, len(pts), CONTAINS_BATCH):
+        out[i:i + CONTAINS_BATCH] = mesh.contains(pts[i:i + CONTAINS_BATCH])
+    return out
+
+
+# Vertices of a shell measured against its candidate container. The
+# question is only whether the shell pokes out and by how much, and the
+# deepest part of an overlap covers many vertices, so an evenly spaced
+# sample of this size answers it; the walls that matter are millimetres
+# thick, not microns.
+REACH_SAMPLE = 4000
+
+
 def _reach_outside(container, shell):
     """How far (mm) the vertices of `shell` reach outside `container`: 0 for
-    a shell that lies wholly inside it (or on its surface)."""
-    inside = container.contains(shell.vertices)
-    if inside.all():
+    a shell that lies wholly inside it (or on its surface).
+
+    Uses trimesh's signed distance (positive inside), which answers "in or
+    out" and "how far out" in one pass and in bounded memory. The obvious
+    alternative, contains() followed by closest_point(), allocates
+    points x triangles at once: on a 72-shell controller that reached 15 GB
+    and had the conversion killed by the kernel before it began.
+
+    The vertex sample is evenly spaced, never random: this decides whether
+    a shell is a cavity or a body of its own, and the same file must always
+    give the same answer.
+    """
+    V = np.asarray(shell.vertices, float)
+    if not len(V):
         return 0.0
-    _, d, _ = trimesh.proximity.closest_point(container, shell.vertices[~inside])
-    return float(d.max()) if len(d) else 0.0
+    if len(V) > REACH_SAMPLE:
+        idx = np.linspace(0, len(V) - 1, REACH_SAMPLE).astype(np.int64)
+        V = V[idx]
+    import trimesh.proximity
+    sd = trimesh.proximity.signed_distance(container, V)   # + inside
+    worst = float(np.min(sd))
+    return 0.0 if worst >= 0 else -worst
 
 
 def nest_shells(parts):
@@ -506,7 +563,7 @@ def nest_shells(parts):
                 if len(pi.vertex_normals) else pi.vertices[k]
             pts.append(v)
         try:
-            inside = pj.contains(np.array(pts))
+            inside = _contains(pj, np.array(pts))
         except Exception:
             continue
         for i, ok in zip(cand, inside):
