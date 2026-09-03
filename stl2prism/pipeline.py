@@ -140,7 +140,8 @@ def gate_values(metrics):
 def run(in_path, out_path, tol=0.08, accept_p95=0.25, accept_vol_pct=2.0,
         accept_max=0.26, accept_hole_max=0.10,
         force_prismatic=False, verbose=True, units='mm', reduce_tol=0.05,
-        write_script=True, face_groups=True, workers=None, shell_timeout=None):
+        write_script=True, face_groups=True, workers=None, shell_timeout=None,
+        bodies=None):
     """Convert one mesh file to one STEP file.
 
     Every connected body is converted on its own — prismatic where it passes
@@ -154,12 +155,21 @@ def run(in_path, out_path, tol=0.08, accept_p95=0.25, accept_vol_pct=2.0,
     `workers` and `shell_timeout` size the process pool the shells are
     converted in (see _convert_all; None takes the environment's default,
     workers=0 converts in this process).
+
+    `bodies` picks which connected bodies to convert, as indices into the
+    prepared list (largest first, the order backend.analysis.body_list
+    reports). None converts all of them. Converting the two halves of a
+    72-shell housing takes minutes where the whole file takes hours, so
+    this is the difference between a usable answer and an unusable one.
     """
     from .mesh_prep import load_and_prep_bodies
     from .rebuild import write_step
 
+    picked = bodies
     bodies, is_scan, n_dropped = load_and_prep_bodies(
         in_path, verbose=verbose, units=units)
+    if picked is not None:
+        bodies = _pick_bodies(bodies, picked, verbose)
     gates = dict(tol=tol, accept_p95=accept_p95, accept_max=accept_max,
                  accept_hole_max=accept_hole_max, accept_vol_pct=accept_vol_pct,
                  reduce_tol=reduce_tol, face_groups=face_groups)
@@ -192,6 +202,110 @@ def run(in_path, out_path, tol=0.08, accept_p95=0.25, accept_vol_pct=2.0,
     finally:
         if pool is not None:
             pool.close()
+
+
+def shell_key(mesh):
+    """A stable identity for one connected shell of a file.
+
+    Face count, the shell's proportions (bounding-box extents sorted and
+    divided by the largest), and where its centre sits inside the *file's*
+    own bounding box as a fraction of that box. Every part of that survives
+    the unit scaling the pipeline applies on load: scaling multiplies each
+    extent and the whole box by the same factor, so both ratios hold.
+
+    Position is what separates otherwise identical shells — four identical
+    screws, or a 20 cube and a 40 cube whose proportions match — and it is
+    exactly what the user pointed at when they clicked one in the viewer.
+    Needs the file's bounds, so callers use shell_keys() rather than
+    calling this directly.
+    """
+    raise NotImplementedError('use shell_keys(meshes) or shell_key_in(mesh, bounds)')
+
+
+def shell_key_in(mesh, lo, span):
+    """shell_key for a shell measured against the whole file's box.
+
+    Face count, proportions, centre, and the shell's size relative to the
+    file. That last term is what separates a cavity from the body around
+    it: a concentric cavity matches its outer shell on every other term,
+    and picking one must never select the other.
+    """
+    import numpy as np
+    lo = np.asarray(lo, float)
+    span = float(span) or 1.0
+    ext = np.asarray(mesh.bounds[1], float) - np.asarray(mesh.bounds[0], float)
+    big = float(np.max(ext))
+    prop = tuple(round(float(v / big), 5) for v in np.sort(ext)) if big > 0 \
+        else (0.0, 0.0, 0.0)
+    centre = (np.asarray(mesh.bounds[0], float) + ext / 2 - lo) / span
+    where = tuple(round(float(v), 5) for v in centre)
+    return (int(len(mesh.faces)),) + prop + where + (round(big / span, 5),)
+
+
+def shell_keys(meshes):
+    """One key per shell, all measured against the box the shells share."""
+    import numpy as np
+    if not len(meshes):
+        return []
+    lo = np.min([m.bounds[0] for m in meshes], axis=0)
+    hi = np.max([m.bounds[1] for m in meshes], axis=0)
+    span = float(np.max(hi - lo)) or 1.0
+    return [shell_key_in(m, lo, span) for m in meshes]
+
+
+def _as_key(want):
+    """A key tuple as it arrives from JSON (a list) or from shell_keys."""
+    return (int(want[0]),) + tuple(round(float(v), 5) for v in want[1:])
+
+
+def _pick_bodies(bodies, picked, verbose):
+    """The subset of `bodies` the caller asked for.
+
+    `picked` names shells by the *shell* index the UI shows (backend.
+    analysis.body_list: every connected shell of the raw mesh, largest
+    first). That is not this list: preparation attaches each cavity to its
+    parent body and drops slivers, so from the first cavity onwards the two
+    orders diverge and index i means different things in each. The caller
+    therefore passes shell_key() tuples, or plain indices when the file has
+    no cavities and the two lists coincide.
+
+    A chosen shell that preparation folded into another body (a cavity) or
+    dropped (a sliver) selects nothing of its own and is reported. Raises
+    rather than convert the wrong thing on an out-of-range index, or
+    convert nothing at all.
+    """
+    by_key = {}
+    for j, key in enumerate(shell_keys([b.mesh for b in bodies])):
+        by_key.setdefault(key, []).append(j)
+    chosen, unmatched = [], []
+    for want in picked:
+        if isinstance(want, (tuple, list)) and len(want) >= 4:
+            # Twins share a key; hand out each match once so picking two of
+            # four identical screws converts two of them, not one.
+            pool = by_key.get(_as_key(want))
+            j = next((x for x in pool if x not in chosen), None) if pool else None
+        else:
+            i = int(want)
+            if i < 0 or i >= len(bodies):
+                raise ValueError(
+                    f"body index {i} is out of range (this file prepares "
+                    f"{len(bodies)} bodies, 0-{len(bodies) - 1})")
+            j = i
+        if j is None:
+            unmatched.append(want)
+        elif j not in chosen:
+            chosen.append(j)
+    if not chosen:
+        raise ValueError('no bodies selected: none of the chosen shells is a '
+                         'body of its own (they may be cavities or slivers)')
+    if verbose:
+        if len(chosen) < len(bodies):
+            print(f"[bodies] converting {len(chosen)} of {len(bodies)}: "
+                  + ', '.join(str(j) for j in sorted(chosen)))
+        for want in unmatched:
+            print(f"[bodies] shell {want} is not a body of its own "
+                  f"(a cavity, or a sliver that was dropped); skipped")
+    return [bodies[j] for j in sorted(chosen)]
 
 
 def _finish_multi(bodies, results, in_path, out_path, write_script, verbose,

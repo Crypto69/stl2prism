@@ -1,6 +1,7 @@
 <script setup>
 import { computed, markRaw, onMounted, ref, shallowRef } from 'vue'
 import MeshViewer from './components/MeshViewer.vue'
+import BodyPicker from './components/BodyPicker.vue'
 import ParamsPanel from './components/ParamsPanel.vue'
 import ReportPanel from './components/ReportPanel.vue'
 import { useConvertStore } from './store'
@@ -78,7 +79,16 @@ const canConvert = computed(
         @dragleave="dragOver = false"
         @drop.prevent="onDrop"
       >
-        <MeshViewer v-if="buffer" :buffer="buffer" :unit-scale="store.unitScale" />
+        <MeshViewer
+          v-if="buffer"
+          :buffer="buffer"
+          :unit-scale="store.unitScale"
+          :triangle-body="store.triangleBody"
+          :selected="store.selected"
+          :hovered="store.hovered"
+          @pick="store.toggleBody($event)"
+          @hover="store.hovered = $event"
+        />
         <div v-else class="dropzone">
           <div class="prism-mark" aria-hidden="true">
             <svg viewBox="0 0 120 100" width="120" height="100">
@@ -104,6 +114,7 @@ const canConvert = computed(
       </div>
 
       <aside class="rail">
+        <BodyPicker />
         <ParamsPanel />
         <button
           class="convert"
@@ -154,7 +165,11 @@ const canConvert = computed(
   flex: 1;
   min-height: 0;
   display: grid;
-  grid-template-columns: 1fr 360px;
+  /* The rail holds the controls and must stay legible at any width, so it
+     keeps a floor and the stage takes what is left (minmax(0,1fr), not
+     1fr: a grid track's default min-content floor would let the canvas
+     push the rail off screen instead of shrinking). */
+  grid-template-columns: minmax(0, 1fr) clamp(300px, 28vw, 380px);
 }
 
 .stage {
@@ -210,6 +225,7 @@ const canConvert = computed(
 
 .rail {
   padding: 16px;
+  min-height: 0;
   overflow-y: auto;
   background: var(--panel);
   display: flex;
@@ -244,8 +260,17 @@ const canConvert = computed(
 }
 @keyframes spin { to { transform: rotate(360deg); } }
 
+/* Narrow: stack, and let the viewer shrink rather than the controls. The
+   stage takes a share of the height with a floor; the rail keeps its own
+   scroll so every control stays reachable. */
 @media (max-width: 900px) {
-  .grid { grid-template-columns: 1fr; grid-template-rows: 55vh auto; }
+  .grid {
+    grid-template-columns: minmax(0, 1fr);
+    grid-template-rows: minmax(180px, 40vh) minmax(0, 1fr);
+  }
   .stage { border-right: none; border-bottom: 1px solid var(--line); }
+}
+@media (max-width: 900px) and (max-height: 560px) {
+  .grid { grid-template-rows: minmax(140px, 32vh) minmax(0, 1fr); }
 }
 </style>

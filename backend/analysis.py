@@ -19,11 +19,14 @@ def mesh_stats(path):
     # Same loader as the pipeline, so watertight/vertex/volume numbers here
     # describe the geometry the conversion will actually see (an OBJ with
     # per-corner normals would otherwise report as open with 4x the vertices).
-    from stl2prism.mesh_prep import load_mesh, suggest_units
+    from stl2prism.mesh_prep import load_mesh, suggest_units, unit_warning
     m = load_mesh(path)
     ext = m.bounding_box.primitive.extents
     stats = {
         'units_suggestion': suggest_units(m),
+        # None unless the mesh, read as mm, is an implausible size for a
+        # part: a wrong unit is cheap to fix here and expensive later.
+        'unit_warning': unit_warning(m),
         'file_size': os.path.getsize(path),
         'triangles': int(len(m.faces)),
         'vertices': int(len(m.vertices)),
@@ -82,3 +85,61 @@ def step_stats(path):
             'freeform': kinds['B_SPLINE_SURFACE'],
         },
     }
+
+
+# Bodies smaller than this share of the largest body's volume are left
+# unticked by default: on a 72-shell controller that selects the two
+# housing halves and none of the 70 screws and buttons.
+DEFAULT_PICK_FRAC = 0.05
+
+
+def body_list(path, max_bodies=400):
+    """One entry per connected shell of the mesh, largest first.
+
+    Returns {'bodies': [...], 'triangle_body': [...]} where `triangle_body`
+    maps every triangle of the mesh, in the order load_mesh yields them, to
+    the index of the body it belongs to. That mapping is what lets the
+    viewer colour bodies and turn a ray-cast triangle into a selection
+    without loading a mesh per body.
+
+    Volumes and sizes are in file units; the caller scales by the chosen
+    unit. A shell that is not closed reports volume None.
+    """
+    import numpy as np
+    from trimesh.graph import connected_components
+    from stl2prism.mesh_prep import load_mesh
+    m = load_mesh(path)
+    n_faces = len(m.faces)
+    # split() does not hand back which face went where, so label the faces
+    # directly from the same connectivity split() uses.
+    comps = connected_components(m.face_adjacency, nodes=np.arange(n_faces))
+    tri_body = np.full(n_faces, -1, dtype=np.int64)
+    order = sorted(range(len(comps)), key=lambda i: -len(comps[i]))
+    subs = [m.submesh([comps[i]], append=True, repair=False)
+            for i in order[:max_bodies]]
+    # Keys are measured against the whole file's box, so they must all be
+    # built together (see pipeline.shell_keys).
+    from stl2prism.pipeline import shell_keys
+    keys = shell_keys(subs)
+    bodies = []
+    for new_i, old_i in enumerate(order[:max_bodies]):
+        faces = comps[old_i]
+        tri_body[faces] = new_i
+        sub = subs[new_i]
+        closed = bool(sub.is_watertight)
+        ext = sub.bounds[1] - sub.bounds[0]
+        bodies.append({
+            'index': new_i,
+            'key': list(keys[new_i]),
+            'triangles': int(len(faces)),
+            'watertight': closed,
+            'volume': round(float(abs(sub.volume)), 4) if closed else None,
+            'size': [round(float(v), 4) for v in ext],
+            'center': [round(float(v), 4) for v in (sub.bounds[0] + ext / 2)],
+        })
+    vols = [b['volume'] or 0.0 for b in bodies]
+    biggest = max(vols) if vols else 0.0
+    for b, v in zip(bodies, vols):
+        b['suggested'] = bool(biggest > 0 and v >= DEFAULT_PICK_FRAC * biggest)
+    return {'bodies': bodies, 'triangle_body': tri_body.tolist(),
+            'truncated': len(comps) > max_bodies}

@@ -12,7 +12,15 @@ const props = defineProps({
   // file units -> mm; the callout shows real-world size, the geometry is
   // rendered as-is (the camera fits it either way)
   unitScale: { type: Number, default: 1 },
+  // triangle index -> body index, from /api/jobs/{id}/bodies. When set,
+  // each body is drawn in its own colour and can be clicked.
+  triangleBody: { type: Array, default: null },
+  // body indices currently ticked for conversion
+  selected: { type: Array, default: () => [] },
+  // body index under the cursor in the list, highlighted in the scene
+  hovered: { type: Number, default: -1 },
 })
+const emit = defineEmits(['pick', 'hover'])
 
 const host = ref(null)
 const rawSize = ref(null)  // in file units
@@ -20,6 +28,19 @@ const dims = computed(() =>
   rawSize.value && rawSize.value.map((v) => (v * props.unitScale).toFixed(1)))
 
 let renderer, scene, camera, controls, mesh, grid, frameId, resizeObs
+let raycaster, pointer, triToBody = null, faceStart = null
+
+// One hue per body, walked by the golden angle so neighbours never share a
+// colour. Unselected bodies keep the hue but drop to a low saturation, so
+// what will be converted reads at a glance without hiding the rest.
+const PICKED = new THREE.Color(), MUTED = new THREE.Color(), HOVER = new THREE.Color(0xffffff)
+function bodyColor(i, isSelected, isHovered) {
+  if (isHovered) return HOVER
+  const hue = (i * 0.381966) % 1
+  return isSelected
+    ? PICKED.setHSL(hue, 0.62, 0.62)
+    : MUTED.setHSL(hue, 0.10, 0.30)
+}
 
 onMounted(() => {
   scene = new THREE.Scene()
@@ -42,6 +63,13 @@ onMounted(() => {
   const rim = new THREE.DirectionalLight(0x5ad2ea, 0.25)
   rim.position.set(-2, -1, -1)
   scene.add(rim)
+
+  raycaster = new THREE.Raycaster()
+  pointer = new THREE.Vector2()
+  renderer.domElement.addEventListener('pointerdown', onPointerDown)
+  renderer.domElement.addEventListener('pointerup', onPointerUp)
+  renderer.domElement.addEventListener('pointermove', onPointerMove)
+  renderer.domElement.addEventListener('pointerleave', () => emit('hover', -1))
 
   resizeObs = new ResizeObserver(resize)
   resizeObs.observe(host.value)
@@ -67,6 +95,78 @@ function parseObj(data) {
   if (!parts.length) throw new Error('OBJ contains no faces')
   return parts.length === 1 ? parts[0] : mergeGeometries(parts, false)
 }
+
+// Paint every triangle from its body's colour. The geometry is
+// non-indexed (STL always, OBJ after the merge above), so triangle t owns
+// vertices 3t..3t+2 and one pass over the array is enough.
+function paintBodies() {
+  if (!mesh || !triToBody) return
+  const pos = mesh.geometry.getAttribute('position')
+  const nTri = pos.count / 3
+  let attr = mesh.geometry.getAttribute('color')
+  if (!attr || attr.count !== pos.count) {
+    attr = new THREE.BufferAttribute(new Float32Array(pos.count * 3), 3)
+    mesh.geometry.setAttribute('color', attr)
+  }
+  const picked = new Set(props.selected)
+  for (let t = 0; t < nTri; t++) {
+    const b = triToBody[t]
+    const c = bodyColor(b, picked.has(b), b === props.hovered)
+    for (let k = 0; k < 3; k++) attr.setXYZ(t * 3 + k, c.r, c.g, c.b)
+  }
+  attr.needsUpdate = true
+  mesh.material.vertexColors = true
+  mesh.material.color.set(0xffffff)
+  mesh.material.needsUpdate = true
+}
+
+// Which body is under the pointer, or -1.
+function bodyAt(ev) {
+  if (!mesh || !triToBody || !raycaster) return -1
+  const r = renderer.domElement.getBoundingClientRect()
+  pointer.set(((ev.clientX - r.left) / r.width) * 2 - 1,
+              -((ev.clientY - r.top) / r.height) * 2 + 1)
+  raycaster.setFromCamera(pointer, camera)
+  const hit = raycaster.intersectObject(mesh, false)[0]
+  if (!hit || hit.faceIndex == null) return -1
+  const b = triToBody[hit.faceIndex]
+  return b == null ? -1 : b
+}
+
+// A drag that orbits must not also toggle a body, so only a press and
+// release in nearly the same place counts as a click.
+let downAt = null
+function onPointerDown(ev) { downAt = [ev.clientX, ev.clientY] }
+function onPointerUp(ev) {
+  if (!downAt) return
+  const moved = Math.hypot(ev.clientX - downAt[0], ev.clientY - downAt[1])
+  downAt = null
+  if (moved > 4) return
+  const b = bodyAt(ev)
+  if (b >= 0) emit('pick', b)
+}
+let hoverRaf = 0
+function onPointerMove(ev) {
+  if (!triToBody || hoverRaf) return
+  hoverRaf = requestAnimationFrame(() => {
+    hoverRaf = 0
+    const b = bodyAt(ev)
+    if (b !== props.hovered) emit('hover', b)
+    renderer.domElement.style.cursor = b >= 0 ? 'pointer' : ''
+  })
+}
+
+watch(() => props.triangleBody, (t) => {
+  triToBody = t && t.length ? t : null
+  if (!triToBody && mesh) {
+    mesh.geometry.deleteAttribute('color')
+    mesh.material.vertexColors = false
+    mesh.material.color.set(0x9aa7b5)
+    mesh.material.needsUpdate = true
+  }
+  paintBodies()
+}, { immediate: true })
+watch(() => [props.selected, props.hovered], paintBodies, { deep: true })
 
 function loadMesh({ data, kind }) {
   if (mesh) {
@@ -105,6 +205,7 @@ function loadMesh({ data, kind }) {
   mesh = new THREE.Mesh(geo, mat)
   mesh.rotation.x = -Math.PI / 2
   scene.add(mesh)
+  paintBodies()
 
   const span = Math.max(size.x, size.y, size.z)
   grid = new THREE.GridHelper(span * 3, 30, 0x3a4350, 0x242a33)
@@ -137,6 +238,10 @@ function animate() {
 
 onBeforeUnmount(() => {
   cancelAnimationFrame(frameId)
+  cancelAnimationFrame(hoverRaf)
+  renderer?.domElement.removeEventListener('pointerdown', onPointerDown)
+  renderer?.domElement.removeEventListener('pointerup', onPointerUp)
+  renderer?.domElement.removeEventListener('pointermove', onPointerMove)
   resizeObs?.disconnect()
   controls?.dispose()
   renderer?.dispose()
@@ -148,7 +253,9 @@ onBeforeUnmount(() => {
     <div v-if="dims" class="callout num">
       {{ dims[0] }} × {{ dims[1] }} × {{ dims[2] }} mm
     </div>
-    <div class="hint micro">drag to rotate · scroll to zoom</div>
+    <div class="hint micro">
+      drag to rotate · scroll to zoom<span v-if="triangleBody"> · click a body to select it</span>
+    </div>
   </div>
 </template>
 

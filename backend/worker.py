@@ -15,7 +15,16 @@ def main():
         params = json.load(f)
 
     from stl2prism import run
-    from .analysis import sanitize, step_stats
+    from .analysis import sanitize, step_stats, body_list
+
+    # The UI picks shells by their index in /bodies (every connected shell
+    # of the raw mesh). Preparation folds cavities into their parent and
+    # drops slivers, so those indices do not address the prepared list:
+    # translate them to the shell keys pipeline._pick_bodies matches on.
+    picked = params.get('bodies')
+    if picked:
+        shells = body_list(in_path)['bodies']
+        picked = [tuple(shells[i]['key']) for i in picked if 0 <= i < len(shells)]
 
     result = {'ok': False, 'error': None, 'mode': None,
               'metrics': None, 'output_stats': None, 'params': params}
@@ -30,6 +39,7 @@ def main():
                 units=params.get('units', 'mm'),
                 reduce_tol=params.get('reduce_tol', 0.05),
                 face_groups=params.get('face_groups', True),
+                bodies=picked or None,
                 verbose=True)
         # Pass the whole pipeline result through (mode, metrics, and for
         # multi-body files the per-body list and counts).

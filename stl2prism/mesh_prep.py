@@ -21,6 +21,12 @@ SUPPORTED_EXTS = ('.stl', '.obj', '.ply', '.off', '.3mf', '.glb', '.gltf')
 UNIT_SCALE = {'mm': 1.0, 'cm': 10.0, 'm': 1000.0, 'in': 25.4, 'ft': 304.8}
 
 
+# A hand-held or benchtop part: anything outside this in mm wants a second
+# look at the unit. The upper bound is generous (a 1.5 m mesh could be a
+# real machine frame) but a part that size is still worth flagging.
+PLAUSIBLE_MM = (3.0, 600.0)
+
+
 def suggest_units(m):
     """Guess the file's unit from its bounding box: a mechanical part is a
     few mm to a metre or so. Returns one of UNIT_SCALE's keys; a hint for
@@ -33,6 +39,38 @@ def suggest_units(m):
     if ext > 5000.0:       # 5 m in mm? more likely a micron/point export — keep mm
         return 'mm'
     return 'mm'
+
+
+def unit_warning(m):
+    """A note for the UI when the mesh, read as mm, is an implausible size
+    for a part, or None.
+
+    Meshes carry no unit and the cost of getting it wrong is high: the whole
+    conversion runs at the wrong scale, every tolerance means something
+    different, and it is only obvious once the STEP is open in CAD. A file
+    authored in cm but written as mm reads 10x too big, which is exactly
+    what a 1.5 m "hand controller" turned out to be.
+    """
+    ext = float(np.max(m.bounding_box.primitive.extents)) if len(m.vertices) else 0.0
+    if ext <= 0:
+        return None
+    lo, hi = PLAUSIBLE_MM
+    # 'scale' is what the mesh must be multiplied by to look sane. A file
+    # written 10x too big needs 0.1, which no unit in UNIT_SCALE offers:
+    # the unit dropdown only multiplies, so such a file is reported with a
+    # scale and no unit, and the UI says to rescale the mesh.
+    if ext > hi or ext < lo:
+        for scale in (0.1, 0.01, 0.001, 25.4, 1000.0, 10.0):
+            if lo <= ext * scale <= hi:
+                unit = next((k for k, v in UNIT_SCALE.items() if v == scale), None)
+                return {'size_mm': round(ext, 3),
+                        'too': 'big' if ext > hi else 'small',
+                        'scale': scale, 'unit': unit,
+                        'would_be': round(ext * scale, 1)}
+        return {'size_mm': round(ext, 3),
+                'too': 'big' if ext > hi else 'small',
+                'scale': None, 'unit': None, 'would_be': None}
+    return None
 
 
 def load_mesh(path, weld_tol=None):

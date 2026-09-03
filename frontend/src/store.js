@@ -37,10 +37,21 @@ export const useConvertStore = defineStore('convert', {
     error: null,
     // server-side view of a running job ('queued' | 'running')
     serverStatus: null,
+    // every connected shell of the upload, largest first (/bodies)
+    bodies: [],
+    // triangle -> body index, for colouring and picking in the viewer
+    triangleBody: null,
+    bodiesTruncated: false,
+    // body indices ticked for conversion; empty means "all of them"
+    selected: [],
+    hovered: -1,
   }),
 
   getters: {
     busy: (s) => s.status === 'uploading' || s.status === 'running',
+    // A file with one body needs no picker at all.
+    hasBodyPicker: (s) => s.bodies.length > 1,
+    selectedCount: (s) => (s.selected.length || s.bodies.length),
     // file units -> mm, for showing input numbers the way the pipeline sees them
     unitScale: (s) => UNITS.find((u) => u.key === s.params.units)?.scale ?? 1,
     downloadUrl: (s) =>
@@ -77,10 +88,41 @@ export const useConvertStore = defineStore('convert', {
         const data = await res.json()
         this.$patch({
           status: 'ready', jobId: data.id, inputStats: data.input_stats,
+          bodies: [], triangleBody: null, selected: [], hovered: -1,
         })
+        this.loadBodies()
       } catch (e) {
         this.$patch({ status: 'error', error: `Upload failed: ${e.message}` })
       }
+    },
+
+    // The shell list is what makes a 72-body file usable: without it the
+    // only choice is "convert everything", which on such a file is hours.
+    async loadBodies() {
+      if (!this.jobId) return
+      try {
+        const res = await fetch(`/api/jobs/${this.jobId}/bodies`)
+        if (!res.ok) return
+        const d = await res.json()
+        this.$patch({
+          bodies: d.bodies || [],
+          triangleBody: d.triangle_body || null,
+          bodiesTruncated: !!d.truncated,
+          // Preselect the bodies worth converting (see DEFAULT_PICK_FRAC):
+          // on a controller that is the housing halves, not the 70 screws.
+          selected: (d.bodies || []).filter((b) => b.suggested).map((b) => b.index),
+        })
+      } catch (e) { /* the picker is optional; conversion still works */ }
+    },
+
+    toggleBody(i) {
+      const at = this.selected.indexOf(i)
+      if (at >= 0) this.selected.splice(at, 1)
+      else this.selected.push(i)
+    },
+    selectAllBodies() { this.selected = this.bodies.map((b) => b.index) },
+    selectSuggestedBodies() {
+      this.selected = this.bodies.filter((b) => b.suggested).map((b) => b.index)
     },
 
     async convert() {
@@ -90,7 +132,14 @@ export const useConvertStore = defineStore('convert', {
         const res = await fetch(`/api/jobs/${this.jobId}/convert`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify(this.params),
+          // Only send a selection when it is a real subset: an empty or
+          // complete list means "everything", which the API takes as null.
+          body: JSON.stringify({
+            ...this.params,
+            bodies: this.selected.length && this.selected.length < this.bodies.length
+              ? [...this.selected].sort((a, b) => a - b)
+              : null,
+          }),
         })
         if (!res.ok) throw new Error(await errText(res))
         this.startPolling()

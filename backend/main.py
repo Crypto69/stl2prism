@@ -15,7 +15,7 @@ from pydantic import BaseModel, Field
 from stl2prism.mesh_prep import SUPPORTED_EXTS
 
 from . import jobs
-from .analysis import sanitize, mesh_stats
+from .analysis import sanitize, mesh_stats, body_list
 
 _EXT_RE = re.compile(r'\.(' + '|'.join(e.lstrip('.') for e in SUPPORTED_EXTS)
                      + r')$', re.IGNORECASE)
@@ -71,6 +71,9 @@ class ConvertParams(BaseModel):
                               description='faceted output: decimate curved regions within this deviation, mm (0 = off)')
     # STL/OBJ carry no units; this says what the file's numbers mean.
     units: Literal['mm', 'cm', 'm', 'in', 'ft'] = 'mm'
+    # Which shells to convert, as indices into /bodies (largest first).
+    # None converts every body, as before.
+    bodies: list[int] | None = None
 
 
 @app.post('/api/jobs')
@@ -124,6 +127,22 @@ def job_state(job_id: str):
     if state is None:
         raise HTTPException(404, 'unknown job')
     return state
+
+
+@app.get('/api/jobs/{job_id}/bodies')
+async def bodies(job_id: str):
+    """Every connected shell of the uploaded mesh, largest first, with the
+    triangle -> body map the viewer colours and picks with."""
+    job = jobs.get(job_id)
+    if job is None:
+        raise HTTPException(404, 'unknown job')
+    src = os.path.join(jobs.job_dir(job_id), job.get('input', ''))
+    if not job.get('input') or not os.path.exists(src):
+        raise HTTPException(404, 'no input file')
+    try:
+        return sanitize(await run_in_threadpool(body_list, src))
+    except Exception as e:
+        raise HTTPException(400, f'could not split mesh: {e}')
 
 
 @app.get('/api/jobs/{job_id}/preview')
