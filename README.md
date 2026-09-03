@@ -274,6 +274,20 @@ volume ≤ 2 %). "faces" = ADVANCED_FACE count in the STEP.
 The remaining planar faces on the face-group parts are blends (tapered
 corner fillets, free-form) that v1 keeps as exact facets.
 
+v0.3.9 (pick the bodies to convert): a file's connected bodies are listed
+on upload and drawn in the viewer, each in its own colour, and clicking
+one selects it. Only the ticked bodies are converted. A 68-body
+controller where two housing halves were wanted took 18 minutes to
+convert all 71 solids; the two take about 10. The default ticks every
+body down to 5% of the largest, which is the housing halves and none of
+the 70 screws. The selection travels as a shell identity (face count,
+proportions, position and size as fractions of the file), not an index:
+preparation folds cavities into their parent body, so the list the UI
+shows and the list the pipeline converts diverge, and an index would
+silently select the wrong part. A mesh whose size is implausible for a
+part is flagged before conversion rather than after — that controller
+reads 1499 mm across, ten times too big, which no input unit corrects.
+
 v0.3.8 (cavities as inner shells): a body's cavities are added to its
 solid as inner shells, the way OCC and STEP represent a hollow solid,
 instead of being subtracted with a fuzzy boolean. The cut had the kernel
