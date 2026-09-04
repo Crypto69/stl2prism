@@ -133,6 +133,16 @@ def running():
     return jobs.running_summary()
 
 
+@app.post('/api/jobs/{job_id}/cancel')
+def cancel(job_id: str):
+    """Stop a running conversion. A long file can run for tens of minutes,
+    and until now the only way out was to wait or restart the server."""
+    what = jobs.cancel(job_id)
+    if what == 'unknown':
+        raise HTTPException(404, 'unknown job')
+    return {'id': job_id, 'status': what}
+
+
 @app.get('/api/jobs/{job_id}')
 def job_state(job_id: str):
     state = jobs.public_state(job_id)

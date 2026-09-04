@@ -727,3 +727,92 @@ def test_a_single_completed_run_is_still_reported_done(tmp_path, monkeypatch):
     jobs._jobs.clear()
     st = jobs.public_state(jid)
     assert st['status'] == 'done' and st['result']['ok'] is True
+
+
+# --- cancelling a conversion ------------------------------------------------
+
+def test_cancel_of_an_unknown_job_is_unknown(tmp_path, monkeypatch):
+    from backend import jobs
+    monkeypatch.setattr(jobs, 'DATA_DIR', str(tmp_path))
+    jobs._jobs.clear()
+    assert jobs.cancel('000000000000') == 'unknown'
+
+
+def test_cancel_of_a_finished_job_says_it_is_not_running(tmp_path, monkeypatch):
+    from backend import jobs
+    monkeypatch.setattr(jobs, 'DATA_DIR', str(tmp_path))
+    with jobs._lock:
+        jobs._jobs.clear()
+        jobs._jobs['fin'] = {'id': 'fin', 'status': 'done', 'proc': None}
+    try:
+        assert jobs.cancel('fin') == 'not_running'
+    finally:
+        with jobs._lock:
+            jobs._jobs.clear()
+
+
+def test_cancel_stops_a_real_process_and_its_children(tmp_path, monkeypatch):
+    """The worker runs a pool of its own. Cancelling must take the group,
+    or a conversion keeps running invisibly after the user stopped it."""
+    import os
+    import subprocess
+    import time as _time
+    from backend import jobs
+    monkeypatch.setattr(jobs, 'DATA_DIR', str(tmp_path))
+    # a process that spawns a child and both sleep, like worker + pool
+    script = ('import subprocess, time; '
+              'subprocess.Popen(["sleep", "120"]); time.sleep(120)')
+    proc = subprocess.Popen([__import__('sys').executable, '-c', script],
+                            start_new_session=True)
+    _time.sleep(1.5)
+    child = subprocess.run(['pgrep', '-P', str(proc.pid)],
+                           capture_output=True, text=True).stdout.split()
+    assert child, 'the fixture never spawned its child'
+    kid = int(child[0])
+    with jobs._lock:
+        jobs._jobs.clear()
+        jobs._jobs['run'] = {'id': 'run', 'status': 'running', 'proc': proc}
+    try:
+        assert jobs.cancel('run') == 'cancelled'
+        _time.sleep(1)
+        assert proc.poll() is not None, 'the worker survived the cancel'
+        # the child must go with the group, not be orphaned
+        alive = subprocess.run(['ps', '-p', str(kid)],
+                               capture_output=True, text=True).returncode == 0
+        assert not alive, f'pool child {kid} was left running'
+    finally:
+        for p in (proc.pid, kid):
+            try:
+                os.kill(p, 9)
+            except OSError:
+                pass
+        with jobs._lock:
+            jobs._jobs.clear()
+
+
+def test_a_cancelled_job_is_not_reported_as_a_failure(tmp_path, monkeypatch):
+    """Stopping on purpose is its own state: not an error to explain, and
+    never the earlier run's success."""
+    import json as _json
+    from backend import jobs
+    monkeypatch.setattr(jobs, 'DATA_DIR', str(tmp_path))
+    jid = 'cancelled123'
+    d = tmp_path / jid
+    d.mkdir()
+    (d / 'log.txt').write_text('[progress] 3/18 shells\n')
+    (d / 'result.json').write_text(_json.dumps({'ok': True}))   # an earlier run
+    with jobs._lock:
+        jobs._jobs.clear()
+        jobs._jobs[jid] = {'id': jid, 'status': 'cancelled', 'proc': None,
+                           'stale_result': True,
+                           'killed': {'signal': None, 'kind': 'cancelled',
+                                      'message': 'Conversion cancelled.'}}
+    try:
+        st = jobs.public_state(jid)
+        assert st['status'] == 'cancelled'
+        assert st['result']['failure'] == 'cancelled'
+        assert st['result']['ok'] is False
+        assert '[progress] 3/18' in st['log']
+    finally:
+        with jobs._lock:
+            jobs._jobs.clear()

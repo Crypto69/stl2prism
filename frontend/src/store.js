@@ -40,6 +40,10 @@ export const useConvertStore = defineStore('convert', {
     error: null,
     // server-side view of a running job ('queued' | 'running')
     serverStatus: null,
+    // a cancel request is in flight
+    cancelling: false,
+    // the last run was stopped by the user
+    cancelled: false,
     // every connected shell of the upload, largest first (/bodies)
     bodies: [],
     // triangle -> body index, for colouring and picking in the viewer
@@ -134,7 +138,8 @@ export const useConvertStore = defineStore('convert', {
 
     async convert() {
       if (!this.jobId) return
-      this.$patch({ status: 'running', log: '', result: null, error: null })
+      this.$patch({ status: 'running', log: '', result: null, error: null,
+                    cancelled: false })
       try {
         const res = await fetch(`/api/jobs/${this.jobId}/convert`, {
           method: 'POST',
@@ -155,6 +160,22 @@ export const useConvertStore = defineStore('convert', {
       }
     },
 
+    // A conversion can run for tens of minutes; before this the only way
+    // out was to wait it out or restart the server.
+    async cancel() {
+      if (!this.jobId || this.status !== 'running') return
+      this.cancelling = true
+      try {
+        const res = await fetch(`/api/jobs/${this.jobId}/cancel`, { method: 'POST' })
+        if (!res.ok) throw new Error(await errText(res))
+        // the poll sees the job stop and reports it; nothing to set here
+      } catch (e) {
+        this.$patch({ error: `Could not cancel: ${e.message}` })
+      } finally {
+        this.cancelling = false
+      }
+    },
+
     startPolling() {
       this.stopPolling()
       pollTimer = setInterval(async () => {
@@ -164,11 +185,17 @@ export const useConvertStore = defineStore('convert', {
           const s = await res.json()
           this.log = s.log || ''
           this.serverStatus = s.status
-          if (s.status === 'done' || s.status === 'error') {
+          if (s.status === 'done' || s.status === 'error' || s.status === 'cancelled') {
             this.stopPolling()
             this.result = s.result
             if (s.status === 'done' && s.result?.ok) {
               this.status = 'done'
+            } else if (s.status === 'cancelled') {
+              // stopping on purpose is not a failure: say so plainly and
+              // leave the file ready to convert again
+              this.status = 'ready'
+              this.error = null
+              this.cancelled = true
             } else {
               this.status = 'error'
               this.error = s.result?.error || 'Conversion failed — see log.'

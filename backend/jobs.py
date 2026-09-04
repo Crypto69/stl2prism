@@ -6,6 +6,7 @@ One directory per job under DATA_DIR:
 import json
 import os
 import shutil
+import signal
 import subprocess
 import sys
 import threading
@@ -13,6 +14,8 @@ import time
 import uuid
 
 DATA_DIR = os.environ.get('STL2PRISM_DATA', os.path.join(os.getcwd(), 'data'))
+# Seconds a cancelled worker gets to stop politely before it is killed.
+CANCEL_GRACE_S = 5
 MAX_AGE_S = int(os.environ.get('STL2PRISM_JOB_TTL', 24 * 3600))
 
 _lock = threading.Lock()
@@ -110,7 +113,10 @@ def _run(job_id):
              os.path.join(d, input_name), os.path.join(d, 'output.step'),
              os.path.join(d, 'params.json'), os.path.join(d, 'result.json')],
             stdout=log, stderr=subprocess.STDOUT,
-            cwd=os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+            cwd=os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+            # its own process group: cancelling signals the group, so the
+            # worker's shell pool goes with it instead of being orphaned
+            start_new_session=True)
         log.close()
         with _lock:
             _jobs[job_id]['proc'] = proc
@@ -120,6 +126,15 @@ def _run(job_id):
             if job is None:
                 return
             job['proc'] = None
+            if job.pop('cancelling', False):
+                # The user stopped it: a state of its own, not a failure to
+                # explain and not a success. Any result.json in the
+                # directory belongs to an earlier run, so it is withheld.
+                job['status'] = 'cancelled'
+                job['killed'] = {'signal': None, 'kind': 'cancelled',
+                                 'message': 'Conversion cancelled.'}
+                job['stale_result'] = True
+                return
             job['status'] = 'done' if code == 0 else 'error'
             # A worker the kernel kills never gets to write result.json or
             # even a traceback: the log simply stops. Without this the UI
@@ -168,7 +183,7 @@ def public_state(job_id):
             out['log'] = f.read()
     except OSError:
         out['log'] = ''
-    if job['status'] in ('done', 'error'):
+    if job['status'] in ('done', 'error', 'cancelled'):
         try:
             if job.get('stale_result'):
                 raise OSError('result belongs to an earlier run')
@@ -184,6 +199,40 @@ def public_state(job_id):
             out['result'] = {'ok': False, 'error': job['killed']['message'],
                              'failure': job['killed']['kind']}
     return out
+
+
+def cancel(job_id):
+    """Stop a running conversion. Returns 'cancelled', 'not_running' or
+    'unknown'.
+
+    The worker is asked to stop with SIGTERM and given a moment to go, then
+    killed. Its own children (the shell pool) die with it: Popen puts the
+    worker in its own process group, so the signal goes to the group and no
+    orphan is left converting in the background.
+    """
+    job = get(job_id)
+    if job is None:
+        return 'unknown'
+    with _lock:
+        proc = job.get('proc')
+        if proc is None or job['status'] not in ('queued', 'running'):
+            return 'not_running'
+        job['cancelling'] = True
+    try:
+        os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+    except (ProcessLookupError, PermissionError, OSError):
+        try:
+            proc.terminate()
+        except Exception:
+            pass
+    try:
+        proc.wait(timeout=CANCEL_GRACE_S)
+    except subprocess.TimeoutExpired:
+        try:
+            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+        except (ProcessLookupError, PermissionError, OSError):
+            proc.kill()
+    return 'cancelled'
 
 
 def running_summary():

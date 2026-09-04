@@ -127,6 +127,16 @@ const canConvert = computed(
              : store.status === 'uploading' ? 'Uploading…'
              : 'Convert to STEP' }}
         </button>
+        <button
+          v-if="store.status === 'running'"
+          class="cancel"
+          :disabled="store.cancelling"
+          @click="store.cancel()"
+        >{{ store.cancelling ? 'Stopping…' : 'Cancel' }}</button>
+        <p v-if="store.cancelled" class="cancelled micro">
+          Conversion cancelled. Your selection is still here — convert again
+          when you are ready.
+        </p>
         <ReportPanel />
       </aside>
     </main>
@@ -252,6 +262,19 @@ const canConvert = computed(
   gap: 8px;
 }
 .convert:disabled { background: var(--line); color: var(--muted); cursor: default; }
+
+.cancel {
+  padding: 9px;
+  border-radius: 6px;
+  border: 1px solid var(--line);
+  background: none;
+  color: var(--muted);
+  font-weight: 600;
+  font-size: 13px;
+}
+.cancel:not(:disabled):hover { color: var(--fail); border-color: var(--fail); }
+.cancel:disabled { opacity: 0.6; cursor: default; }
+.cancelled { color: var(--muted); line-height: 1.45; }
 .convert:not(:disabled):hover { filter: brightness(1.1); }
 
 .spin {
