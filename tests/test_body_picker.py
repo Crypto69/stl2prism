@@ -464,3 +464,65 @@ def test_body_list_marks_open_shells(tmp_path):
     assert by[12]['volume'] == pytest.approx(64000)
     assert by[4]['watertight'] is False
     assert by[4]['volume'] is None             # no volume without a closed shell
+
+
+# --- selections a real file will produce ------------------------------------
+
+def test_picking_among_identical_twins_picks_the_ones_asked_for(tmp_path):
+    """Four identical screws differ only in where they sit. Picking the
+    second and fourth must convert those two, not any two."""
+    parts = [_box(40)] + [_box(4, (100 + 20 * k, 0, 0)) for k in range(4)]
+    stl = str(tmp_path / 'screws.stl')
+    trimesh.util.concatenate(parts).export(stl)
+    keys = [tuple(b['key']) for b in body_list(stl)['bodies']]
+    out = str(tmp_path / 'two.step')
+    r = pipeline.run(stl, out, verbose=False, write_script=False,
+                     bodies=[keys[2], keys[4]], workers=0)
+    assert r['n_written'] == 2
+    assert [round(v) for _, v in synth.solid_stats(out)] == [64, 64]
+    # the two chosen screws sit at x=120 and x=160, so the span is 118..162:
+    # proof it took those two and not the block or the first pair
+    from OCP.Bnd import Bnd_Box
+    from OCP.BRepBndLib import BRepBndLib
+    b = Bnd_Box()
+    BRepBndLib.Add_s(synth.read_step(out), b)
+    g = np.array(b.Get())
+    assert g[0] == pytest.approx(118.0, abs=0.1)
+    assert g[3] == pytest.approx(162.0, abs=0.1)
+
+
+def test_picking_a_hollow_body_keeps_its_cavity(tmp_path):
+    """The cavity is not a separate pick: it travels with its body."""
+    v = _box(20)
+    v.invert()
+    stl = str(tmp_path / 'hollow.stl')
+    trimesh.util.concatenate([_box(40), v]).export(stl)
+    keys = [tuple(b['key']) for b in body_list(stl)['bodies']]
+    out = str(tmp_path / 'hollow.step')
+    r = pipeline.run(stl, out, verbose=False, write_script=False,
+                     bodies=[keys[0]], workers=0)
+    assert r['n_written'] == 1
+    assert [round(v) for _, v in synth.solid_stats(out)] == [40 ** 3 - 20 ** 3]
+
+
+def test_body_list_survives_a_single_body_file(tmp_path):
+    stl = str(tmp_path / 'one.stl')
+    _box(40).export(stl)
+    d = body_list(stl)
+    assert len(d['bodies']) == 1 and d['bodies'][0]['suggested'] is True
+    assert set(d['triangle_body']) == {0}
+
+
+def test_body_list_keys_stay_unique_on_the_hard_cases(tmp_path):
+    """A key that repeats would let one body be picked and another
+    converted. Twins, nesting and slivers are where that would happen."""
+    cav = _box(20)
+    cav.invert()
+    sliver = trimesh.Trimesh(vertices=[[80, 0, 0], [81, 0, 0], [80, 1, 0], [80, 0, 1]],
+                             faces=[[0, 1, 2], [0, 2, 3]], process=False)
+    parts = [_box(40), cav, sliver] + [_box(4, (100 + 20 * k, 0, 0)) for k in range(4)]
+    stl = str(tmp_path / 'hard.stl')
+    trimesh.util.concatenate(parts).export(stl)
+    d = body_list(stl)
+    keys = [tuple(b['key']) for b in d['bodies']]
+    assert len(set(keys)) == len(keys)
