@@ -48,6 +48,36 @@ _FACE_KINDS = ('PLANE', 'CYLINDRICAL_SURFACE', 'CONICAL_SURFACE',
                'SPHERICAL_SURFACE', 'TOROIDAL_SURFACE', 'B_SPLINE_SURFACE')
 
 
+def _solid_check(path):
+    """(solids, closed) by reading the STEP back, or (None, None) if it
+    cannot be read.
+
+    `closed` is False when the file carries open shells: geometry a CAD
+    package imports as surfaces rather than bodies you can model against.
+    """
+    try:
+        from OCP.TopExp import TopExp_Explorer
+        from OCP.TopAbs import TopAbs_SOLID
+        from OCP.STEPControl import STEPControl_Reader
+
+        reader = STEPControl_Reader()
+        if reader.ReadFile(path) != 1:      # IFSelect_RetDone
+            return None, None
+        reader.TransferRoots()
+        shape = reader.OneShape()
+        if shape.IsNull():
+            return None, None
+        n = 0
+        e = TopExp_Explorer(shape, TopAbs_SOLID)
+        while e.More():
+            n += 1
+            e.Next()
+        from stl2prism.rebuild import _naked_edges
+        return n, _naked_edges(shape) == 0
+    except Exception:
+        return None, None
+
+
 def step_stats(path):
     """Cheap textual scan of the STEP file: face count and surface types.
 
@@ -72,10 +102,18 @@ def step_stats(path):
                 kinds[name] += 1
             elif name.startswith('B_SPLINE_SURFACE'):
                 kinds['B_SPLINE_SURFACE'] += 1
+    # The entity count says what the writer *claimed*; reading the file back
+    # says what a CAD package will actually find. They disagree exactly
+    # where it matters: an open shell is written as a MANIFOLD_SOLID_BREP
+    # but imports as surfaces, so reporting "2 solids" for a file holding
+    # none is the one number a user must not be given wrongly.
+    real_solids, closed = _solid_check(path)
     return {
         'file_size': os.path.getsize(path),
         'faces': faces,
-        'solids': solids,
+        'solids': real_solids if real_solids is not None else solids,
+        'solids_claimed': solids,
+        'closed': closed,
         'surface_types': {
             'planes': kinds['PLANE'],
             'cylinders': kinds['CYLINDRICAL_SURFACE'],

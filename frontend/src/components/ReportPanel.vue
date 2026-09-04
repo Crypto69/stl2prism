@@ -156,12 +156,22 @@ const notes = computed(() => {
   return out
 })
 
+// A finished conversion whose STEP carries no solid: written from bodies
+// that were never closed, so it is surfaces only.
+const openResult = computed(() => {
+  const o = store.result?.ok ? store.result.output_stats : null
+  return !!o && o.solids === 0
+})
+
 const outputRows = computed(() => {
   const r = store.result
   if (!r?.ok) return []
   const o = r.output_stats
   const rows = [['BREP faces', o.faces.toLocaleString()]]
-  if (o.solids > 1) rows.push(['Solids', o.solids.toLocaleString()])
+  // Always show the count when it is 0: a STEP of open shells writes the
+  // solid entity anyway, so "0 solids" is the one number that tells the
+  // user their file holds surfaces rather than bodies.
+  if (o.solids > 1 || o.solids === 0) rows.push(['Solids', String(o.solids)])
   const t = o.surface_types
   const kinds = [
     ['planes', t.planes], ['cylinders', t.cylinders], ['cones', t.cones],
@@ -283,6 +293,14 @@ const reduction = computed(() => {
       </p>
     </section>
 
+    <section v-if="openResult" class="openbox">
+      <h3 class="micro">Surfaces, not solids</h3>
+      <p>
+        The STEP holds no closed solid, because the chosen bodies were not
+        watertight. It will import as surfaces, which you can measure and
+        reference but not model against or cut.
+      </p>
+    </section>
     <section v-if="store.error" ref="verdictEl" class="errorbox">
       <h2 class="micro">Failed</h2>
       <p>{{ store.error }}</p>
@@ -362,6 +380,16 @@ th { text-align: left; font-weight: 600; }
   text-decoration: none;
 }
 .download:hover { filter: brightness(1.1); }
+
+.openbox {
+  border: 1px solid rgba(240, 173, 78, 0.45);
+  border-left-width: 3px;
+  background: rgba(240, 173, 78, 0.08);
+  border-radius: 4px;
+  padding: 10px 12px;
+}
+.openbox h3 { margin: 0 0 4px; letter-spacing: 0.08em; text-transform: uppercase; }
+.openbox p { font-size: 13px; line-height: 1.5; color: var(--text); margin: 0; }
 
 .errorbox {
   border: 1px solid var(--fail);

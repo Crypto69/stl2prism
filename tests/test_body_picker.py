@@ -526,3 +526,34 @@ def test_body_list_keys_stay_unique_on_the_hard_cases(tmp_path):
     d = body_list(stl)
     keys = [tuple(b['key']) for b in d['bodies']]
     assert len(set(keys)) == len(keys)
+
+
+# --- what the STEP really holds ---------------------------------------------
+
+def test_step_stats_reports_solids_that_are_really_there(tmp_path):
+    """A closed body: claimed and real agree."""
+    from backend.analysis import step_stats
+    stl = str(tmp_path / 'box.stl')
+    _box(40).export(stl)
+    out = str(tmp_path / 'box.step')
+    pipeline.run(stl, out, verbose=False, write_script=False)
+    st = step_stats(out)
+    assert st['solids'] == 1 and st['solids_claimed'] == 1
+    assert st['closed'] is True
+
+
+def test_step_stats_does_not_call_an_open_shell_a_solid(tmp_path):
+    """An open shell is written as MANIFOLD_SOLID_BREP but imports as
+    surfaces. Counting the entity told the user '2 solids' for a file that
+    holds none — the one number that must not be wrong."""
+    from backend.analysis import step_stats
+    stl = str(tmp_path / 'open.stl')
+    _open_sheet(w=40.0, h=20.0).export(stl)
+    out = str(tmp_path / 'open.step')
+    try:
+        pipeline.run(stl, out, verbose=False, write_script=False)
+    except Exception:
+        pytest.skip('an open sheet may be refused outright, which is also fine')
+    st = step_stats(out)
+    assert st['solids'] == 0
+    assert st['closed'] is False
