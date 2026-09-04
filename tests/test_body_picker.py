@@ -572,3 +572,73 @@ def test_solid_check_is_skipped_for_a_very_large_step(tmp_path, monkeypatch):
     st = analysis.step_stats(out)
     assert st['solids'] == st['solids_claimed'] == 1
     assert st['closed'] is None                                   # not checked
+
+
+# --- surviving a restart ----------------------------------------------------
+
+def test_a_finished_job_survives_a_restart(tmp_path, monkeypatch):
+    """The registry is in memory, so a restart forgot every job while its
+    files sat on disk: the user was told 'unknown job' about a conversion
+    whose result was right there."""
+    import json as _json
+    from backend import jobs
+    monkeypatch.setattr(jobs, 'DATA_DIR', str(tmp_path))
+    jid = 'abc123abc123'
+    d = tmp_path / jid
+    d.mkdir()
+    (d / 'input.stl').write_bytes(b'')
+    (d / 'params.json').write_text('{}')
+    (d / 'result.json').write_text(_json.dumps({'ok': True, 'mode': 'prismatic'}))
+    (d / 'log.txt').write_text('[prep] done\n')
+    jobs._jobs.clear()                       # the restart
+    st = jobs.public_state(jid)
+    assert st is not None and st['status'] == 'done'
+    assert st['result']['ok'] is True
+    assert '[prep] done' in st['log']
+
+
+def test_a_job_interrupted_by_a_restart_says_so(tmp_path, monkeypatch):
+    """Converting when the server stopped: not 'unknown job', and not a
+    job that appears to still be running."""
+    from backend import jobs
+    monkeypatch.setattr(jobs, 'DATA_DIR', str(tmp_path))
+    jid = 'def456def456'
+    d = tmp_path / jid
+    d.mkdir()
+    (d / 'input.stl').write_bytes(b'')
+    (d / 'params.json').write_text('{}')     # started, never finished
+    (d / 'log.txt').write_text('[body 1/3] shell started\n')
+    jobs._jobs.clear()
+    st = jobs.public_state(jid)
+    assert st['status'] == 'error'
+    assert 'server restarted' in st['result']['error']
+    assert st['result']['failure'] == 'restart'
+
+
+def test_an_uploaded_but_unconverted_job_survives(tmp_path, monkeypatch):
+    from backend import jobs
+    monkeypatch.setattr(jobs, 'DATA_DIR', str(tmp_path))
+    jid = 'aaa111bbb222'
+    d = tmp_path / jid
+    d.mkdir()
+    (d / 'input.stl').write_bytes(b'')
+    jobs._jobs.clear()
+    st = jobs.public_state(jid)
+    assert st['status'] == 'uploaded'
+
+
+def test_recovery_refuses_a_path_that_is_not_a_job_id(tmp_path, monkeypatch):
+    """A job id names a directory, so it must never carry a path."""
+    from backend import jobs
+    monkeypatch.setattr(jobs, 'DATA_DIR', str(tmp_path))
+    jobs._jobs.clear()
+    for bad in ('..', '.', '../etc', 'a/b', ''):
+        assert jobs.get(bad) is None
+
+
+def test_unknown_job_is_still_unknown(tmp_path, monkeypatch):
+    from backend import jobs
+    monkeypatch.setattr(jobs, 'DATA_DIR', str(tmp_path))
+    jobs._jobs.clear()
+    assert jobs.get('0123456789ab') is None
+    assert jobs.public_state('0123456789ab') is None

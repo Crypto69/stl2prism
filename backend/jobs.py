@@ -40,7 +40,43 @@ def new_job():
 
 def get(job_id):
     with _lock:
-        return _jobs.get(job_id)
+        job = _jobs.get(job_id)
+    return job if job is not None else _recover(job_id)
+
+
+def _recover(job_id):
+    """Rebuild a job's entry from its directory, or None.
+
+    The registry lives in memory, so a restart forgets every job while its
+    files sit on disk untouched: the user is told "unknown job" about a
+    conversion whose result is right there, and a restart mid-run turns a
+    running job into a 404 rather than a failure they can read. Recover
+    what the directory can prove and let the rest be reported honestly.
+    """
+    if not job_id or os.path.sep in job_id or job_id in ('.', '..'):
+        return None
+    d = job_dir(job_id)
+    if not os.path.isdir(d):
+        return None
+    entry = {'id': job_id, 'proc': None, 'recovered': True,
+             'created': os.path.getmtime(d), 'filename': None}
+    try:
+        entry['input'] = next(n for n in os.listdir(d) if n.startswith('input.'))
+    except StopIteration:
+        entry['input'] = None
+    if os.path.exists(os.path.join(d, 'result.json')):
+        entry['status'] = 'done'          # public_state re-reads it and can
+    elif os.path.exists(os.path.join(d, 'params.json')):
+        # it was converting when the server stopped; nothing is running now
+        entry['status'] = 'error'
+        entry['killed'] = {'signal': None, 'kind': 'restart', 'message':
+                           'The server restarted while this conversion was '
+                           'running, so it did not finish. Convert again.'}
+    else:
+        entry['status'] = 'uploaded'
+    with _lock:
+        _jobs.setdefault(job_id, entry)
+        return _jobs[job_id]
 
 
 def start(job_id, filename, params):
