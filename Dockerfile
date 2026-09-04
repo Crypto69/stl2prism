@@ -18,9 +18,13 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         libcom-err2 libp11-kit0 libgpg-error0 \
     && rm -rf /var/lib/apt/lists/*
 WORKDIR /app
-COPY pyproject.toml README.md LICENSE ./
+# constraints.txt pins every dependency (see its header for how it was
+# resolved); without it each rebuild floats to whatever PyPI serves that
+# day, and this stack has proven version-sensitive. Update the pins
+# deliberately, then rebuild.
+COPY pyproject.toml README.md LICENSE constraints.txt ./
 COPY stl2prism/ stl2prism/
-RUN pip install --no-cache-dir --timeout 300 --retries 10 '.[scan]' fastapi 'uvicorn[standard]' python-multipart
+RUN pip install --no-cache-dir --timeout 300 --retries 10 -c constraints.txt '.[scan]' fastapi 'uvicorn[standard]' python-multipart
 COPY backend/ backend/
 COPY --from=webbuild /build/dist frontend/dist
 

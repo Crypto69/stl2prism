@@ -16,9 +16,12 @@ Placeholders used throughout:
 
 ## Step 1 — Check the hardware
 
-- **x86_64 CPU** — required. The scan-repair library (pymeshlab) only ships
-  Linux wheels for x86_64; on an ARM NAS the image as written will not build.
-  The x86_64 NAS (Intel NAS CPU) is x86_64.
+- **x86_64 CPU** — the tested platform. The x86_64 NAS (Intel NAS CPU) is
+  x86_64. Current pymeshlab and cadquery-ocp releases do publish Linux
+  aarch64 wheels, so an ARM NAS is no longer ruled out by packaging alone —
+  but nothing in this stack has been verified on ARM Linux, and the Poisson
+  step has already proven platform-sensitive (it crashes on macOS arm64).
+  Treat ARM as untested, not supported.
 - **RAM** — 8 GB minimum, 16 GB comfortable. A 2-million-triangle scan peaks
   at several GB during Poisson repair.
 
