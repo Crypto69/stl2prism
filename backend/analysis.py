@@ -48,13 +48,24 @@ _FACE_KINDS = ('PLANE', 'CYLINDRICAL_SURFACE', 'CONICAL_SURFACE',
                'SPHERICAL_SURFACE', 'TOROIDAL_SURFACE', 'B_SPLINE_SURFACE')
 
 
+# Reading a STEP back costs about a second per 6 MB. Worth it to tell a
+# user their file holds surfaces rather than solids; not worth a minute on
+# a 371 MB export, where the textual count is reported instead.
+SOLID_CHECK_MAX_BYTES = 150 * 1024 * 1024
+
+
 def _solid_check(path):
-    """(solids, closed) by reading the STEP back, or (None, None) if it
-    cannot be read.
+    """(solids, closed) by reading the STEP back, or (None, None) when it
+    cannot be read or is too large to be worth re-reading.
 
     `closed` is False when the file carries open shells: geometry a CAD
     package imports as surfaces rather than bodies you can model against.
     """
+    try:
+        if os.path.getsize(path) > SOLID_CHECK_MAX_BYTES:
+            return None, None
+    except OSError:
+        return None, None
     try:
         from OCP.TopExp import TopExp_Explorer
         from OCP.TopAbs import TopAbs_SOLID

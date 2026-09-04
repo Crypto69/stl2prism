@@ -557,3 +557,18 @@ def test_step_stats_does_not_call_an_open_shell_a_solid(tmp_path):
     st = step_stats(out)
     assert st['solids'] == 0
     assert st['closed'] is False
+
+
+def test_solid_check_is_skipped_for_a_very_large_step(tmp_path, monkeypatch):
+    """Re-reading costs about a second per 6 MB. On a 371 MB export that is
+    a minute of the user's time for a number the file's own text already
+    gives, so past a cap the textual count stands."""
+    from backend import analysis
+    stl = str(tmp_path / 'box.stl')
+    _box(40).export(stl)
+    out = str(tmp_path / 'box.step')
+    pipeline.run(stl, out, verbose=False, write_script=False)
+    monkeypatch.setattr(analysis, 'SOLID_CHECK_MAX_BYTES', 1)     # force the skip
+    st = analysis.step_stats(out)
+    assert st['solids'] == st['solids_claimed'] == 1
+    assert st['closed'] is None                                   # not checked
