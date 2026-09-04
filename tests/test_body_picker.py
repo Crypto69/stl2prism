@@ -816,3 +816,35 @@ def test_a_cancelled_job_is_not_reported_as_a_failure(tmp_path, monkeypatch):
     finally:
         with jobs._lock:
             jobs._jobs.clear()
+
+
+def test_a_recovered_verdict_is_re_read_when_the_run_finishes(tmp_path, monkeypatch):
+    """A recovered entry is a snapshot of the directory at one moment. If
+    the run it was waiting on finishes afterwards, reporting the old
+    verdict tells the user their conversion failed when it succeeded —
+    which is exactly what happened to a 13-body run."""
+    import json as _json
+    import os
+    import time as _time
+    from backend import jobs
+    monkeypatch.setattr(jobs, 'DATA_DIR', str(tmp_path))
+    jid = 'inflight1234'
+    d = tmp_path / jid
+    d.mkdir()
+    (d / 'input.stl').write_bytes(b'')
+    (d / 'params.json').write_text('{}')          # converting, no result yet
+    (d / 'log.txt').write_text('[progress] 5/18 shells\n')
+    jobs._jobs.clear()
+
+    first = jobs.public_state(jid)
+    assert first['status'] == 'error'             # in flight, nothing running
+
+    # the run finishes: a result lands, newer than the params
+    _time.sleep(0.01)
+    (d / 'result.json').write_text(_json.dumps({'ok': True, 'n_written': 13}))
+    now = _time.time()
+    os.utime(d / 'result.json', (now + 5, now + 5))
+
+    second = jobs.public_state(jid)
+    assert second['status'] == 'done'
+    assert second['result']['n_written'] == 13

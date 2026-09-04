@@ -61,6 +61,19 @@ def _recover(job_id):
     d = job_dir(job_id)
     if not os.path.isdir(d):
         return None
+    entry = _from_disk(job_id)
+    if entry is None:
+        return None
+    with _lock:
+        _jobs.setdefault(job_id, entry)
+        return _jobs[job_id]
+
+
+def _from_disk(job_id):
+    """What the job's directory says about it right now, or None."""
+    d = job_dir(job_id)
+    if not os.path.isdir(d):
+        return None
     entry = {'id': job_id, 'proc': None, 'recovered': True,
              'created': os.path.getmtime(d), 'filename': None}
     try:
@@ -86,9 +99,8 @@ def _recover(job_id):
                            'running, so it did not finish. Convert again.'}
     else:
         entry['status'] = 'uploaded'
-    with _lock:
-        _jobs.setdefault(job_id, entry)
-        return _jobs[job_id]
+        entry['stale_result'] = False
+    return entry
 
 
 def start(job_id, filename, params):
@@ -175,6 +187,18 @@ def public_state(job_id):
     job = get(job_id)
     if job is None:
         return None
+    # A recovered verdict is a snapshot of the directory at the moment it
+    # was read. If the run it was waiting on has since finished, the entry
+    # is stale: re-read rather than reporting a failure for a conversion
+    # that succeeded afterwards.
+    if job.get('recovered') and job.get('proc') is None:
+        fresh = _from_disk(job_id)
+        if fresh is not None and fresh['status'] != job['status']:
+            with _lock:
+                cur = _jobs.get(job_id)
+                if cur is not None and cur.get('proc') is None:
+                    cur.update(fresh)
+                    job = cur
     d = job_dir(job_id)
     out = {'id': job_id, 'status': job['status'],
            'filename': job.get('filename')}
