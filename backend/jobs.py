@@ -64,11 +64,20 @@ def _recover(job_id):
         entry['input'] = next(n for n in os.listdir(d) if n.startswith('input.'))
     except StopIteration:
         entry['input'] = None
-    if os.path.exists(os.path.join(d, 'result.json')):
-        entry['status'] = 'done'          # public_state re-reads it and can
-    elif os.path.exists(os.path.join(d, 'params.json')):
-        # it was converting when the server stopped; nothing is running now
+    res = os.path.join(d, 'result.json')
+    par = os.path.join(d, 'params.json')
+    have_res, have_par = os.path.exists(res), os.path.exists(par)
+    # A job can be converted more than once. params.json is rewritten at the
+    # start of every run and result.json only at the end, so params newer
+    # than result means a later run was still going when the server
+    # stopped — reporting the older run's success would hide that.
+    stale = (have_res and have_par
+             and os.path.getmtime(par) > os.path.getmtime(res) + 1)
+    if have_res and not stale:
+        entry['status'] = 'done'          # public_state re-reads it
+    elif have_par:
         entry['status'] = 'error'
+        entry['stale_result'] = stale
         entry['killed'] = {'signal': None, 'kind': 'restart', 'message':
                            'The server restarted while this conversion was '
                            'running, so it did not finish. Convert again.'}
@@ -161,6 +170,8 @@ def public_state(job_id):
         out['log'] = ''
     if job['status'] in ('done', 'error'):
         try:
+            if job.get('stale_result'):
+                raise OSError('result belongs to an earlier run')
             with open(os.path.join(d, 'result.json')) as f:
                 out['result'] = json.load(f)
         except OSError:

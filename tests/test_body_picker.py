@@ -679,3 +679,51 @@ def test_running_summary_counts_only_live_conversions(tmp_path, monkeypatch):
     finally:
         with jobs._lock:
             jobs._jobs.clear()
+
+
+def test_a_second_run_killed_by_a_restart_does_not_report_the_first_run(tmp_path, monkeypatch):
+    """A job can be converted twice. params.json is rewritten at the start
+    of each run and result.json only at the end, so a params newer than the
+    result means a later run never finished — reporting the earlier run's
+    success would tell the user their conversion worked when it did not."""
+    import json as _json
+    import os
+    import time as _time
+    from backend import jobs
+    monkeypatch.setattr(jobs, 'DATA_DIR', str(tmp_path))
+    jid = 'twicetwice12'
+    d = tmp_path / jid
+    d.mkdir()
+    (d / 'input.stl').write_bytes(b'')
+    (d / 'result.json').write_text(_json.dumps({'ok': True, 'mode': 'prismatic'}))
+    (d / 'log.txt').write_text('[progress] 7/18 shells\n')
+    (d / 'params.json').write_text('{}')
+    # the second run started well after the first one finished
+    old = _time.time() - 600
+    os.utime(d / 'result.json', (old, old))
+    jobs._jobs.clear()
+    st = jobs.public_state(jid)
+    assert st['status'] == 'error'
+    assert st['result']['failure'] == 'restart'
+    assert st['result'].get('ok') is False
+    assert '[progress] 7/18' in st['log']       # the log still shows the truth
+
+
+def test_a_single_completed_run_is_still_reported_done(tmp_path, monkeypatch):
+    """The guard must not turn every recovered job into a failure."""
+    import json as _json
+    import os
+    import time as _time
+    from backend import jobs
+    monkeypatch.setattr(jobs, 'DATA_DIR', str(tmp_path))
+    jid = 'onceonce1234'
+    d = tmp_path / jid
+    d.mkdir()
+    (d / 'input.stl').write_bytes(b'')
+    (d / 'params.json').write_text('{}')
+    (d / 'result.json').write_text(_json.dumps({'ok': True, 'mode': 'prismatic'}))
+    now = _time.time()
+    os.utime(d / 'params.json', (now - 60, now - 60))    # params first, result after
+    jobs._jobs.clear()
+    st = jobs.public_state(jid)
+    assert st['status'] == 'done' and st['result']['ok'] is True
