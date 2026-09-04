@@ -17,9 +17,15 @@ services:
       STL2PRISM_JOB_TTL: "86400"
       # conversions run one at a time; scan repair can peak at several GB
       STL2PRISM_CONCURRENCY: "1"
-      # shells (bodies and their cavities) converted at once inside a job:
-      # two of the four cores, the rest for the kernel's threads and the NAS
-      STL2PRISM_WORKERS: "2"
+      # Shells (bodies and their cavities) converted at once inside a job.
+      # Two of the NAS's four cores, the rest for the kernel's threads and
+      # the NAS's other services. Raise it on a bigger machine by setting
+      # STL2PRISM_WORKERS in the environment: measured 2026-09-04 on the
+      # 72-shell controller, the body split costs ~2.8 GB once and each
+      # extra worker only ~0.5 GB, so four workers converted 13 bodies in
+      # 8.7 min at a 4.2 GB peak (12 GB limit). Four on the NAS would still
+      # be a poor trade: it has four cores and shares them.
+      STL2PRISM_WORKERS: "${STL2PRISM_WORKERS:-2}"
       # seconds a shell may take in a worker before it is built faceted
       # instead (default 900)
       # STL2PRISM_SHELL_TIMEOUT: "900"
