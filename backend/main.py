@@ -125,6 +125,14 @@ def convert(job_id: str, params: ConvertParams):
     return {'id': job_id, 'status': 'running'}
 
 
+@app.get('/api/jobs/running')
+def running():
+    """How many conversions are in flight, for deploy.sh to check before it
+    replaces the container: a restart kills whatever is converting and
+    leaves the user a half-written log and no result."""
+    return jobs.running_summary()
+
+
 @app.get('/api/jobs/{job_id}')
 def job_state(job_id: str):
     state = jobs.public_state(job_id)

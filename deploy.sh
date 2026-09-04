@@ -46,6 +46,24 @@ else
 fi
 BUILD_TIME="$(date -u +%Y-%m-%dT%H:%MZ)"
 export GIT_SHA BUILD_TIME
+
+# Restarting the container kills whatever it is converting, and the job's
+# only record of being alive is in that process: the user is left with a
+# half-written log and no result. Check before replacing it. --force skips
+# the check when the running job is the thing being fixed.
+if [ "$1" != "--force" ] && [ "$2" != "--force" ]; then
+  busy="$(curl -s --max-time 5 http://localhost:8321/api/jobs/running 2>/dev/null || true)"
+  case "$busy" in
+    *'"running":0'*|'') : ;;
+    *)
+      echo "A conversion is still running:"
+      echo "  $busy"
+      echo "Deploying now would kill it. Wait for it to finish, or re-run with --force."
+      exit 1
+      ;;
+  esac
+fi
+
 echo "building stl2prism ${GIT_SHA} (${BUILD_TIME})"
 docker compose build
 docker compose up -d

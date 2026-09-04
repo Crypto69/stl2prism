@@ -175,6 +175,16 @@ def public_state(job_id):
     return out
 
 
+def running_summary():
+    """{'running': n, 'jobs': [...]} for the jobs converting right now."""
+    with _lock:
+        live = [j for j in _jobs.values()
+                if j.get('proc') is not None and j['status'] in ('queued', 'running')]
+        return {'running': len(live),
+                'jobs': [{'id': j['id'], 'filename': j.get('filename'),
+                          'status': j['status']} for j in live]}
+
+
 def cleanup_old():
     """Drop job directories older than the TTL (best effort)."""
     now = time.time()

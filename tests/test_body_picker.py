@@ -642,3 +642,40 @@ def test_unknown_job_is_still_unknown(tmp_path, monkeypatch):
     jobs._jobs.clear()
     assert jobs.get('0123456789ab') is None
     assert jobs.public_state('0123456789ab') is None
+
+
+# --- not deploying over a running conversion --------------------------------
+
+def test_running_endpoint_is_not_shadowed_by_the_job_id_route(tmp_path, monkeypatch):
+    """FastAPI matches in declaration order, so /api/jobs/running has to be
+    declared before /api/jobs/{job_id} or it is read as a job called
+    'running' and 404s — which is how it was first written."""
+    from fastapi.testclient import TestClient
+    from backend.main import app
+    from backend import jobs
+    monkeypatch.setattr(jobs, 'DATA_DIR', str(tmp_path))
+    c = TestClient(app)
+    r = c.get('/api/jobs/running')
+    assert r.status_code == 200
+    assert r.json() == {'running': 0, 'jobs': []}
+    assert c.get('/api/jobs/000000000000').status_code == 404
+
+
+def test_running_summary_counts_only_live_conversions(tmp_path, monkeypatch):
+    from backend import jobs
+    monkeypatch.setattr(jobs, 'DATA_DIR', str(tmp_path))
+    with jobs._lock:
+        jobs._jobs.clear()
+        jobs._jobs['a'] = {'id': 'a', 'status': 'running', 'proc': object(),
+                           'filename': 'x.stl'}
+        jobs._jobs['b'] = {'id': 'b', 'status': 'done', 'proc': None,
+                           'filename': 'y.stl'}
+        jobs._jobs['c'] = {'id': 'c', 'status': 'queued', 'proc': object(),
+                           'filename': 'z.stl'}
+    try:
+        got = jobs.running_summary()
+        assert got['running'] == 2
+        assert {j['id'] for j in got['jobs']} == {'a', 'c'}
+    finally:
+        with jobs._lock:
+            jobs._jobs.clear()
