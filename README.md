@@ -134,8 +134,8 @@ docker compose up --build        # then open http://localhost:8321
                                  # shown top-right in the UI and at /api/version
 ```
 
-To run it on a home NAS (any x86_64 box with Docker — the NAS vendor, Synology,
-QNAP; clone on the NAS, build natively, optional Tailscale HTTPS front), follow
+To run it on a home NAS (any x86_64 box with Docker: clone on the NAS, build
+natively, optional Tailscale HTTPS front), follow
 [docs/DEPLOY-NAS.md](docs/DEPLOY-NAS.md).
 
 Environment knobs: `STL2PRISM_DATA` (job storage dir, default `/data` in

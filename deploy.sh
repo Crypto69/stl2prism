@@ -6,16 +6,19 @@
 set -e
 cd "$(dirname "$0")"
 
-# The NAS keeps git off the default PATH for non-login shells; look in the
-# usual places, and if all else fails read the commit straight from .git.
+# Some NAS firmwares keep git off the default PATH for non-login shells; look
+# in the usual places, and if all else fails read the commit straight from
+# .git. If your box installs git somewhere else, point GIT_BIN at it:
+#   GIT_BIN=/path/to/git ./deploy.sh
 GIT=""
-for c in git /usr/bin/git /usr/local/bin/git /opt/bin/git /usr/local/git/bin/git \
-         <app-path>/git/bin/git; do
+for c in "${GIT_BIN:-}" git /usr/bin/git /usr/local/bin/git /opt/bin/git \
+         /usr/local/git/bin/git; do
+  [ -n "$c" ] || continue
   if command -v "$c" >/dev/null 2>&1; then GIT="$c"; break; fi
 done
 
-# On this NAS `git` is often only a shell alias, invisible to scripts. Fall back
-# to git inside a throwaway container so pulling still works.
+# On some NAS firmwares `git` is only a shell alias, invisible to scripts. Fall
+# back to git inside a throwaway container so pulling still works.
 if [ -z "$GIT" ] && command -v docker >/dev/null 2>&1; then
   echo "note: no git binary; using docker alpine/git"
   GIT="docker run --rm -v $(pwd):/repo -w /repo -e HOME=/tmp alpine/git -c safe.directory=/repo"
@@ -25,7 +28,7 @@ if [ -n "$GIT" ]; then
   if [ "$1" != "--no-pull" ]; then
     echo "pulling latest..."
     $GIT pull --ff-only
-    chmod -R a+rX . 2>/dev/null || true   # TOS share ACLs strip modes on pull
+    chmod -R a+rX . 2>/dev/null || true   # NAS share ACLs strip modes on pull
   fi
   GIT_SHA="$($GIT rev-parse --short HEAD)"
   if [ -n "$($GIT status --porcelain --untracked-files=no)" ]; then

@@ -1,23 +1,22 @@
 # Deploying stl2prism on a NAS — step by step
 
 Runs the web app as one Docker container on a home NAS, reachable from any
-browser on your LAN (and optionally over Tailscale). Written and tested on a
-**x86_64 NAS (Intel NAS CPU, 16 GB, TOS 6)**; the Docker steps are
-the same on Synology, QNAP or any Linux box — only the "TOS" notes are
-the NAS vendor-specific.
+browser on your LAN (and optionally over Tailscale). Written for a small
+**x86_64 NAS running Docker**; the steps are the same on any consumer NAS
+or Linux box, and only the notes at the end are vendor-specific.
 
 Placeholders used throughout:
 
 | Placeholder | Meaning | Example |
 |---|---|---|
 | `<your-nas>` | the NAS hostname or LAN IP | `nas.local`, `192.0.2.10` |
-| `<share-path>` | the shared folder you deploy into | `<share-path>/apps` |
+| `<share-path>` | the shared folder you deploy into | `/volume1/apps` |
 | `<port>` | the LAN port the app listens on | `8321` |
 
 ## Step 1 — Check the hardware
 
-- **x86_64 CPU** — the tested platform. The x86_64 NAS (Intel NAS CPU) is
-  x86_64. Current pymeshlab and cadquery-ocp releases do publish Linux
+- **x86_64 CPU** — the tested platform. Current pymeshlab and cadquery-ocp
+  releases do publish Linux
   aarch64 wheels, so an ARM NAS is no longer ruled out by packaging alone —
   but nothing in this stack has been verified on ARM Linux, and the Poisson
   step has already proven platform-sensitive (it crashes on macOS arm64).
@@ -27,10 +26,10 @@ Placeholders used throughout:
 
 ## Step 2 — Prepare the NAS (one-time)
 
-On TOS 6:
+On a vendor NAS (menu names vary by firmware; these are typical):
 
-1. **App Center → install Docker** ("DockerEngine"). Confirm over SSH:
-   `docker compose version`.
+1. **App Center → install Docker** (packaged as "DockerEngine" on some
+   firmwares). Confirm over SSH: `docker compose version`.
 2. **App Center → install Git** (optional — the deploy script falls back to a
    throw-away `alpine/git` container if there is no `git` binary).
 3. **Control Panel → Shared Folders → create a plain share** for apps
@@ -39,7 +38,8 @@ On TOS 6:
 4. **Enable SSH** (Control Panel → Terminal & SNMP) and log in as an admin
    user.
 
-On another NAS: install Docker (with Compose v2), create a folder, enable SSH.
+On any other NAS: install Docker (with Compose v2), create a folder, enable
+SSH.
 
 ## Step 3 — Clone the repository
 
@@ -47,7 +47,7 @@ On another NAS: install Docker (with Compose v2), create a folder, enable SSH.
 cd <share-path>
 git clone https://github.com/Crypto69/stl2prism.git
 cd stl2prism
-chmod -R a+rX .       # TOS shares strip file modes on checkout; harmless elsewhere
+chmod -R a+rX .       # some NAS shares strip file modes on checkout; harmless elsewhere
 mkdir -p data         # job storage, bind-mounted to /data inside the container
 ```
 
@@ -57,9 +57,9 @@ mkdir -p data         # job storage, bind-mounted to /data inside the container
 docker compose build
 ```
 
-Builds natively on the NAS (2–3 minutes on the NAS CPU; it downloads the ~2 GB
-CAD stack the first time). Do **not** copy an image built on an Apple-silicon
-Mac unless you built it with `--platform linux/amd64`.
+Builds natively on the NAS (a few minutes on a NAS CPU; it downloads the
+~2 GB CAD stack the first time). Do **not** copy an image built on an
+Apple-silicon Mac unless you built it with `--platform linux/amd64`.
 
 If the build fails with a download timeout in `pip` or `apt-get`, just run it
 again — it is a mirror hiccup, not a code problem (pip is set to 300 s / 10
@@ -122,9 +122,10 @@ tailscale serve --bg --https=8443 http://127.0.0.1:<port>
 tailscale serve status
 ```
 
-The app is then at `https://<your-nas>.<your-tailnet>.ts.net:8443`. Use a
-port other than 443 if something else already serves it. The app has no
-login: anyone on your LAN or tailnet can use it, which is the intended scope.
+The app is then at `https://<your-nas>.<your-tailnet>.ts.net:8443` — run
+`tailscale status` to see your own tailnet name. Use a port nothing else is
+serving (`tailscale serve status` lists the entries). The app has no login:
+anyone on your LAN or tailnet can use it, which is the intended scope.
 
 ## Step 9 — Run the test suite on the NAS (optional)
 
@@ -148,19 +149,22 @@ acceptance test.
 `docker compose ps`; if you use the Tailscale front, run
 `tailscale serve status` and repeat the `serve` command if its entry is gone.
 
-## TOS 6 notes (the NAS vendor)
+## Vendor NAS notes
 
-- **Docker CLI** lives under `<app-path>/DockerEngine/dockerd/bin`; add
-  it to `PATH` in `~/.bashrc`. If the daemon is down, start **DockerEngine**
-  in App Center and the containers come back.
-- **git** installed from App Center is at `<app-path>/git/bin/git`, and
-  interactive shells may only see it as an alias that scripts cannot use —
-  `deploy.sh` reads `.git/HEAD` itself and pulls through an `alpine/git`
-  container when needed.
+These apply to several vendor firmwares; check the equivalents on yours.
+
+- **Docker CLI may be off the default PATH** — it often lives under the
+  Docker app's own `bin` directory. Find it with
+  `find / -name docker -type f 2>/dev/null | head` and add that directory to
+  `PATH` in your shell rc. If the daemon is down, start the Docker app in the
+  admin UI and the containers come back.
+- **git may be an alias, not a binary** that scripts can call, and may also
+  live under an app directory. `deploy.sh` copes: it reads `.git/HEAD` itself
+  and pulls through an `alpine/git` container when needed.
 - **Share ACLs strip file modes** on clone/pull: run `chmod -R a+rX .` in the
   repo directory afterwards (`deploy.sh` does this for you).
 - **SSH auto-block**: a burst of SSH connections can blacklist your client IP
-  (ping works, SSH times out). Unblock under Control Panel → Security, or
+  (ping works, SSH times out). Unblock under the vendor security panel, or
   connect from your other address (LAN vs tailnet).
 
 ## Troubleshooting

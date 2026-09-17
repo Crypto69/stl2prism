@@ -33,3 +33,7 @@ include = ["stl2prism*"]
 
 [tool.pytest.ini_options]
 markers = ["slow: end-to-end runs over large sample meshes"]
+# Never collect a vendored dependency tree: a wheel unpacked into a lib/
+# folder is built for another interpreter, and importing it shadows the
+# venv's own copy and breaks every other test module.
+norecursedirs = ["*/lib", "*.egg", ".*", "build", "dist", "node_modules"]
