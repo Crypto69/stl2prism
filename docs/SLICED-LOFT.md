@@ -65,6 +65,15 @@ prismatic engine's frame snapping and tangent junction solving made the
 fit *worse* (twice as many primitives off by more than tol), so
 `fit_loop` leaves them off unless `clean=True`.
 
+A leaky mesh (the RC-N2 as uploaded is 77 loose surface patches) cuts
+into open chains as well as loops. The sketch path (`section_curves`,
+`fit_section`, the web app's single slice and its `.py`) keeps them open,
+as Fusion's Create Mesh Section Sketch does, after joining loose ends
+closer than `join_mm` (2.5 mm by default in the app; `--join` in
+`tools/trace_section.py`): at Y = centre + 36 mm the controller's outline,
+in 15 pieces with 0.1–2.2 mm cracks, comes back as one closed loop. The
+loft's cutter, `section_loops`, still closes every chain by its chord.
+
 ## What one does by hand in Fusion
 
 1. Design workspace → **Mesh** tab → Create → **Create Mesh Section

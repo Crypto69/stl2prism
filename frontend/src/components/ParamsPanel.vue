@@ -63,14 +63,14 @@ const isDefault = (key) => store.params[key] === DEFAULT_PARAMS[key]
 const isLoft = computed(() => store.params.method === 'loft')
 // Single slice: the plane follows the slider at once; the trace (a cut
 // plus a curve fit, a few seconds on a big mesh) runs when the slider
-// rests. Any change of axis, tolerance or scale re-traces too.
+// rests. Any change of axis, tolerance, scale or gap joining re-traces too.
 let traceTimer = null
 const scheduleTrace = () => {
   clearTimeout(traceTimer)
   traceTimer = setTimeout(() => store.traceSection(), 350)
 }
 watch(() => [store.sliceOffset, store.resolvedSliceAxis, store.params.tol, store.params.units,
-             store.params.scale, store.jobId],
+             store.params.scale, store.jobId, store.sliceJoin],
       ([off, axis, , , , job]) => {
         // the old outline belongs to the old plane: drop it at once, so the
         // view never shows a trace that does not sit on the plane
@@ -90,7 +90,11 @@ const sectionSummary = computed(() => {
   if (st.arcs) parts.push(`${st.arcs} arcs`)
   if (st.circles) parts.push(`${st.circles} circle${st.circles === 1 ? '' : 's'}`)
   if (st.splines) parts.push(`${st.splines} spline${st.splines === 1 ? '' : 's'}`)
-  return `${st.loops} outline${st.loops === 1 ? '' : 's'}: ${parts.join(', ')}; worst miss ${st.dev_max.toFixed(3)} mm`
+  let head = `${st.loops} outline${st.loops === 1 ? '' : 's'}`
+  if (st.open) head += `, ${st.open} open curve${st.open === 1 ? '' : 's'}`
+  let tail = ''
+  if (st.joins) tail = `; ${st.joins} gap${st.joins === 1 ? '' : 's'} joined (largest ${st.max_gap.toFixed(2)} mm)`
+  return `${head}: ${parts.join(', ')}${tail}; worst miss ${st.dev_max.toFixed(3)} mm`
 })
 // Axis choices with the file's side along each, so X / Y / Z mean
 // something before the plane appears in the 3D view, and 'auto' says
@@ -249,6 +253,21 @@ const axisOptions = computed(() => {
           Move the slider and the plane in the 3D view follows; the traced
           outline is drawn on it a moment later. This is Fusion's Create Mesh
           Section Sketch + Fit Curves to Mesh Section, for one plane.
+        </p>
+        <div class="row">
+          <label for="slice_join">
+            Join gaps up to
+            <span class="unit num">mm</span>
+          </label>
+          <input
+            id="slice_join" type="number" step="0.1" min="0" max="20"
+            v-model.number="store.sliceJoin"
+          />
+        </div>
+        <p class="hint">
+          A leaky mesh (loose surface patches) cuts into pieces; loose ends
+          closer than this are joined so the outline closes. 0 draws exactly
+          what Fusion's Create Mesh Section Sketch draws, open pieces and all.
         </p>
         <p v-if="store.sectionBusy" class="hint">tracing…</p>
         <p v-else-if="store.sectionError" class="hint warn">Could not trace: {{ store.sectionError }}</p>

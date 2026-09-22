@@ -189,42 +189,49 @@ _AXES = ('x', 'y', 'z')
 
 @app.get('/api/jobs/{job_id}/section')
 async def section(job_id: str, axis: str = 'z', offset: float = 0.0, tol: float = 0.08,
-                  units: str = 'mm', scale: float = 1.0):
+                  units: str = 'mm', scale: float = 1.0, join: float = 2.5):
     """One traced section of the uploaded mesh: the plane across `axis`
     at `offset` mm from the bounding-box centre (Fusion's section-plane
-    slider), fitted as lines, arcs and splines within `tol`. Returns the
-    curves as 3-D polylines (mm, converted frame) for the viewer plus the
-    fit statistics."""
+    slider), fitted as lines, arcs and splines within `tol`. Open chains
+    of a leaky mesh stay open, as in Fusion's mesh section sketch, after
+    free ends within `join` mm of each other are joined (0 = never).
+    Returns the curves as 3-D polylines (mm, converted frame) for the
+    viewer plus the fit statistics."""
     if axis not in _AXES:
         raise HTTPException(400, 'axis must be x, y or z')
     if not (0 < tol <= 5):
         raise HTTPException(400, 'tol must be in (0, 5] mm')
+    if not (0 <= join <= 20):
+        raise HTTPException(400, 'join must be in [0, 20] mm')
     _, src = _input_path(job_id)
     from .sections import trace
     try:
-        return sanitize(await run_in_threadpool(trace, src, axis, offset, tol, units, scale))
+        return sanitize(await run_in_threadpool(trace, src, axis, offset, tol, units, scale, join))
     except Exception as e:
         raise HTTPException(400, f'could not trace the section: {e}')
 
 
 @app.get('/api/jobs/{job_id}/section-script')
 async def section_script(job_id: str, axis: str = 'z', offset: float = 0.0, tol: float = 0.08,
-                         units: str = 'mm', scale: float = 1.0):
+                         units: str = 'mm', scale: float = 1.0, join: float = 2.5):
     """The same section as a Fusion 360 script: one construction plane
     and one sketch of lines, arcs, circles and fitted splines (Create Mesh
     Section Sketch + Fit Curves to Mesh Section, in one go)."""
     if axis not in _AXES:
         raise HTTPException(400, 'axis must be x, y or z')
+    if not (0 <= join <= 20):
+        raise HTTPException(400, 'join must be in [0, 20] mm')
     job, src = _input_path(job_id)
     from .sections import trace
     from stl2prism.fusion_export import emit_fusion_sections_script
     try:
-        sec = await run_in_threadpool(trace, src, axis, offset, tol, units, scale)
+        sec = await run_in_threadpool(trace, src, axis, offset, tol, units, scale, join)
     except Exception as e:
         raise HTTPException(400, f'could not trace the section: {e}')
     name = f"section {axis.upper()}={sec['at']:.2f} mm ({offset:+.1f} from centre)"
     text = emit_fusion_sections_script([{'origin': sec['origin'], 'normal': sec['normal'],
-                                         'name': name, 'loops': sec['loops']}])
+                                         'name': name, 'loops': sec['loops'],
+                                         'open': sec['open']}])
     stem = _EXT_RE.sub('', job.get('filename') or 'part')
     safe = re.sub(r'[^\w.-]+', '_', stem) or 'part'
     from fastapi.responses import Response

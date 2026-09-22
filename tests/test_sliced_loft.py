@@ -80,6 +80,76 @@ def test_section_matches_trimesh():
     assert abs(signed_area(loops[0][0])) == pytest.approx(ref, rel=1e-6)
 
 
+def _sheet(xy, z0=-1.0, z1=1.0):
+    """A vertical open sheet (V, F) through the 2-D polyline `xy`: one
+    quad per segment, no caps, so a horizontal cut gives an open chain."""
+    xy = np.asarray(xy, float)
+    n = len(xy)
+    V = np.vstack([np.c_[xy, np.full(n, z0)], np.c_[xy, np.full(n, z1)]])
+    F = []
+    for i in range(n - 1):
+        F.append([i, i + 1, n + i + 1])
+        F.append([i, n + i + 1, n + i])
+    return V, np.asarray(F)
+
+
+def test_open_chain_stays_open():
+    """A U-shaped sheet cuts into one open chain: no loop, no chord, three
+    lines whose ends are the sheet's ends, an open preview polyline and a
+    script that draws exactly those three lines."""
+    from stl2prism.section_fit import section_curves, section_loops, fit_section, section_preview
+    from stl2prism.fusion_export import emit_fusion_sections_script
+    V, F = _sheet([[0, 10], [0, 0], [20, 0], [20, 10]])
+    loops, opens, _, jst = section_curves(V, F, [0, 0, 0], [0, 0, 1])
+    assert loops == [] and len(opens) == 1 and jst['joins'] == 0
+    assert np.allclose(opens[0][0], [0, 10]) and np.allclose(opens[0][-1], [20, 10])
+    sec = fit_section(V, F, [0, 0, 0], [0, 0, 1], tol=0.05)
+    st = sec['stats']
+    assert st['loops'] == 0 and st['open'] == 1 and st['lines'] == 3 and st['dev_max'] < 1e-6
+    prims = sec['open'][0]
+    assert np.allclose(prims[0]['p0'], [0, 10]) and np.allclose(prims[-1]['p1'], [20, 10])
+    pv = section_preview(V, F, [0, 0, 0], [0, 0, 1], tol=0.05)
+    assert len(pv['polylines']) == 1 and pv['loops'] == [] and len(pv['open']) == 1
+    assert not np.allclose(pv['polylines'][0][0], pv['polylines'][0][-1])
+    txt = emit_fusion_sections_script([{'origin': pv['origin'], 'normal': pv['normal'],
+                                        'name': 'u', 'loops': pv['loops'], 'open': pv['open']}])
+    assert txt.count('sketchLines.addByTwoPoints') == 3
+    compile(txt, 'u.py', 'exec')
+    # the loft's cutter keeps closing every chain by its chord
+    from stl2prism.section_fit import signed_area
+    lp, _ = section_loops(V, F, [0, 0, 0], [0, 0, 1])
+    assert len(lp) == 1 and abs(signed_area(lp[0][0])) == pytest.approx(200.0)
+
+
+def test_join_chains_bridges_small_gaps_only():
+    """Two sheets 0.5 mm apart are two open chains at join 0, one at join
+    1; a ring sheet missing one facet closes on itself once the join
+    reaches the gap, and becomes a loop."""
+    from stl2prism.section_fit import section_curves, fit_section
+    Va, Fa = _sheet([[0, 0], [10, 0]])
+    Vb, Fb = _sheet([[10.5, 0], [20, 0]])
+    V = np.vstack([Va, Vb])
+    F = np.vstack([Fa, Fb + len(Va)])
+    for join, n_open, n_join in [(0.0, 2, 0), (0.4, 2, 0), (1.0, 1, 1)]:
+        loops, opens, _, jst = section_curves(V, F, [0, 0, 0], [0, 0, 1], join_mm=join)
+        assert (len(loops), len(opens), jst['joins']) == (0, n_open, n_join), join
+    _, opens, _, jst = section_curves(V, F, [0, 0, 0], [0, 0, 1], join_mm=1.0)
+    assert jst['max_gap'] == pytest.approx(0.5)
+    assert np.allclose(opens[0][0], [0, 0]) and np.allclose(opens[0][-1], [20, 0])
+    assert np.all(np.diff(opens[0][:, 0]) > 0)          # one chain, in order
+    # a ring with one facet missing: gap = one chord of a 32-gon, r = 5
+    t = np.linspace(0, 2 * np.pi, 33)[:-1]
+    ring = np.c_[5 * np.cos(t), 5 * np.sin(t)]
+    V, F = _sheet(ring)                       # open between ring[-1] and ring[0]
+    gap = float(np.linalg.norm(ring[-1] - ring[0]))
+    loops, opens, _, jst = section_curves(V, F, [0, 0, 0], [0, 0, 1], join_mm=gap * 0.9)
+    assert len(loops) == 0 and len(opens) == 1
+    loops, opens, _, jst = section_curves(V, F, [0, 0, 0], [0, 0, 1], join_mm=gap * 1.1)
+    assert len(loops) == 1 and opens == [] and jst['joins'] == 1
+    st = fit_section(V, F, [0, 0, 0], [0, 0, 1], tol=0.1, join_mm=gap * 1.1)['stats']
+    assert st['circles'] == 1 and st['open'] == 0
+
+
 def test_fit_loop_rounded_rect_is_lines_and_arcs():
     from stl2prism.section_fit import section_loops, fit_loop
     p = synth.export(synth.rounded_rect(), '/tmp/_s2p_rr.stl')

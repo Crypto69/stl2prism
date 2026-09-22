@@ -14,6 +14,15 @@ sketch in the generated Fusion script comes from this one cutter.
 Coordinates: `section_loops` returns 2-D points in an in-plane frame (u, v)
 with `to_3d(xy)` = origin + u*x + v*y. Outer loops are counter-clockwise,
 holes clockwise, holes attached to the outer loop that contains them.
+
+A leaky mesh (separate surface patches, a scan) cuts into open chains as
+well as closed loops. `section_curves` keeps them apart: closed loops are
+nested and fitted as loops, open chains are fitted as open curves and drawn
+open, exactly as Fusion's Create Mesh Section Sketch draws them, and free
+ends closer than `join_mm` are joined first so an outline that is only
+broken by hairline cracks between patches comes back closed. `section_loops`
+(the loft's cutter) keeps its older behaviour of closing every chain by its
+chord.
 """
 import numpy as np
 
@@ -79,11 +88,12 @@ def cut_segments(V, F, origin, normal):
 
 
 def chain_loops(S):
-    """Chain segments (rows of point-index pairs) into closed loops. Each
-    point of a closed mesh section is used by exactly two segments; a point
-    used once (an open, leaky mesh) starts an open chain that is returned
-    as well, so nothing is silently dropped. Returns a list of index
-    lists; a closed loop does not repeat its first index."""
+    """Chain segments (rows of point-index pairs) into loops. Each point of
+    a closed mesh section is used by exactly two segments; a point used
+    once (an open, leaky mesh) starts an open chain that is returned as
+    well, so nothing is silently dropped. Returns a list of (index list,
+    closed); a closed loop does not repeat its first index, an open chain
+    has at least two points."""
     if len(S) == 0:
         return []
     nbrs = {}
@@ -100,11 +110,13 @@ def chain_loops(S):
                 continue
             loop = [start]
             cur, k = start, k0
+            closed = False
             while True:
                 used[k] = True
                 i, j = S[k]
                 nxt = int(j) if int(i) == cur else int(i)
                 if nxt == start:
+                    closed = True
                     break
                 loop.append(nxt)
                 cur = nxt
@@ -112,9 +124,51 @@ def chain_loops(S):
                 if step is None:
                     break
                 k = step[1]
-            if len(loop) >= 3:
-                loops.append(loop)
+            if len(loop) >= (3 if closed else 2):
+                loops.append((loop, closed))
     return loops
+
+
+def join_chains(chains, xy, join_mm):
+    """Join the free ends of open chains that sit within `join_mm` of each
+    other: the closest pair of ends first, then the next, until no pair is
+    that close. A chain whose own two ends are the closest pair becomes a
+    closed loop. `chains` is `chain_loops` output, `xy` the 2-D point per
+    index. Returns (chains, joins made, largest gap bridged). join_mm <= 0
+    returns the input untouched."""
+    if join_mm <= 0 or not chains:
+        return chains, 0, 0.0
+    done = [(list(c), True) for c, cl in chains if cl]
+    open_ = [list(c) for c, cl in chains if not cl]
+    n_join, max_gap = 0, 0.0
+    while open_:
+        ends = [(ci, e) for ci in range(len(open_)) for e in (0, 1)]
+        E = np.array([xy[open_[ci][0 if e == 0 else -1]] for ci, e in ends])
+        if len(E) < 2:
+            break
+        D = np.linalg.norm(E[:, None, :] - E[None, :, :], axis=2)
+        np.fill_diagonal(D, np.inf)
+        i, j = np.unravel_index(int(np.argmin(D)), D.shape)
+        gap = float(D[i, j])
+        if gap > join_mm:
+            break
+        (ci, si), (cj, sj) = ends[i], ends[j]
+        n_join += 1
+        max_gap = max(max_gap, gap)
+        if ci == cj:
+            done.append((open_.pop(ci), True))
+            continue
+        a, b = open_[ci], open_[cj]
+        if si == 0:                 # join at a's end
+            a = a[::-1]
+        if sj == 1:                 # ... to b's start
+            b = b[::-1]
+        if gap < 1e-9:              # coincident ends: one point, not two
+            b = b[1:]
+        for k in sorted((ci, cj), reverse=True):
+            open_.pop(k)
+        open_.append(a + b)
+    return done + [(c, False) for c in open_], n_join, max_gap
 
 
 def signed_area(xy):
@@ -163,29 +217,64 @@ def nest_loops(loops_xy):
     return [out[i] for i in sorted(out, key=lambda i: -areas[i])]
 
 
+def _cut_xy(V, F, origin, normal):
+    u, v, n = plane_basis(normal)
+    o = np.asarray(origin, float)
+    P, S = cut_segments(V, F, o, n)
+    xy_all = np.stack([(P - o) @ u, (P - o) @ v], axis=1) if len(P) else np.zeros((0, 2))
+    return xy_all, S, (o, u, v, n)
+
+
+def _dedupe(xy):
+    """Drop consecutive duplicates (a crossing at a shared vertex)."""
+    keep = np.ones(len(xy), bool)
+    keep[1:] = np.linalg.norm(xy[1:] - xy[:-1], axis=1) > 1e-9
+    return xy[keep]
+
+
 def section_loops(V, F, origin, normal, min_area=1e-6):
-    """Cut the mesh (V, F) with the plane (origin, normal).
+    """Cut the mesh (V, F) with the plane (origin, normal), every chain
+    taken as a closed loop (the sliced loft's cutter).
 
     Returns (loops, frame): loops is a list of (outer_xy, [hole_xy, ...])
     with 2-D points in the plane frame, outers CCW and holes CW, largest
     outer first; frame is (origin, u, v, n) with to_3d(xy) = origin + u*x
     + v*y. Loops of less than `min_area` (mm^2) are dropped as numerical
     dust. Open chains (a leaky mesh) are kept as loops too: closed by
-    their chord, which is what any sketch would do."""
-    u, v, n = plane_basis(normal)
-    o = np.asarray(origin, float)
-    P, S = cut_segments(V, F, o, n)
-    xy_all = np.stack([(P - o) @ u, (P - o) @ v], axis=1) if len(P) else np.zeros((0, 2))
+    their chord. For sketches use `section_curves`, which keeps them
+    open."""
+    xy_all, S, frame = _cut_xy(V, F, origin, normal)
     loops = []
-    for idx in chain_loops(S):
-        xy = xy_all[idx]
-        # drop consecutive duplicates (a crossing at a shared vertex)
-        keep = np.ones(len(xy), bool)
-        keep[1:] = np.linalg.norm(xy[1:] - xy[:-1], axis=1) > 1e-9
-        xy = xy[keep]
+    for idx, _closed in chain_loops(S):
+        xy = _dedupe(xy_all[idx])
         if len(xy) >= 3 and abs(signed_area(xy)) >= min_area:
             loops.append(xy)
-    return nest_loops(loops), (o, u, v, n)
+    return nest_loops(loops), frame
+
+
+def section_curves(V, F, origin, normal, min_area=1e-6, join_mm=0.0):
+    """Cut the mesh (V, F) with the plane (origin, normal), keeping open
+    chains open, as Fusion's Create Mesh Section Sketch does.
+
+    Returns (loops, open_chains, frame, joins): loops as `section_loops`
+    gives them (closed chains only, nested, outers CCW, holes CW);
+    open_chains a list of 2-D polylines, longest first, never closed; frame
+    (origin, u, v, n); joins {'joins': ends joined, 'max_gap': largest gap
+    bridged}. Free ends within `join_mm` of each other are joined first
+    (`join_chains`), so a shell whose patches leave hairline cracks comes
+    back as one closed outline; 0 joins nothing."""
+    xy_all, S, frame = _cut_xy(V, F, origin, normal)
+    chains, n_join, max_gap = join_chains(chain_loops(S), xy_all, join_mm)
+    loops, opens = [], []
+    for idx, closed in chains:
+        xy = _dedupe(xy_all[idx])
+        if closed:
+            if len(xy) >= 3 and abs(signed_area(xy)) >= min_area:
+                loops.append(xy)
+        elif len(xy) >= 2:
+            opens.append(xy)
+    opens.sort(key=lambda q: -float(np.linalg.norm(np.diff(q, axis=0), axis=1).sum()))
+    return nest_loops(loops), opens, frame, {'joins': n_join, 'max_gap': max_gap}
 
 
 def to_3d(xy, frame):
@@ -274,42 +363,54 @@ def _prim_dev(p):
     return _open_polyline_dev(pts, q)
 
 
-def _fragment_runs(prims, min_len, min_run, tol):
-    """Cyclic runs of primitives that lines and arcs did not really fit: a
-    run of >= min_run consecutive crumbs shorter than min_len (a curve
-    chopped into pieces), or any run holding a primitive whose own raw
-    points sit more than tol off it (a stretch the segmenter gave up on).
-    Returns a list of index lists in cyclic order."""
+def _fragment_runs(prims, min_len, min_run, tol, closed=True):
+    """Runs of primitives that lines and arcs did not really fit: a run of
+    >= min_run consecutive crumbs shorter than min_len (a curve chopped
+    into pieces), or any run holding a primitive whose own raw points sit
+    more than tol off it (a stretch the segmenter gave up on). Returns a
+    list of index lists, cyclic for a closed loop (a run may straddle the
+    seam), in order for an open chain (a run may start at 0 or end at
+    n - 1)."""
     n = len(prims)
     bad = [_prim_dev(p) > tol for p in prims]
     weak = [bad[i] or _span_len(p) < min_len for i, p in enumerate(prims)]
     if all(weak):
         return [list(range(n))] if (n >= min_run or any(bad)) else []
-    # start after a strong primitive so runs do not straddle the seam
-    start = next(i for i in range(n) if not weak[i])
+    if closed:
+        # start after a strong primitive so runs do not straddle the seam
+        start = next(i for i in range(n) if not weak[i])
+        order = [(start + k) % n for k in range(1, n + 1)]
+    else:
+        order = list(range(n))
     runs, cur = [], []
-    for k in range(1, n + 1):
-        i = (start + k) % n
+
+    def flush():
+        if len(cur) >= min_run or any(bad[j] for j in cur):
+            runs.append(list(cur))
+        cur.clear()
+
+    for i in order:
         if weak[i]:
             cur.append(i)
         else:
-            if len(cur) >= min_run or any(bad[j] for j in cur):
-                runs.append(cur)
-            cur = []
+            flush()
+    flush()                     # an open chain may end in a run
     return runs
 
 
-def _close_junctions(prims):
+def _close_junctions(prims, closed=True):
     """Make consecutive primitives share their endpoint exactly: the two
     ends are averaged (they already sit within a hair of each other, both
     being the raw section point the segmenter split at). Arc endpoints
     are then put back on their circle and the neighbour follows, so a
-    three-point arc drawn from p0, mid, p1 is the fitted circle."""
+    three-point arc drawn from p0, mid, p1 is the fitted circle. The two
+    free ends of an open chain are left where they are."""
     from .profile_fit import _project_arc_ends
     n = len(prims)
     if n < 2:
         return prims
-    for i in range(n):
+    pairs = range(n) if closed else range(n - 1)
+    for i in pairs:
         a, b = prims[i], prims[(i + 1) % n]
         x = 0.5 * (np.asarray(a['p1'], float) + np.asarray(b['p0'], float))
         a['p1'] = x.copy()
@@ -317,7 +418,7 @@ def _close_junctions(prims):
     for p in prims:
         if p['type'] == 'arc':
             _project_arc_ends(p)
-    for i in range(n):
+    for i in pairs:
         a, b = prims[i], prims[(i + 1) % n]
         if a['type'] == 'arc':
             b['p0'] = np.asarray(a['p1'], float).copy()
@@ -330,20 +431,20 @@ def _close_junctions(prims):
     return prims
 
 
-def _replace_with_splines(prims, runs, tol):
+def _replace_with_splines(prims, runs, tol, closed=True):
     """Replace each fragment run by one spline primitive through the raw
     section points the fragments covered, thinned by Douglas-Peucker at
     tol/2. The spline starts and ends exactly on its neighbours' junction
-    points, so the loop stays closed."""
+    points, so a loop stays closed and an open chain keeps its ends."""
     if not runs:
         return prims
     n = len(prims)
     drop = set(i for r in runs for i in r)
     first_of = {r[0]: r for r in runs}
     out = []
-    # walk from the primitive after the last run's end, so every run is
-    # met at its first index
-    start = (runs[-1][-1] + 1) % n
+    # closed: walk from the primitive after the last run's end, so every
+    # run is met at its first index; open: runs are in order already
+    start = (runs[-1][-1] + 1) % n if closed else 0
     for k in range(n):
         i = (start + k) % n
         if i in first_of:
@@ -362,8 +463,10 @@ def _replace_with_splines(prims, runs, tol):
     return out
 
 
-def fit_loop(xy, tol=0.08, mesh_pts=None, min_prim_mm=None, min_run=3, clean=False):
-    """Redraw one closed 2-D loop as sketch primitives.
+def fit_loop(xy, tol=0.08, mesh_pts=None, min_prim_mm=None, min_run=3, clean=False,
+             closed=True):
+    """Redraw one 2-D loop (or, with closed=False, one open chain) as
+    sketch primitives.
 
     Lines and arcs first (`profile_fit.segment_polyline`, the fitter the
     prismatic engine uses). Where that only manages a run of `min_run` or
@@ -372,6 +475,10 @@ def fit_loop(xy, tol=0.08, mesh_pts=None, min_prim_mm=None, min_run=3, clean=Fal
     becomes one {'type': 'spline', 'pts'} through the raw points, thinned
     at tol/2. Neighbours are then made to share their endpoints. A loop
     that is one circle within tol is returned as a full circle dict.
+
+    An open chain skips the full-circle test, is segmented as an open
+    polyline and keeps its two free ends exactly where the section put
+    them; a whole-chain spline comes back with 'closed': False.
 
     `clean=True` also runs the prismatic engine's frame snapping and
     tangent junction solving (squared-up lines, true fillets). Off by
@@ -382,38 +489,47 @@ def fit_loop(xy, tol=0.08, mesh_pts=None, min_prim_mm=None, min_run=3, clean=Fal
     """
     from .profile_fit import refine_arcs_with_points
     pts = np.asarray(xy, float)
-    if len(pts) > 1 and np.allclose(pts[0], pts[-1]):
+    if closed and len(pts) > 1 and np.allclose(pts[0], pts[-1]):
         pts = pts[:-1]
-    if len(pts) < 3:
+    if len(pts) < (3 if closed else 2):
         return []
-    circ = try_full_circle(pts, tol)
-    if circ:
-        if mesh_pts is not None:
-            refine_arcs_with_points([circ], mesh_pts, tol)
-        return circ
-    prims = segment_polyline(pts, tol=tol, closed=True)
+    if closed:
+        circ = try_full_circle(pts, tol)
+        if circ:
+            if mesh_pts is not None:
+                refine_arcs_with_points([circ], mesh_pts, tol)
+            return circ
+    prims = segment_polyline(pts, tol=tol, closed=closed)
     if not prims:
         return []
     if mesh_pts is not None:
         refine_arcs_with_points(prims, mesh_pts, tol)
     if clean:
         prims = snap_profile(prims)
-        solve_junctions(prims, closed=True)
+        solve_junctions(prims, closed=closed)
     if min_prim_mm is None:
         min_prim_mm = max(0.6, 8.0 * tol)
-    runs = _fragment_runs(prims, min_prim_mm, min_run, tol)
+    runs = _fragment_runs(prims, min_prim_mm, min_run, tol, closed)
     if runs and len(runs) == 1 and len(runs[0]) == len(prims):
-        # the whole loop is one curve: a single closed spline
-        raw = np.vstack([np.asarray(p['_pts'], float)[:-1] for p in prims])
-        keep = douglas_peucker(np.vstack([raw, raw[:1]]), tol / 2)[:-1]
-        return [{'type': 'spline', 'pts': raw[keep], 'p0': raw[keep][0].copy(),
-                 'p1': raw[keep][0].copy(), 'closed': True, '_pts': raw}]
-    return _close_junctions(_replace_with_splines(prims, runs, tol))
+        # the whole loop is one curve: a single spline
+        if closed:
+            raw = np.vstack([np.asarray(p['_pts'], float)[:-1] for p in prims])
+            keep = douglas_peucker(np.vstack([raw, raw[:1]]), tol / 2)[:-1]
+            return [{'type': 'spline', 'pts': raw[keep], 'p0': raw[keep][0].copy(),
+                     'p1': raw[keep][0].copy(), 'closed': True, '_pts': raw}]
+        raw = np.vstack([np.asarray(prims[0]['_pts'], float)]
+                        + [np.asarray(p['_pts'], float)[1:] for p in prims[1:]])
+        q = raw[douglas_peucker(raw, tol / 2)]
+        return [{'type': 'spline', 'pts': q, 'p0': q[0].copy(), 'p1': q[-1].copy(),
+                 'closed': False, '_pts': raw}]
+    return _close_junctions(_replace_with_splines(prims, runs, tol, closed), closed)
 
 
-def prim_points(prims, arc_step_deg=6.0):
+def prim_points(prims, arc_step_deg=6.0, closed=True):
     """Dense 2-D polyline of a fitted loop (for deviation checks and
-    previews). Full circles and closed splines come back closed."""
+    previews). Full circles and closed splines come back closed; a loop's
+    polyline implies its closing edge, an open chain (closed=False) ends
+    on its last primitive's end point."""
     if isinstance(prims, dict):                       # full circle
         c, r = np.asarray(prims['center'], float), float(prims['r'])
         a = np.linspace(0, 2 * np.pi, 96, endpoint=False)
@@ -438,6 +554,8 @@ def prim_points(prims, arc_step_deg=6.0):
         else:
             out.append(np.asarray(p['pts'], float)[:-1] if not p.get('closed')
                        else np.asarray(p['pts'], float))
+    if not closed and out:
+        out.append(np.asarray([prims[-1]['p1']], float))
     return np.vstack(out) if out else np.zeros((0, 2))
 
 
@@ -447,15 +565,31 @@ def polyline_deviation(pts, ref):
     return _seg_dist_max(pts, ref, np.roll(ref, -1, axis=0))
 
 
-def fit_section(V, F, origin, normal, tol=0.08, mesh_pts=None):
+def fit_section(V, F, origin, normal, tol=0.08, mesh_pts=None, join_mm=0.0):
     """Cut and fit in one go. Returns {'origin', 'u', 'v', 'normal',
-    'loops': [(outer_prims, [hole_prims...]), ...], 'raw': the raw loops,
-    'stats': {'loops', 'holes', 'lines', 'arcs', 'circles', 'splines',
-    'dev_max'}} where dev_max is the worst distance from the raw section
-    points to the fitted curves."""
-    loops, frame = section_loops(V, F, origin, normal)
-    fitted, stats = [], dict(loops=0, holes=0, lines=0, arcs=0, circles=0,
-                             splines=0, dev_max=0.0)
+    'loops': [(outer_prims, [hole_prims...]), ...], 'open': [prims, ...]
+    (open chains, fitted open), 'raw': the raw loops, 'raw_open': the raw
+    open chains, 'stats': {'loops', 'holes', 'open', 'lines', 'arcs',
+    'circles', 'splines', 'joins', 'max_gap', 'dev_max'}} where dev_max is
+    the worst distance from the raw section points to the fitted curves.
+    Free chain ends within `join_mm` are joined before fitting."""
+    loops, opens, frame, jst = section_curves(V, F, origin, normal, join_mm=join_mm)
+    fitted, stats = [], dict(loops=0, holes=0, open=0, lines=0, arcs=0, circles=0,
+                             splines=0, joins=jst['joins'], max_gap=jst['max_gap'],
+                             dev_max=0.0)
+
+    def tally(prims, raw, closed):
+        if isinstance(prims, dict):
+            stats['circles'] += 1
+        else:
+            for p in prims:
+                stats[{'line': 'lines', 'arc': 'arcs', 'spline': 'splines'}[p['type']]] += 1
+        if len(prims):
+            sub = raw[::max(1, len(raw) // 400)]
+            dev = (polyline_deviation(sub, prim_points(prims)) if closed
+                   else _open_polyline_dev(sub, prim_points(prims, closed=False)))
+            stats['dev_max'] = max(stats['dev_max'], dev)
+
     for outer, holes in loops:
         fo = fit_loop(outer, tol, mesh_pts)
         fh = [fit_loop(h, tol, mesh_pts) for h in holes]
@@ -463,18 +597,16 @@ def fit_section(V, F, origin, normal, tol=0.08, mesh_pts=None):
         stats['loops'] += 1
         stats['holes'] += len(holes)
         for prims, raw in [(fo, outer)] + list(zip(fh, holes)):
-            if isinstance(prims, dict):
-                stats['circles'] += 1
-            else:
-                for p in prims:
-                    stats[{'line': 'lines', 'arc': 'arcs', 'spline': 'splines'}[p['type']]] += 1
-            if len(prims):
-                dense = prim_points(prims)
-                stats['dev_max'] = max(stats['dev_max'],
-                                       polyline_deviation(raw[::max(1, len(raw) // 400)], dense))
+            tally(prims, raw, True)
+    fopen = []
+    for xy in opens:
+        prims = fit_loop(xy, tol, mesh_pts, closed=False)
+        fopen.append(prims)
+        stats['open'] += 1
+        tally(prims, xy, False)
     o, u, v, n = frame
-    return {'origin': o, 'u': u, 'v': v, 'normal': n, 'loops': fitted,
-            'raw': loops, 'stats': stats}
+    return {'origin': o, 'u': u, 'v': v, 'normal': n, 'loops': fitted, 'open': fopen,
+            'raw': loops, 'raw_open': opens, 'stats': stats}
 
 
 def lift_prims(prims, frame):
@@ -502,11 +634,13 @@ def lift_prims(prims, frame):
     return out
 
 
-def section_preview(V, F, origin, normal, tol=0.08):
+def section_preview(V, F, origin, normal, tol=0.08, join_mm=0.0):
     """One traced section for the web app and the sections script:
-    {'origin', 'normal', 'loops': [(outer3d, [holes3d])], 'polylines':
-    [[x, y, z]...] dense curves per loop for drawing, 'stats'}."""
-    sec = fit_section(V, F, origin, normal, tol=tol)
+    {'origin', 'normal', 'loops': [(outer3d, [holes3d])], 'open':
+    [prims3d...] (open chains), 'polylines': [[x, y, z]...] dense curves
+    per loop for drawing (closed ones repeat their first point, open ones
+    do not), 'stats'}."""
+    sec = fit_section(V, F, origin, normal, tol=tol, join_mm=join_mm)
     frame = (sec['origin'], sec['u'], sec['v'], sec['normal'])
     loops, polys = [], []
     for fo, fh in sec['loops']:
@@ -515,5 +649,10 @@ def section_preview(V, F, origin, normal, tol=0.08):
             if len(prims):
                 q = prim_points(prims)
                 polys.append(to_3d(np.vstack([q, q[:1]]), frame).tolist())
+    opens = []
+    for prims in sec['open']:
+        opens.append(lift_prims(prims, frame))
+        if len(prims):
+            polys.append(to_3d(prim_points(prims, closed=False), frame).tolist())
     return {'origin': np.asarray(sec['origin']).tolist(), 'normal': np.asarray(sec['normal']).tolist(),
-            'loops': loops, 'polylines': polys, 'stats': sec['stats']}
+            'loops': loops, 'open': opens, 'polylines': polys, 'stats': sec['stats']}

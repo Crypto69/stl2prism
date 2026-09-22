@@ -61,9 +61,12 @@ export const useConvertStore = defineStore('convert', {
     selected: [],
     hovered: -1,
     // single slice (sliced-loft method): where the plane sits along the
-    // chosen axis, in mm from the part's centre (Fusion's slider), and the
-    // last traced section from /section
+    // chosen axis, in mm from the part's centre (Fusion's slider), how far
+    // apart two loose ends of a leaky mesh may be and still be joined (mm;
+    // 0 draws exactly what Fusion's mesh section draws), and the last
+    // traced section from /section
     sliceOffset: 0,
+    sliceJoin: 2.5,
     section: null,
     sectionBusy: false,
     sectionError: null,
@@ -107,7 +110,8 @@ export const useConvertStore = defineStore('convert', {
       const a = s.resolvedSliceAxis
       if (!s.jobId || !a) return null
       const q = new URLSearchParams({ axis: a, offset: String(s.sliceOffset), tol: String(s.params.tol),
-                                      units: s.params.units, scale: String(s.params.scale) })
+                                      units: s.params.units, scale: String(s.params.scale),
+                                      join: String(s.sliceJoin) })
       return `/api/jobs/${s.jobId}/section-script?${q}`
     },
     // The axis the sliced loft will cut along, with 'auto' resolved to the
@@ -143,7 +147,7 @@ export const useConvertStore = defineStore('convert', {
         this.$patch({
           status: 'ready', jobId: data.id, inputStats: data.input_stats,
           bodies: [], triangleBody: null, selected: [], hovered: -1,
-          sliceOffset: 0, section: null, sectionError: null,
+          sliceOffset: 0, sliceJoin: 2.5, section: null, sectionError: null,
         })
         this.loadBodies()
       } catch (e) {
@@ -267,7 +271,8 @@ export const useConvertStore = defineStore('convert', {
       const a = this.resolvedSliceAxis
       if (!this.jobId || !a) return
       const q = new URLSearchParams({ axis: a, offset: String(this.sliceOffset), tol: String(this.params.tol),
-                                      units: this.params.units, scale: String(this.params.scale) })
+                                      units: this.params.units, scale: String(this.params.scale),
+                                      join: String(this.sliceJoin) })
       const mine = ++traceSeq
       this.sectionBusy = true
       try {

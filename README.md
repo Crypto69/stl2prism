@@ -61,6 +61,12 @@ an offset from the part's centre, the traced outline is drawn on it, and
 "Download Fusion sketch of this slice" gives a script that draws that one
 sketch — lines, arcs, circles and fitted splines on a construction plane
 at that position (`GET /api/jobs/{id}/section` and `/section-script`).
+A leaky mesh (loose surface patches, a scan) cuts into open chains as well
+as closed loops; they are drawn open, exactly as Fusion's mesh section
+draws them, after loose ends closer than "Join gaps up to" (default
+2.5 mm, `join=`) have been joined, so an outline broken only by hairline
+cracks between patches comes back as one closed profile. 0 joins
+nothing.
 
 ## Screenshots
 
