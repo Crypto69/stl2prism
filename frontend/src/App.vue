@@ -86,6 +86,9 @@ const canConvert = computed(
           :triangle-body="store.triangleBody"
           :selected="store.selected"
           :hovered="store.hovered"
+          :slice-axis="store.resolvedSliceAxis"
+          :slice-offset="store.sliceOffset"
+          :section="store.section"
           @pick="store.toggleBody($event)"
           @hover="store.hovered = $event"
         />

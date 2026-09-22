@@ -78,6 +78,13 @@ class ConvertParams(BaseModel):
     # Which shells to convert, as indices into /bodies (largest first).
     # None converts every body, as before.
     bodies: list[int] | None = None
+    # 'loft': slice every body along an axis and loft the section outlines
+    # (Fusion's Mesh Section Sketch + Loft, automated); 'auto' is the
+    # prismatic / face-group / faceted ladder.
+    method: Literal['auto', 'loft'] = 'auto'
+    slice_mm: float = Field(0.2, gt=0, le=50, description='sliced loft: section spacing, mm')
+    slice_axis: Literal['auto', 'x', 'y', 'z'] = 'auto'
+    loft_ruled: bool = False
 
 
 @app.post('/api/jobs')
@@ -165,6 +172,65 @@ async def bodies(job_id: str):
         return sanitize(await run_in_threadpool(body_list, src))
     except Exception as e:
         raise HTTPException(400, f'could not split mesh: {e}')
+
+
+def _input_path(job_id):
+    job = jobs.get(job_id)
+    if job is None:
+        raise HTTPException(404, 'unknown job')
+    src = os.path.join(jobs.job_dir(job_id), job.get('input', ''))
+    if not job.get('input') or not os.path.exists(src):
+        raise HTTPException(404, 'no input file')
+    return job, src
+
+
+_AXES = ('x', 'y', 'z')
+
+
+@app.get('/api/jobs/{job_id}/section')
+async def section(job_id: str, axis: str = 'z', offset: float = 0.0, tol: float = 0.08,
+                  units: str = 'mm', scale: float = 1.0):
+    """One traced section of the uploaded mesh: the plane across `axis`
+    at `offset` mm from the bounding-box centre (Fusion's section-plane
+    slider), fitted as lines, arcs and splines within `tol`. Returns the
+    curves as 3-D polylines (mm, converted frame) for the viewer plus the
+    fit statistics."""
+    if axis not in _AXES:
+        raise HTTPException(400, 'axis must be x, y or z')
+    if not (0 < tol <= 5):
+        raise HTTPException(400, 'tol must be in (0, 5] mm')
+    _, src = _input_path(job_id)
+    from .sections import trace
+    try:
+        return sanitize(await run_in_threadpool(trace, src, axis, offset, tol, units, scale))
+    except Exception as e:
+        raise HTTPException(400, f'could not trace the section: {e}')
+
+
+@app.get('/api/jobs/{job_id}/section-script')
+async def section_script(job_id: str, axis: str = 'z', offset: float = 0.0, tol: float = 0.08,
+                         units: str = 'mm', scale: float = 1.0):
+    """The same section as a Fusion 360 script: one construction plane
+    and one sketch of lines, arcs, circles and fitted splines (Create Mesh
+    Section Sketch + Fit Curves to Mesh Section, in one go)."""
+    if axis not in _AXES:
+        raise HTTPException(400, 'axis must be x, y or z')
+    job, src = _input_path(job_id)
+    from .sections import trace
+    from stl2prism.fusion_export import emit_fusion_sections_script
+    try:
+        sec = await run_in_threadpool(trace, src, axis, offset, tol, units, scale)
+    except Exception as e:
+        raise HTTPException(400, f'could not trace the section: {e}')
+    name = f"section {axis.upper()}={sec['at']:.2f} mm ({offset:+.1f} from centre)"
+    text = emit_fusion_sections_script([{'origin': sec['origin'], 'normal': sec['normal'],
+                                         'name': name, 'loops': sec['loops']}])
+    stem = _EXT_RE.sub('', job.get('filename') or 'part')
+    safe = re.sub(r'[^\w.-]+', '_', stem) or 'part'
+    from fastapi.responses import Response
+    return Response(text, media_type='text/x-python',
+                    headers={'Content-Disposition':
+                             f'attachment; filename="{safe}_section_{axis}{offset:+.1f}.py"'})
 
 
 @app.get('/api/jobs/{job_id}/preview')

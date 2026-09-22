@@ -1,0 +1,734 @@
+"""Sliced loft: mesh -> stack of plane sections -> lofted B-spline solid.
+
+The automated form of what one does by hand in Fusion (Create Mesh
+Section Sketch at a spacing, Fit Curves to Mesh Section, Loft): slice the
+body along one axis at `interval` mm, redraw every section outline as a
+closed B-spline, and loft the stack into one smooth face per run of
+sections. Runs break at flat faces perpendicular to the axis (a real step
+becomes a real planar face, not a smear) and wherever the section topology
+changes (loop count, hole count). Holes along the axis are lofted on their
+own and cut. Runs that do not touch are bridged by extruding the earlier
+outline to the next run's first plane. A dome end (a run whose end ring is
+much smaller than the ring below it) is finished with a short ruled cone
+to the mesh's apex instead of a flat cap.
+
+Phase 0 measurements (docs/SLICED-LOFT.md) behind the recipe:
+  * Every ring of a run is fitted by least squares onto one shared
+    uniform periodic cubic B-spline basis (`fit_ring_poles`: K poles,
+    doubling until the samples sit within 0.05 mm), and
+    `BRepOffsetAPI_ThruSections` lofts those. The surface then has K x M
+    poles and ThruSections has no knot vectors to unify. The alternatives
+    measured: chord-length interpolating splines (the prototype) took
+    minutes and `makeSplineApprox` rings 13 s per cornered run (knot
+    unification), uniform interpolating splines built in 0.7 s but gave
+    an 11k-pole surface that could not be tessellated in minutes;
+    `SetSmoothing` and `SetMaxDegree` make ThruSections fail outright.
+  * A slice within a hair of a dome tip (a 0.2 mm ring) makes the smooth
+    surface flare by centimetres. End slices are therefore dropped when
+    they are tiny against their neighbour, and the tip is a ruled cone.
+  * A ruled loft is exact within d^2/(8R) and never flares; it is the
+    per-run fallback when the smooth solid is invalid or its volume is off
+    the section-area integral by more than 2 %, and the user option.
+
+`loft_body(mesh, axis, interval, ruled)` returns (TopoDS_Shape, build_info);
+build_info carries the thinned section outlines per run, which is what the
+generated Fusion script draws (fusion_export.emit_fusion_loft_script).
+"""
+import numpy as np
+
+from .section_fit import section_loops, to_3d, signed_area, douglas_peucker
+
+EPS = 1e-3                 # mm: end / level slices sit this far inside the material
+MAX_SECTIONS_PER_RUN = 60  # smooth loft sections per run (plan: ~60)
+STEP_AREA_FRAC = 0.02      # a flat level holding this share of the bbox section is a step
+END_AREA_FRAC = 0.5        # an end slice under this share of its neighbour is a dome tip
+PTS_PER_MM = 2.0           # ring resampling density before the spline approximation
+RING_MIN, RING_MAX = 32, 1200
+SPLINE_TOL = 0.02          # mm: Douglas-Peucker thinning of the rings kept for the Fusion script
+RING_FIT_TOL = 0.05        # mm: ring samples to their shared-basis B-spline
+RING_POLES_MIN, RING_POLES_MAX = 16, 640   # poles per ring (doubling until RING_FIT_TOL holds)
+VOL_CHECK_PCT = 1.0        # smooth run volume vs section-area integral before falling back to ruled
+RULED_VOL_PCT = 5.0        # a ruled run off by more than this is refused (twisted rings)
+SMOOTH_MAX_CHANGE = 0.15   # relative area jump between neighbours above which the pair is lofted ruled
+
+
+def axis_index(mesh, slice_axis='auto'):
+    """'auto' -> longest extent; 'x'|'y'|'z' -> 0|1|2."""
+    if slice_axis in (None, 'auto'):
+        return int(np.argmax(mesh.extents))
+    return 'xyz'.index(slice_axis)
+
+
+def _frame(axis):
+    n = np.zeros(3)
+    n[axis] = 1.0
+    from .section_fit import plane_basis
+    u, v, n = plane_basis(n)
+    return u, v, n
+
+
+# ---------------------------------------------------------------------------
+# where to slice
+
+def step_levels(mesh, axis, frac=STEP_AREA_FRAC, gap=0.05):
+    """Heights of flat faces perpendicular to the axis that hold more than
+    `frac` of the bounding cross-section area: the shoulders a loft must
+    not smooth across. Faces within `gap` mm of each other are one level
+    (a parting-line rim exported at three heights 0.01 mm apart is one
+    step, not three 0.01 mm runs)."""
+    n = mesh.face_normals[:, axis]
+    perp = np.abs(n) > 0.999
+    if not perp.any():
+        return []
+    zc = mesh.triangles_center[perp][:, axis]
+    ar = mesh.area_faces[perp]
+    o = np.argsort(zc)
+    zc, ar = zc[o], ar[o]
+    u, v = [i for i in range(3) if i != axis]
+    ref = float(mesh.extents[u] * mesh.extents[v])
+    out, i = [], 0
+    while i < len(zc):
+        j = i
+        while j + 1 < len(zc) and zc[j + 1] - zc[j] < gap:
+            j += 1
+        if ar[i:j + 1].sum() > frac * ref:
+            out.append(float(np.average(zc[i:j + 1], weights=ar[i:j + 1])))
+        i = j + 1
+    return out
+
+
+def slice_plan(mesh, axis, interval, levels):
+    """[(z_query, z_target, kind)] sorted by z_query. Regular slices every
+    `interval` from the low end; an 'end' slice EPS inside each end
+    (snapped onto the end); a 'level' pair EPS either side of each step
+    level (both snapped onto it, so the run above and the run below meet
+    exactly). Regular slices within 3*EPS of a snapped one are dropped."""
+    lo, hi = float(mesh.bounds[0][axis]), float(mesh.bounds[1][axis])
+    reqs = [(lo + EPS, lo, 'end'), (hi - EPS, hi, 'end')]
+    reqs += [(float(z), float(z), 'reg') for z in np.arange(lo + interval, hi - interval * 0.5, interval)]
+    for L in levels:
+        if L - lo < 2 * EPS or hi - L < 2 * EPS:
+            continue
+        reqs.append((L - EPS, L, 'level'))
+        reqs.append((L + EPS, L, 'level'))
+    reqs.sort()
+    keep = []
+    for r in reqs:
+        if r[2] == 'reg' and any(abs(r[0] - k[0]) < 3 * EPS for k in keep[-2:]):
+            continue
+        if keep and r[2] == 'reg' and keep[-1][2] != 'reg' and abs(r[0] - keep[-1][0]) < 3 * EPS:
+            continue
+        keep.append(r)
+    # a regular slice just before a snapped one
+    out = []
+    for i, r in enumerate(keep):
+        if r[2] == 'reg' and i + 1 < len(keep) and keep[i + 1][2] != 'reg' \
+                and abs(keep[i + 1][0] - r[0]) < 3 * EPS:
+            continue
+        out.append(r)
+    return out
+
+
+# ---------------------------------------------------------------------------
+# cutting
+
+class Cutter:
+    """Plane cuts of one mesh perpendicular to one axis, with the faces
+    pre-filtered by their extent along the axis (one boolean mask per cut
+    instead of the whole mesh through the chainer)."""
+
+    def __init__(self, mesh, axis):
+        self.V = np.asarray(mesh.vertices, float)
+        self.F = np.asarray(mesh.faces, np.int64)
+        self.axis = axis
+        z = self.V[:, axis][self.F]
+        self.zmin, self.zmax = z.min(1), z.max(1)
+        self.u, self.v, self.n = _frame(axis)
+
+    def cut(self, z):
+        """[(outer_xy, [hole_xy...])] in the plane frame, largest outer first."""
+        m = (self.zmin <= z) & (self.zmax >= z)
+        if not m.any():
+            return []
+        o = self.n * z
+        loops, _ = section_loops(self.V, self.F[m], o, self.n, min_area=1e-4)
+        return loops
+
+    def to_3d(self, xy, z):
+        return to_3d(xy, (self.n * z, self.u, self.v, self.n))
+
+
+def slice_mesh(mesh, axis, interval, verbose=True):
+    """All sections: [(z_target, kind, loops)] with empty cuts dropped,
+    plus the step levels used."""
+    levels = step_levels(mesh, axis, gap=max(0.05, interval / 2))
+    plan = slice_plan(mesh, axis, interval, levels)
+    cutter = Cutter(mesh, axis)
+    out = []
+    for zq, zt, kind in plan:
+        loops = cutter.cut(zq)
+        if loops:
+            out.append((zt, kind, loops))
+    if verbose:
+        print(f"[loft] axis {'xyz'[axis]}, {interval} mm: {len(out)} sections, "
+              f"{len(levels)} step level(s)"
+              + (f" at {[round(l, 2) for l in levels]}" if levels else ""))
+    return out, levels, cutter
+
+
+# ---------------------------------------------------------------------------
+# rings
+
+def resample(P, N):
+    """N points at equal arc length along the closed 2-D polyline P."""
+    P = np.asarray(P, float)
+    if len(P) > 1 and np.allclose(P[0], P[-1]):
+        P = P[:-1]
+    seg = np.linalg.norm(np.roll(P, -1, 0) - P, axis=1)
+    L = seg.sum()
+    cum = np.concatenate([[0.0], np.cumsum(seg)])
+    t = np.linspace(0, L, N, endpoint=False)
+    idx = np.clip(np.searchsorted(cum, t, side='right') - 1, 0, len(P) - 1)
+    frac = (t - cum[idx]) / np.maximum(seg[idx], 1e-12)
+    return P[idx] + (P[(idx + 1) % len(P)] - P[idx]) * frac[:, None]
+
+
+def ccw(Q):
+    return Q if signed_area(Q) > 0 else Q[::-1].copy()
+
+
+def align(Q, prev):
+    """Roll the ring so its start is nearest the previous ring's start
+    (least total squared distance), so the loft does not twist. The first
+    ring starts at its max-x point."""
+    if prev is None:
+        k = int(np.argmax(Q[:, 0] + 1e-3 * Q[:, 1]))
+        return np.roll(Q, -k, 0)
+    # vectorised over all rotations via the circulant distance
+    n = len(Q)
+    best, bk = None, 0
+    for k in range(n):
+        d = float(np.sum((np.roll(Q, -k, 0) - prev) ** 2))
+        if best is None or d < best:
+            best, bk = d, k
+    return np.roll(Q, -bk, 0)
+
+
+def _perimeter(xy):
+    return float(np.linalg.norm(np.roll(xy, -1, 0) - xy, axis=1).sum())
+
+
+def _ring_n(xy):
+    return int(np.clip(round(_perimeter(xy) * PTS_PER_MM), RING_MIN, RING_MAX))
+
+
+def _overlap(a, b, shrink=0.02):
+    """Overlap test of two 2-D loops without shapely: bounding boxes and
+    the fraction of a's vertices inside b (and b's inside a). The sample
+    points are pulled `shrink` of the way towards their loop's centroid
+    first: two identical sections (any prism) put every vertex exactly on
+    the other's edges, where a ray cast is a coin toss, and an axis-aligned
+    rectangle then scored 0 against its own twin."""
+    from .section_fit import point_in_loop
+    lo = np.maximum(a.min(0), b.min(0))
+    hi = np.minimum(a.max(0), b.max(0))
+    if (hi < lo).any():
+        return 0.0
+    ca, cb = a.mean(0), b.mean(0)
+    sa = a[::max(1, len(a) // 40)]
+    sb = b[::max(1, len(b) // 40)]
+    sa = ca + (sa - ca) * (1.0 - shrink)
+    sb = cb + (sb - cb) * (1.0 - shrink)
+    fa = np.mean([point_in_loop(p, b) for p in sa])
+    fb = np.mean([point_in_loop(p, a) for p in sb])
+    return max(fa, fb)
+
+
+def match(loops_a, loops_b):
+    """Outer i in a -> outer j in b, when the counts agree, every pair
+    overlaps and the hole counts agree; else None (a topology change)."""
+    if len(loops_a) != len(loops_b) or not loops_a:
+        return None
+    used, m = set(), []
+    for i, (ea, ha) in enumerate(loops_a):
+        best, bj = 0.0, -1
+        for j, (eb, hb) in enumerate(loops_b):
+            if j in used:
+                continue
+            ov = _overlap(ea, eb)
+            if ov > best:
+                best, bj = ov, j
+        if bj < 0 or best < 0.2 or len(ha) != len(loops_b[bj][1]):
+            return None
+        used.add(bj)
+        m.append(bj)
+    return m
+
+
+def match_holes(ha, hb):
+    """Hole i in ha -> nearest hole (by centroid) in hb."""
+    used, m = set(), []
+    ca = [h.mean(0) for h in ha]
+    cb = [h.mean(0) for h in hb]
+    for i in range(len(ha)):
+        best, bj = None, -1
+        for j in range(len(hb)):
+            if j in used:
+                continue
+            d = float(np.linalg.norm(ca[i] - cb[j]))
+            if best is None or d < best:
+                best, bj = d, j
+        used.add(bj)
+        m.append(bj)
+    return m
+
+
+# ---------------------------------------------------------------------------
+# runs
+
+def _total_area(loops):
+    return sum(abs(signed_area(o)) - sum(abs(signed_area(h)) for h in hs) for o, hs in loops)
+
+
+def drop_dome_ends(slices):
+    """Remove an end slice whose material area is under END_AREA_FRAC of
+    its neighbour's: that ring is the last sliver of a dome, and lofting
+    through it makes the smooth surface flare. Returns (slices, apex_lo,
+    apex_hi): the flags say which ends want a cone to the apex."""
+    apex_lo = apex_hi = False
+    if len(slices) >= 2 and slices[0][1] == 'end' and \
+            _total_area(slices[0][2]) < END_AREA_FRAC * _total_area(slices[1][2]):
+        slices = slices[1:]
+        apex_lo = True
+    if len(slices) >= 2 and slices[-1][1] == 'end' and \
+            _total_area(slices[-1][2]) < END_AREA_FRAC * _total_area(slices[-2][2]):
+        slices = slices[:-1]
+        apex_hi = True
+    return slices, apex_lo, apex_hi
+
+
+def build_runs(slices):
+    """Group consecutive sections into runs of constant topology.
+
+    Returns [(i, j, chains)]: slices i..j inclusive belong to the run, and
+    chains[c] is the list of (outer_xy, holes_xy) of outer c through the
+    run. A run ends where the next slice does not match (loop or hole
+    count, overlap) and at a snapped level pair (two slices at the same
+    height), so the flat face between them becomes a real planar face."""
+    runs, i = [], 0
+    while i < len(slices):
+        j = i
+        chains = [[lp] for lp in slices[i][2]]
+        while j + 1 < len(slices):
+            if abs(slices[j + 1][0] - slices[j][0]) < 1e-9:
+                break                      # snapped pair: the step is the boundary
+            m = match(slices[j][2], slices[j + 1][2])
+            if m is None:
+                break
+            nxt = slices[j + 1][2]
+            for ci, mj in enumerate(m):
+                chains[ci].append(nxt[mj])
+            j += 1
+        runs.append((i, j, chains))
+        i = j + 1
+    return runs
+
+
+def thin_indices(n, max_n=MAX_SECTIONS_PER_RUN, areas=None, change=0.02):
+    """Indices to keep out of n sections, at most max_n: first and last
+    always; with `areas` (one per section) a section is kept where the
+    outline has changed by more than `change` (relative area) since the
+    last kept one, plus an even backbone so no gap exceeds n/max_n
+    sections. Where the outline changes fast (a dome tip, a fillet) the
+    kept sections crowd; along a straight stretch they thin out. Without
+    areas, an even spread."""
+    if n <= max_n:
+        return list(range(n))
+    even = set(int(round(x)) for x in np.linspace(0, n - 1, max_n // 2))
+    if areas is None:
+        return sorted(set(int(round(x)) for x in np.linspace(0, n - 1, max_n)))
+    keep = [0]
+    for i in range(1, n - 1):
+        a0, a1 = areas[keep[-1]], areas[i]
+        if i in even or abs(a1 - a0) > change * max(a0, 1e-12):
+            keep.append(i)
+    keep.append(n - 1)
+    if len(keep) > max_n:
+        # too many changes to keep them all: an even pick among them
+        keep = [keep[int(round(x))] for x in np.linspace(0, len(keep) - 1, max_n)]
+    return sorted(set(keep))
+
+
+# ---------------------------------------------------------------------------
+# OCC
+
+# --- ring curves: one shared uniform periodic cubic B-spline basis per run
+
+def _ubs_design(N, K):
+    """Design matrix (N x K) of a uniform periodic cubic B-spline with K
+    poles, knots at the integers 0..K, sampled at t_i = i K / N. Pole
+    indexing follows OCC's Geom_BSplineCurve(periodic=True) convention:
+    the span [i, i+1) blends poles i .. i+3 (mod K)."""
+    t = np.arange(N) * (K / N)
+    seg = np.floor(t).astype(int)
+    u = t - seg
+    b = ((1 - u) ** 3 / 6, (3 * u ** 3 - 6 * u ** 2 + 4) / 6,
+         (-3 * u ** 3 + 3 * u ** 2 + 3 * u + 1) / 6, u ** 3 / 6)
+    A = np.zeros((N, K))
+    rows = np.arange(N)
+    for k in range(4):
+        np.add.at(A, (rows, (seg + k) % K), b[k])
+    return A
+
+
+def fit_ring_poles(rings, tol=RING_FIT_TOL, kmin=RING_POLES_MIN, kmax=RING_POLES_MAX):
+    """Least-squares poles of every ring on one shared basis.
+
+    `rings`: (N, d) arrays with the same N (equal-arc-length samples,
+    aligned). The pole count K doubles from kmin until every ring's
+    samples sit within `tol` of its curve, or K reaches kmax or N/2.
+    Sharing the basis is what keeps the loft light and robust: the
+    surface has K x M poles (a sphere: 16 x 60) and ThruSections has no
+    knot vectors to unify. Returns (poles [(K, d)], K, worst_dev)."""
+    N = len(rings[0])
+    kmax = max(kmin, min(kmax, N // 2))
+    K = min(kmin, kmax)
+    while True:
+        A = _ubs_design(N, K)
+        pinv = np.linalg.pinv(A)
+        poles = [pinv @ np.asarray(r, float) for r in rings]
+        dev = max(float(np.linalg.norm(A @ q - np.asarray(r, float), axis=1).max())
+                  for q, r in zip(poles, rings))
+        if dev <= tol or K >= kmax:
+            return poles, K, dev
+        K = min(kmax, K * 2)
+
+
+def _wire_from_poles(poles3d):
+    """Closed periodic cubic B-spline wire from (K, 3) poles on the
+    uniform knot vector 0..K (see _ubs_design)."""
+    import cadquery as cq
+    from OCP.Geom import Geom_BSplineCurve
+    from OCP.TColgp import TColgp_Array1OfPnt
+    from OCP.TColStd import TColStd_Array1OfReal, TColStd_Array1OfInteger
+    from OCP.gp import gp_Pnt
+    from OCP.BRepBuilderAPI import BRepBuilderAPI_MakeEdge
+    K = len(poles3d)
+    arr = TColgp_Array1OfPnt(1, K)
+    for i, q in enumerate(poles3d):
+        arr.SetValue(i + 1, gp_Pnt(float(q[0]), float(q[1]), float(q[2])))
+    knots = TColStd_Array1OfReal(1, K + 1)
+    mults = TColStd_Array1OfInteger(1, K + 1)
+    for i in range(K + 1):
+        knots.SetValue(i + 1, float(i))
+        mults.SetValue(i + 1, 1)
+    c = Geom_BSplineCurve(arr, knots, mults, 3, True)
+    return cq.Wire.assembleEdges([cq.Edge(BRepBuilderAPI_MakeEdge(c).Edge())])
+
+
+def _ring_wires(rings3d, tol=RING_FIT_TOL):
+    """Wires for a run's rings on one shared basis; (wires, K, dev)."""
+    poles, K, dev = fit_ring_poles(rings3d, tol)
+    return [_wire_from_poles(q) for q in poles], K, dev
+
+
+def _ring_wire(pts3d):
+    """One ring on its own basis."""
+    return _ring_wires([pts3d])[0][0]
+
+
+def _thru(wires, ruled, apex=None, apex_first=False):
+    """ThruSections solid through wires (cadquery's defaults: no smoothing
+    flags, those make OCC fail). `apex` is an optional 3-D point added as
+    a vertex section at the start (apex_first) or the end."""
+    import cadquery as cq
+    from OCP.BRepOffsetAPI import BRepOffsetAPI_ThruSections
+    from OCP.BRepBuilderAPI import BRepBuilderAPI_MakeVertex
+    from OCP.gp import gp_Pnt
+    ts = BRepOffsetAPI_ThruSections(True, bool(ruled), 1e-6)
+    if apex is not None and apex_first:
+        ts.AddVertex(BRepBuilderAPI_MakeVertex(gp_Pnt(*map(float, apex))).Vertex())
+    for w in wires:
+        ts.AddWire(w.wrapped)
+    if apex is not None and not apex_first:
+        ts.AddVertex(BRepBuilderAPI_MakeVertex(gp_Pnt(*map(float, apex))).Vertex())
+    ts.Build()
+    if not ts.IsDone():
+        raise RuntimeError('ThruSections failed')
+    s = cq.Shape.cast(ts.Shape())
+    if s.wrapped.IsNull():
+        raise RuntimeError('ThruSections gave a null shape')
+    return s
+
+
+def _valid(shape):
+    from OCP.BRepCheck import BRepCheck_Analyzer
+    return BRepCheck_Analyzer(shape.wrapped).IsValid()
+
+
+def _volume(shape):
+    """Adaptive volume: cq's Volume() is 1-2 % off on B-spline faces."""
+    from .pipeline import accurate_volume
+    return accurate_volume(shape)
+
+
+def _stretches(areas, max_change=None):
+    """Split a run's ring indices into stretches: consecutive rings whose
+    material area changes by at most `max_change` (relative) stay in one
+    smooth stretch; a jump bigger than that is lofted ruled between the
+    two rings. A smooth B-spline through sections that shrink by half per
+    step (a dome tip) overshoots by tenths of a millimetre; a ruled pair
+    there is exact within d^2/8R. Returns [(i0, i1, smooth)] covering
+    0..n-1 with shared ends."""
+    if max_change is None:
+        max_change = SMOOTH_MAX_CHANGE
+    n = len(areas)
+    steep = [abs(areas[i + 1] - areas[i]) > max_change * max(min(areas[i], areas[i + 1]), 1e-12)
+             for i in range(n - 1)]
+    out, i = [], 0
+    while i < n - 1:
+        j = i
+        while j < n - 1 and steep[j] == steep[i]:
+            j += 1
+        out.append((i, j, not steep[i]))
+        i = j
+    return out
+
+
+def _loft_rings(rings3d, areas, zs, ruled, tag, verbose):
+    """Solid through 3-D rings (each (N, 3), same N, aligned) on one shared
+    spline basis. Smooth unless `ruled`, in stretches: where the section
+    area jumps by more than SMOOTH_MAX_CHANGE between neighbours the pair
+    is lofted ruled (_stretches). A smooth stretch that comes out invalid
+    or off the trapezoid integral of its areas by more than VOL_CHECK_PCT
+    is rebuilt ruled. The stretch solids are glued into one. A result off
+    the whole run's integral by more than RULED_VOL_PCT is refused
+    (raises): the rings do not correspond. Returns (solid, used_ruled)."""
+    wires, K, dev = _ring_wires(rings3d)
+    if verbose and dev > RING_FIT_TOL:
+        print(f"[loft] {tag}: rings fit to {dev:.3f} mm with {K} poles (cap)")
+    est = float(np.trapezoid(areas, zs)) if len(zs) > 1 else 0.0
+    used_ruled = bool(ruled)
+    pieces = []
+    for i0, i1, smooth in _stretches(areas):
+        w = wires[i0:i1 + 1]
+        e = float(np.trapezoid(areas[i0:i1 + 1], zs[i0:i1 + 1]))
+        if smooth and not ruled and len(w) >= 2:
+            try:
+                piece = _thru(w, False)
+                off = abs(_volume(piece) - e) / e * 100 if e > 0 else 0.0
+                if _valid(piece) and off <= VOL_CHECK_PCT:
+                    pieces.append(piece)
+                    continue
+                if verbose:
+                    print(f"[loft] {tag} {zs[i0]:.2f}..{zs[i1]:.2f}: smooth loft "
+                          f"{'invalid' if not _valid(piece) else f'volume off by {off:.1f}%'}; ruled instead")
+            except Exception as ex:
+                if verbose:
+                    print(f"[loft] {tag} {zs[i0]:.2f}..{zs[i1]:.2f}: smooth loft failed "
+                          f"({type(ex).__name__}: {ex}); ruled instead")
+        pieces.append(_thru(w, True))
+        used_ruled = True
+    if len(pieces) == 1:
+        solid = pieces[0]
+    else:
+        solid, how = _fuse_all(pieces, False)
+        if how == 'compound':
+            solid = _thru(wires, True)
+            used_ruled = True
+    vol = _volume(solid)
+    off = abs(vol - est) / est * 100 if est > 0 else 0.0
+    if off > RULED_VOL_PCT:
+        raise RuntimeError(f'loft volume off the section integral by {off:.0f}%; '
+                           f'the rings do not correspond')
+    return solid, used_ruled
+
+
+def _extrude(outer3d, holes3d, d):
+    """Prism of an outline (minus its holes) along d: a ruled loft between
+    the ring and its translated copy. extrudeLinear refuses B-spline
+    wires as 'not planar' at its tolerance, so it is not used."""
+    d = np.asarray(d, float)
+    body = _thru(_ring_wires([outer3d, outer3d + d])[0], True)
+    for h in holes3d:
+        tool = _thru(_ring_wires([h - d * 0.01, h + d * 1.01])[0], True)
+        body = body.cut(tool)
+    return body
+
+
+def _fuse_all(solids, verbose, tol_pct=2.0):
+    """One shape from the run solids: glued fuse (they share planar caps),
+    else a fuzzy fuse, else a compound of the solids with a warning. The
+    pieces only touch, so a fuse whose volume is not the sum of theirs
+    (within tol_pct) is wrong however valid it looks: a glued fuse of 19
+    pieces of a block once returned a 'valid' 533 mm^3 out of 24000."""
+    import cadquery as cq
+    if len(solids) == 1:
+        return solids[0], 'single'
+    total = sum(_volume(x) for x in solids)
+    for how, kw in (('glue', dict(glue=True)), ('fuzzy', dict(tol=1e-3))):
+        try:
+            s = solids[0].fuse(*solids[1:], **kw).clean()
+            vol = _volume(s)
+            off = abs(vol - total) / total * 100 if total > 0 else 0.0
+            if _valid(s) and len(s.Solids()) == 1 and off <= tol_pct:
+                return s, how
+            if verbose:
+                print(f"[loft] {how} fuse gave {len(s.Solids())} solid(s), valid {_valid(s)}, "
+                      f"volume off the pieces' sum by {off:.1f}%")
+        except Exception as e:
+            if verbose:
+                print(f"[loft] {how} fuse failed ({type(e).__name__}: {e})")
+    if verbose:
+        print(f"[loft] runs left as {len(solids)} separate solids in one compound")
+    return cq.Compound.makeCompound(solids), 'compound'
+
+
+# ---------------------------------------------------------------------------
+# the body
+
+def loft_body(mesh, axis, interval=0.2, ruled=False, verbose=True):
+    """Sliced-loft solid of one closed body. Returns (TopoDS_Shape, info).
+
+    info: {'mode': 'loft', 'axis': [..], 'axis_name', 'interval', 'ruled'
+    (requested), 'n_sections', 'n_runs', 'n_levels', 'n_holes',
+    'n_ruled_runs', 'fuse', 'runs': [{'z0', 'z1', 'n', 'ruled', 'sections':
+    [{'z', 'outer': [[x, y, z], ...], 'holes': [[...], ...]}]}]} where the
+    section outlines are the thinned rings the loft went through, thinned
+    again by Douglas-Peucker at SPLINE_TOL for the Fusion script.
+    """
+    import cadquery as cq
+    if isinstance(axis, str):
+        axis = axis_index(mesh, axis)
+    slices, levels, cutter = slice_mesh(mesh, axis, interval, verbose)
+    if len(slices) < 2:
+        raise RuntimeError(f'only {len(slices)} section(s) along {"xyz"[axis]}; nothing to loft')
+    slices, apex_lo, apex_hi = drop_dome_ends(slices)
+    runs = build_runs(slices)
+    if verbose:
+        print(f"[loft] {len(runs)} run(s): "
+              + ", ".join(f"{slices[a][0]:.2f}..{slices[b][0]:.2f} ({b - a + 1} sections, {len(c)} outline(s))"
+                          for a, b, c in runs))
+    lo, hi = float(mesh.bounds[0][axis]), float(mesh.bounds[1][axis])
+    ax_vec = np.zeros(3)
+    ax_vec[axis] = 1.0
+
+    solids, run_infos, n_holes, n_ruled, skipped = [], [], 0, 0, []
+    for ri, (a, b, chains) in enumerate(runs):
+        zs_all = [slices[k][0] for k in range(a, b + 1)]
+        keep = thin_indices(len(zs_all), areas=[_total_area(slices[k][2]) for k in range(a, b + 1)])
+        zs = [zs_all[k] for k in keep]
+        rinfo = {'z0': zs[0], 'z1': zs[-1], 'n': len(zs), 'ruled': bool(ruled), 'sections': []}
+        secs = [{'z': z, 'outer': None, 'holes': []} for z in zs]
+        distinct = abs(zs[-1] - zs[0]) > 1e-6 and len(zs) >= 2
+        for ci, chain in enumerate(chains):
+            chain = [chain[k] for k in keep]
+            N = max(_ring_n(e) for e, _ in chain)
+            rings, prev = [], None
+            for (e, _) in chain:
+                Q = align(ccw(resample(e, N)), prev)
+                rings.append(Q)
+                prev = Q
+            rings3d = [cutter.to_3d(Q, z) for Q, z in zip(rings, zs)]
+            for si, r3 in enumerate(rings3d):
+                pts = r3[douglas_peucker(np.vstack([r3, r3[:1]]), SPLINE_TOL)[:-1]]
+                secs[si]['outer'] = pts.tolist() if ci == 0 else secs[si].get('outer')
+                if ci > 0:
+                    secs[si].setdefault('more_outers', []).append(pts.tolist())
+            if not distinct:
+                continue
+            areas = [abs(signed_area(Q)) for Q in rings]
+            tag = f"run {ri + 1} outline {ci + 1}"
+            try:
+                body, used_ruled = _loft_rings(rings3d, areas, zs, ruled, tag, verbose)
+            except Exception as e:
+                # one outline of one run must not cost the body: the gap it
+                # leaves shows up in the deviation check
+                skipped.append(f"{tag}: {type(e).__name__}: {e}")
+                if verbose:
+                    print(f"[loft] {tag} skipped ({type(e).__name__}: {e})")
+                continue
+            n_ruled += used_ruled
+            rinfo['ruled'] = rinfo['ruled'] or used_ruled
+            # holes: chained by centroid, lofted the same way, cut
+            nh = len(chain[0][1])
+            for hi_ in range(nh):
+                hrings, prev, hidx = [], None, hi_
+                for k, (e, holes) in enumerate(chain):
+                    if k > 0:
+                        hidx = match_holes(chain[k - 1][1], holes)[hidx]
+                    hp = holes[hidx]
+                    Nh = _ring_n(hp) if k == 0 else len(hrings[0])
+                    Q = align(ccw(resample(hp, Nh)), prev)
+                    hrings.append(Q)
+                    prev = Q
+                h3d = [cutter.to_3d(Q, z) for Q, z in zip(hrings, zs)]
+                for si, r3 in enumerate(h3d):
+                    pts = r3[douglas_peucker(np.vstack([r3, r3[:1]]), SPLINE_TOL)[:-1]]
+                    secs[si]['holes'].append(pts.tolist())
+                # the cutter runs a hair past both ends so the cut is clean
+                d = ax_vec * EPS
+                h3d[0] = h3d[0] - d
+                h3d[-1] = h3d[-1] + d
+                hareas = [abs(signed_area(Q)) for Q in hrings]
+                htag = tag + f" hole {hi_ + 1}"
+                try:
+                    tool, _ = _loft_rings(h3d, hareas, zs, ruled or used_ruled, htag, verbose)
+                    cut = body.cut(tool)
+                    if cut.wrapped.IsNull() or not _valid(cut):
+                        raise RuntimeError('cut gave an invalid solid')
+                    body = cut
+                    n_holes += 1
+                except Exception as e:
+                    skipped.append(f"{htag}: {type(e).__name__}: {e}")
+                    if verbose:
+                        print(f"[loft] {htag} left filled ({type(e).__name__}: {e})")
+            # dome tips: a ruled cone from the end ring to the mesh apex
+            for at_end, want, ring, r3, zend in ((ri == 0, apex_lo, rings[0], rings3d[0], lo),
+                                                 (ri == len(runs) - 1, apex_hi, rings[-1], rings3d[-1], hi)):
+                if not (at_end and want and nh == 0):
+                    continue
+                touching = abs((zs[0] if zend == lo else zs[-1]) - (slices[0][0] if zend == lo else slices[-1][0])) < 1e-9
+                if not touching:
+                    continue
+                try:
+                    apex = cutter.to_3d(ring.mean(0)[None, :], zend)[0]
+                    solids.append(_thru([_ring_wire(r3)], True, apex, apex_first=(zend == lo)))
+                except Exception as e:
+                    skipped.append(f"{tag} apex cone: {type(e).__name__}: {e}")
+                    if verbose:
+                        print(f"[loft] {tag} apex cone skipped ({type(e).__name__}: {e})")
+            solids.append(body)
+        rinfo['sections'] = secs
+        run_infos.append(rinfo)
+
+    # bridges: a run's last outline extruded to the next run's first plane
+    for (a0, b0, ch0), (a1, b1, ch1) in zip(runs, runs[1:]):
+        za, zb = slices[b0][0], slices[a1][0]
+        gap = zb - za
+        if gap < 1e-6:
+            continue
+        for chain in ch0:
+            e, holes = chain[-1]
+            try:
+                o3 = cutter.to_3d(ccw(resample(e, _ring_n(e))), za)
+                h3 = [cutter.to_3d(ccw(resample(h, _ring_n(h))), za) for h in holes]
+                solids.append(_extrude(o3, h3, ax_vec * gap))
+            except Exception as e_:
+                skipped.append(f"bridge {za:.2f}..{zb:.2f}: {type(e_).__name__}: {e_}")
+                if verbose:
+                    print(f"[loft] bridge {za:.2f}..{zb:.2f} skipped ({type(e_).__name__}: {e_})")
+        if verbose:
+            print(f"[loft] bridged {za:.2f}..{zb:.2f} by extrusion")
+    if not solids:
+        raise RuntimeError('no run could be lofted')
+    shape, how = _fuse_all(solids, verbose)
+    if verbose:
+        print(f"[loft] {len(solids)} solid(s) -> {len(shape.Faces())} faces "
+              f"({how} fuse), volume {_volume(shape):.0f} mm^3")
+    info = {'mode': 'loft', 'axis': ax_vec.tolist(), 'axis_name': 'xyz'[axis],
+            'interval': float(interval), 'ruled': bool(ruled),
+            'n_sections': len(slices), 'n_runs': len(runs), 'n_levels': len(levels),
+            'n_holes': n_holes, 'n_ruled_runs': int(n_ruled), 'fuse': how,
+            'faces': len(shape.Faces()), 'skipped': skipped, 'runs': run_infos}
+    return shape.wrapped, info

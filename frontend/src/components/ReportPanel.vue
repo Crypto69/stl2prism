@@ -66,6 +66,15 @@ const verdict = computed(() => {
       return { title: 'Prismatic solid', cls: 'prismatic',
                note: 'Clean BREP with true planes and cylinders — every gate below passed.' }
     }
+    if (r.mode === 'loft') {
+      const lf = r.metrics?.loft || {}
+      const runs = lf.n_runs === 1 ? 'one run' : `${lf.n_runs} runs`
+      const gate = r.metrics?.gate_ok === false
+        ? ' The gate below did not pass; the loft is written anyway because you chose the method — the deviation is usually a sideways hole or a corner the smooth surface cannot follow.'
+        : ' Every gate below passed.'
+      return { title: 'Sliced loft solid', cls: 'loft',
+               note: `${lf.n_sections} sections along ${(lf.axis_name || '?').toUpperCase()} at ${lf.interval} mm, ${runs}${lf.n_levels ? ` (split at ${lf.n_levels} flat step${lf.n_levels === 1 ? '' : 's'})` : ''}${lf.n_holes ? `, ${lf.n_holes} hole${lf.n_holes === 1 ? '' : 's'} cut` : ''}: one smooth face per run${lf.n_ruled_runs ? ` (${lf.n_ruled_runs} run${lf.n_ruled_runs === 1 ? '' : 's'} ruled)` : ''}, like Fusion's Mesh Section Sketch + Loft.${gate}` }
+    }
     if (r.mode === 'facegroup') {
       const fg = r.metrics?.fgroup || {}
       const bt = fg.by_type || {}
@@ -83,6 +92,7 @@ const verdict = computed(() => {
   const parts = []
   if (m.n_prismatic) parts.push(`${m.n_prismatic} prismatic`)
   if (m.n_facegroup) parts.push(`${m.n_facegroup} face-group`)
+  if (m.n_loft) parts.push(`${m.n_loft} sliced-loft`)
   if (m.n_faceted) parts.push(`${m.n_faceted} faceted`)
   if (m.n_failed) parts.push(`${m.n_failed} failed`)
   const dropped = r.n_dropped
@@ -101,7 +111,7 @@ const bodyRows = computed(() =>
     faces: b.faces.toLocaleString(),
     mode: b.error ? 'failed' : b.mode,
     detail: b.error ? b.error
-      : (b.mode === 'prismatic' || b.mode === 'facegroup')
+      : (b.mode === 'prismatic' || b.mode === 'facegroup' || b.mode === 'loft')
         ? `p95 ${fmt(b.metrics.dev_p95)} · max ${fmt(b.metrics.dev_max)} mm`
         : `${b.metrics.faces_out.toLocaleString()} faces`
           + (b.metrics.is_solid === false ? ' · open shell' : ''),
@@ -110,7 +120,7 @@ const bodyRows = computed(() =>
 // The inspection card: measured value vs the limit the run was gated on.
 const gates = computed(() => {
   const r = store.result
-  if (!r?.ok || (r.mode !== 'prismatic' && r.mode !== 'facegroup') || bodies.value) return []
+  if (!r?.ok || (r.mode !== 'prismatic' && r.mode !== 'facegroup' && r.mode !== 'loft') || bodies.value) return []
   const m = r.metrics
   const p = r.params
   const rows = [
@@ -182,7 +192,7 @@ const outputRows = computed(() => {
   }
   if (bodies.value) {
     // per-body detail lives in the bodies table; only file-level rows here
-  } else if (r.mode === 'prismatic' || r.mode === 'facegroup') {
+  } else if (r.mode === 'prismatic' || r.mode === 'facegroup' || r.mode === 'loft') {
     rows.push(['Mean deviation', `${fmt(r.metrics.dev_mean)} mm`])
     rows.push(['Worst point at', `(${(r.metrics.dev_max_xyz || []).join(', ')}) mm`])
     if (r.metrics.vol_solid != null) {
@@ -288,6 +298,9 @@ const reduction = computed(() => {
       <p v-if="store.scriptUrl" class="hint">
         The script rebuilds the recognised sketches and extrudes as an editable program — change a radius or height and re-run it to get a new STEP.
       </p>
+      <p v-if="store.fusionScriptUrl && store.result?.mode === 'loft'" class="hint">
+        The Fusion script repeats the sliced loft as a timeline: one sketch per section on an offset plane with a closed fitted spline per outline, then a Loft per run (holes as a Loft cut). To run: put the .py in an empty folder, then in Fusion Utilities → Add-Ins → Scripts and Add-Ins → + → choose that folder → Run.
+      </p>
       <p v-if="store.fusionBfillScriptUrl" class="hint">
         The Boundary Fill script rebuilds every fitted surface inside Fusion and lets Fusion compute the edges between them, so the face-group solid comes out without the mesh's zig-zag edges. Works on cleanly fitted parts (fillets around curved edges are one torus tool each, a pointed cone is one solid cone tool, a tapered fillet's band chain is one approximate tool); the reported outlook comes from an OpenCascade dry run of the script itself. To run: put the .py in an empty folder, then in Fusion Utilities → Add-Ins → Scripts and Add-Ins → + → choose that folder → Run.
       </p>
@@ -344,6 +357,8 @@ th { text-align: left; font-weight: 600; }
 .mode.faceted { border-color: var(--muted); color: var(--text); }
 .mode.facegroup { border-color: var(--edge); color: var(--text); }
 .mode.mixed { border-color: var(--edge); color: var(--text); }
+.mode.loft { border-color: var(--edge); color: var(--text); }
+.bodies td.loft { color: var(--edge); }
 .bodies td:first-child { color: var(--muted); }
 .bodies td.prismatic { color: var(--edge); font-weight: 600; }
 .bodies td.facegroup { color: var(--edge); }

@@ -23,9 +23,17 @@ export const DEFAULT_PARAMS = {
   accept_vol_pct: 2.0,
   force_prismatic: false,
   face_groups: true,
+  // 'auto': the prismatic / face-group / faceted ladder. 'loft': slice the
+  // body along an axis and loft the section outlines (Fusion's Create Mesh
+  // Section Sketch + Fit Curves + Loft, automated).
+  method: 'auto',
+  slice_mm: 0.2,
+  slice_axis: 'auto',
+  loft_ruled: false,
 }
 
 let pollTimer = null
+let traceSeq = 0
 
 export const useConvertStore = defineStore('convert', {
   state: () => ({
@@ -52,6 +60,13 @@ export const useConvertStore = defineStore('convert', {
     // body indices ticked for conversion; empty means "all of them"
     selected: [],
     hovered: -1,
+    // single slice (sliced-loft method): where the plane sits along the
+    // chosen axis, in mm from the part's centre (Fusion's slider), and the
+    // last traced section from /section
+    sliceOffset: 0,
+    section: null,
+    sectionBusy: false,
+    sectionError: null,
   }),
 
   getters: {
@@ -73,11 +88,39 @@ export const useConvertStore = defineStore('convert', {
       s.status === 'done' && s.result?.ok && s.result?.has_script
         ? `/api/jobs/${s.jobId}/script`
         : null,
+    // prismatic bodies write it next to the CadQuery script; sliced lofts
+    // write it on its own (has_fusion_script), older results only say has_script
     fusionScriptUrl: (s) =>
-      s.status === 'done' && s.result?.ok && s.result?.has_script
+      s.status === 'done' && s.result?.ok
+        && (s.result?.has_fusion_script ?? s.result?.has_script)
         ? `/api/jobs/${s.jobId}/fusion-script`
         : null,
     bfillCheck: (s) => (s.status === 'done' && s.result?.ok ? s.result?.bfill_check || null : null),
+    // half the part's side along the resolved slice axis, mm: the slider's range
+    sliceHalfExtent: (s) => {
+      const a = s.resolvedSliceAxis
+      const bb = s.inputStats?.bbox_mm
+      if (!a || !bb) return 0
+      return (bb['xyz'.indexOf(a)] * s.unitScale) / 2
+    },
+    sectionScriptUrl: (s) => {
+      const a = s.resolvedSliceAxis
+      if (!s.jobId || !a) return null
+      const q = new URLSearchParams({ axis: a, offset: String(s.sliceOffset), tol: String(s.params.tol),
+                                      units: s.params.units, scale: String(s.params.scale) })
+      return `/api/jobs/${s.jobId}/section-script?${q}`
+    },
+    // The axis the sliced loft will cut along, with 'auto' resolved to the
+    // file's longest side the way sliced_loft.axis_index does; null when
+    // the loft is not the chosen method. Drives the plane in the 3D view.
+    resolvedSliceAxis: (s) => {
+      if (s.params.method !== 'loft') return null
+      const a = s.params.slice_axis
+      if (a === 'x' || a === 'y' || a === 'z') return a
+      const bb = s.inputStats?.bbox_mm
+      if (!bb) return null
+      return 'xyz'[bb.indexOf(Math.max(...bb))]
+    },
     fusionBfillScriptUrl: (s) =>
       s.status === 'done' && s.result?.ok && s.result?.has_bfill_script
         ? `/api/jobs/${s.jobId}/fusion-bfill-script`
@@ -100,6 +143,7 @@ export const useConvertStore = defineStore('convert', {
         this.$patch({
           status: 'ready', jobId: data.id, inputStats: data.input_stats,
           bodies: [], triangleBody: null, selected: [], hovered: -1,
+          sliceOffset: 0, section: null, sectionError: null,
         })
         this.loadBodies()
       } catch (e) {
@@ -215,6 +259,29 @@ export const useConvertStore = defineStore('convert', {
 
     resetParams() {
       this.params = { ...DEFAULT_PARAMS }
+    },
+
+    // Trace the slice at the current offset. Debounced by the caller (the
+    // slider fires continuously); a stale answer is dropped.
+    async traceSection() {
+      const a = this.resolvedSliceAxis
+      if (!this.jobId || !a) return
+      const q = new URLSearchParams({ axis: a, offset: String(this.sliceOffset), tol: String(this.params.tol),
+                                      units: this.params.units, scale: String(this.params.scale) })
+      const mine = ++traceSeq
+      this.sectionBusy = true
+      try {
+        const res = await fetch(`/api/jobs/${this.jobId}/section?${q}`)
+        if (!res.ok) throw new Error(await errText(res))
+        const sec = await res.json()
+        if (mine !== traceSeq) return
+        this.section = sec
+        this.sectionError = null
+      } catch (e) {
+        if (mine === traceSeq) { this.section = null; this.sectionError = e.message }
+      } finally {
+        if (mine === traceSeq) this.sectionBusy = false
+      }
     },
   },
 })

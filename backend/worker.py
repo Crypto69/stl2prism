@@ -41,6 +41,10 @@ def main():
                 reduce_tol=params.get('reduce_tol', 0.05),
                 face_groups=params.get('face_groups', True),
                 bodies=picked or None,
+                method=params.get('method', 'auto'),
+                slice_mm=params.get('slice_mm', 0.2),
+                slice_axis=params.get('slice_axis', 'auto'),
+                loft_ruled=params.get('loft_ruled', False),
                 verbose=True)
         # Pass the whole pipeline result through (mode, metrics, and for
         # multi-body files the per-body list and counts).
@@ -49,6 +53,10 @@ def main():
         result.pop('script', None)     # server path; the API serves it by job id
         result['has_bfill_script'] = bool(r.get('bfill_script'))
         result.pop('bfill_script', None)
+        # the Fusion script exists for prismatic bodies (next to the
+        # CadQuery script) and for sliced lofts (on its own)
+        result['has_fusion_script'] = bool(r.get('fusion_script'))
+        result.pop('fusion_script', None)
     except Exception as e:
         traceback.print_exc()
         result['error'] = f'{type(e).__name__}: {e}'

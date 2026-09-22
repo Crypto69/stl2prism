@@ -1,5 +1,5 @@
 <script setup>
-import { computed, ref } from 'vue'
+import { computed, ref, watch } from 'vue'
 import { useConvertStore, DEFAULT_PARAMS, UNITS } from '../store'
 
 const store = useConvertStore()
@@ -60,6 +60,53 @@ const longest = computed(() =>
 const openInfo = ref(null)
 const toggleInfo = (key) => { openInfo.value = openInfo.value === key ? null : key }
 const isDefault = (key) => store.params[key] === DEFAULT_PARAMS[key]
+const isLoft = computed(() => store.params.method === 'loft')
+// Single slice: the plane follows the slider at once; the trace (a cut
+// plus a curve fit, a few seconds on a big mesh) runs when the slider
+// rests. Any change of axis, tolerance or scale re-traces too.
+let traceTimer = null
+const scheduleTrace = () => {
+  clearTimeout(traceTimer)
+  traceTimer = setTimeout(() => store.traceSection(), 350)
+}
+watch(() => [store.sliceOffset, store.resolvedSliceAxis, store.params.tol, store.params.units,
+             store.params.scale, store.jobId],
+      ([off, axis, , , , job]) => {
+        // the old outline belongs to the old plane: drop it at once, so the
+        // view never shows a trace that does not sit on the plane
+        store.section = null
+        if (!job || !axis) return
+        scheduleTrace()
+      })
+const sliceStep = computed(() => {
+  const h = store.sliceHalfExtent
+  return h > 50 ? 0.5 : h > 10 ? 0.1 : 0.05
+})
+const sectionSummary = computed(() => {
+  const st = store.section?.stats
+  if (!st) return ''
+  const parts = []
+  if (st.lines) parts.push(`${st.lines} lines`)
+  if (st.arcs) parts.push(`${st.arcs} arcs`)
+  if (st.circles) parts.push(`${st.circles} circle${st.circles === 1 ? '' : 's'}`)
+  if (st.splines) parts.push(`${st.splines} spline${st.splines === 1 ? '' : 's'}`)
+  return `${st.loops} outline${st.loops === 1 ? '' : 's'}: ${parts.join(', ')}; worst miss ${st.dev_max.toFixed(3)} mm`
+})
+// Axis choices with the file's side along each, so X / Y / Z mean
+// something before the plane appears in the 3D view, and 'auto' says
+// which side it will pick.
+const axisOptions = computed(() => {
+  const bb = store.inputStats?.bbox_mm
+  const k = store.unitScale
+  const len = (i) => (bb ? `${(bb[i] * k).toFixed(1)} mm` : '')
+  const longest = bb ? 'XYZ'[bb.indexOf(Math.max(...bb))] : null
+  return [
+    { key: 'auto', label: longest ? `auto · longest side (${longest}, ${len('XYZ'.indexOf(longest))})` : 'auto · longest side' },
+    { key: 'x', label: bb ? `X · ${len(0)}` : 'X' },
+    { key: 'y', label: bb ? `Y · ${len(1)}` : 'Y' },
+    { key: 'z', label: bb ? `Z · ${len(2)}` : 'Z' },
+  ]
+})
 </script>
 
 <template>
@@ -133,13 +180,109 @@ const isDefault = (key) => store.params[key] === DEFAULT_PARAMS[key]
     </p>
 
     <header class="head gate">
+      <h2 class="micro">Method</h2>
+    </header>
+    <div class="row">
+      <label for="method">
+        Build the solid by
+        <button
+          class="info num"
+          :aria-expanded="openInfo === 'method'"
+          aria-label="What does Method do?"
+          @click="toggleInfo('method')"
+        >i</button>
+      </label>
+      <select id="method" v-model="store.params.method"
+              :class="{ touched: !isDefault('method') }">
+        <option value="auto">Prismatic / face-group (auto)</option>
+        <option value="loft">Sliced loft</option>
+      </select>
+    </div>
+    <div v-if="openInfo === 'method'" class="explain">
+      <p><span class="dir">Auto</span> looks for the design intent: an extrusion direction, flat faces, cylinders, cones, spheres. Best for machined or CAD-designed parts; it gives real planes and cylinders you can measure and sketch on.</p>
+      <p><span class="dir">Sliced loft</span> does what you would do by hand in Fusion with Create Mesh Section Sketch, Fit Curves to Mesh Section and Loft: it cuts the body into thin slices along one axis, redraws each outline as a smooth curve and lofts the stack into one smooth surface per run of slices. Best for organic shells — controller housings, handles, caps — where the auto method has nothing flat or round to find. A hole drilled sideways through the part comes out smeared, because no slice sees it as a circle.</p>
+    </div>
+    <template v-if="isLoft">
+      <div class="row">
+        <label for="slice_mm">
+          Slice spacing
+          <span class="unit num">mm</span>
+        </label>
+        <input
+          id="slice_mm" type="number" step="0.1" min="0.05" max="50"
+          v-model.number="store.params.slice_mm"
+          :class="{ touched: !isDefault('slice_mm') }"
+        />
+      </div>
+      <div class="row">
+        <label for="slice_axis">Slice along</label>
+        <select id="slice_axis" v-model="store.params.slice_axis"
+                :class="{ touched: !isDefault('slice_axis') }">
+          <option v-for="o in axisOptions" :key="o.key" :value="o.key">{{ o.label }}</option>
+        </select>
+      </div>
+      <p class="hint">
+        The 3D view shows the chosen axis and the slicing plane:
+        <span class="ax x">X</span> red, <span class="ax y">Y</span> green,
+        <span class="ax z">Z</span> blue, as in Fusion. Slices are cut across
+        that axis, so the plane you see is one slice.
+      </p>
+      <div v-if="store.sliceHalfExtent > 0" class="slice">
+        <div class="row">
+          <label for="slice_offset">
+            Single slice
+            <span class="unit num">mm from centre</span>
+          </label>
+          <input
+            id="slice_offset_num" type="number" :step="sliceStep"
+            :min="-store.sliceHalfExtent" :max="store.sliceHalfExtent"
+            v-model.number="store.sliceOffset"
+          />
+        </div>
+        <input
+          id="slice_offset" class="slider" type="range" :step="sliceStep"
+          :min="-store.sliceHalfExtent" :max="store.sliceHalfExtent"
+          v-model.number="store.sliceOffset"
+          :aria-label="`Slice position along ${(store.resolvedSliceAxis || '').toUpperCase()}`"
+        />
+        <p class="hint">
+          Move the slider and the plane in the 3D view follows; the traced
+          outline is drawn on it a moment later. This is Fusion's Create Mesh
+          Section Sketch + Fit Curves to Mesh Section, for one plane.
+        </p>
+        <p v-if="store.sectionBusy" class="hint">tracing…</p>
+        <p v-else-if="store.sectionError" class="hint warn">Could not trace: {{ store.sectionError }}</p>
+        <p v-else-if="sectionSummary" class="hint num">{{ sectionSummary }}</p>
+        <a v-if="store.section && store.sectionScriptUrl" class="dl" :href="store.sectionScriptUrl" download>
+          Download Fusion sketch of this slice (.py)
+        </a>
+      </div>
+      <label class="check loft">
+        <input type="checkbox" v-model="store.params.loft_ruled" />
+        <span>
+          Ruled loft
+          <span class="help">Straight faces between neighbouring slices (one face per pair) instead of one smooth face per run. Exact within a hair at 0.2 mm spacing and never overshoots, but many more faces. The smooth loft is used by default and falls back to ruled on its own where a run's smooth surface comes out wrong.</span>
+        </span>
+      </label>
+      <p class="hint">
+        Slices are cut every {{ store.params.slice_mm }} mm; the loft itself goes through at most about 60 of them per run, and the checks below still measure the result against every triangle of the mesh. Steps (flat faces across the axis) and changes in the outline count split the stack into runs, so a shoulder stays a real flat face.
+      </p>
+    </template>
+
+    <header class="head gate">
       <h2 class="micro">Acceptance gate</h2>
       <button class="reset" @click="store.resetParams()">Reset defaults</button>
     </header>
-    <p class="intro">
+    <p v-if="!isLoft" class="intro">
       A result is only written if it passes every limit below — the prismatic
       fit first, then the face-group engine. Otherwise you get a faceted
       (exact but unclean) STEP instead.
+    </p>
+    <p v-else class="intro">
+      With the sliced loft the limits below are measured and shown, not
+      enforced: you chose the method, so its solid is written whenever it
+      can be built. Only a loft that cannot be built at all falls back to a
+      faceted copy.
     </p>
 
     <div v-for="f in fields" :key="f.key" class="field">
@@ -267,4 +410,17 @@ input.touched, select.touched { border-color: var(--edge); }
 }
 .check input { margin-top: 3px; accent-color: var(--edge); }
 .check .help { display: block; font-weight: 400; }
+.check.loft { border-top: none; padding-top: 4px; }
+.ax { font-weight: 700; }
+.slice { border-top: 1px solid var(--line); padding-top: 8px; display: flex; flex-direction: column; gap: 6px; }
+.slice .slider { width: 100%; accent-color: var(--edge); }
+.slice .dl {
+  display: block; text-align: center; padding: 7px; border-radius: 6px;
+  border: 1px solid var(--edge); color: var(--edge); text-decoration: none; font-size: 12px;
+}
+.slice .dl:hover { background: var(--panel-2); }
+.hint.warn { color: var(--warn, #b26a00); }
+.ax.x { color: #e5484d; }
+.ax.y { color: #46b95a; }
+.ax.z { color: #4c8dff; }
 </style>

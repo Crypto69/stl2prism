@@ -27,6 +27,41 @@ keep their exact facets; when even that fails, the tool falls back to a
 faceted (valid, manifold, coplanar-merged, tolerance-reduced) STEP solid
 instead of failing.
 
+### Sliced loft (v0.4)
+
+For organic shells — controller housings, handles, lens caps, scanned
+enclosures — where nothing is flat or round enough for the engines above,
+`--method loft` does what you would do by hand in Fusion with **Create
+Mesh Section Sketch → Fit Curves to Mesh Section → Loft**, automatically:
+the body is sliced along one axis every 0.2 mm (default), every section
+outline is redrawn as a closed B-spline, and the stack is lofted into
+**one smooth face per run of sections**. Runs break at flat faces across
+the axis (a shoulder stays a real planar face, not a smear) and where the
+outline count changes; holes along the axis are lofted and cut; a dome
+tip gets a short cone to the apex. The result is written whenever it can
+be built — you chose the method — and the acceptance gate is reported for
+information. Alongside the STEP comes `<out>_fusion.py`, which repeats
+the workflow as a Fusion timeline: one sketch per section (closed fitted
+splines on offset planes) and one Loft per run, holes as Loft cuts.
+
+Where it is bad by design: a hole drilled *across* the slicing axis
+becomes a trough, because no slice sees it as a circle (the prismatic
+engine handles those); sharp corners *around* an outline are followed
+within the spline tolerance (0.02 mm) but are not sharp edges.
+
+`stl2prism/section_fit.py` holds the shared plane cutter and the curve
+fitter (lines and arcs where they hold the tolerance, fitted splines where
+they do not) — numpy only, so the same file can run inside Fusion.
+`tools/trace_section.py` draws one section the way the fitter sees it.
+
+**Single slice from the web app.** With the sliced loft chosen, the 3D
+view shows a labelled XYZ triad (X red, Y green, Z blue, as in Fusion) and
+a translucent plane across the chosen axis; a slider moves the plane by
+an offset from the part's centre, the traced outline is drawn on it, and
+"Download Fusion sketch of this slice" gives a script that draws that one
+sketch — lines, arcs, circles and fitted splines on a construction plane
+at that position (`GET /api/jobs/{id}/section` and `/section-script`).
+
 ## Screenshots
 
 The web app: drop a mesh, inspect it, set the acceptance gate, convert, and
@@ -67,6 +102,9 @@ stl2prism part.stl out.step --tol 0.05 --accept-max 0.3 --accept-vol-pct 3
 stl2prism scan.stl --reduce-tol 0.1     # faceted output: simplify curved regions within 0.1 mm
 stl2prism scan.stl --force-prismatic    # attempt prismatic on scan input
 stl2prism part.stl --no-face-groups     # skip the face-group engine (prismatic -> faceted only)
+stl2prism shell.stl --method loft       # sliced loft: sections every 0.2 mm along the longest axis, smooth loft
+stl2prism shell.stl --method loft --slice-mm 0.5 --slice-axis z --loft-ruled
+stl2prism big.stl --scale 0.1           # a cm design exported as mm: shrink by ten
 ```
 
 Or from Python:
@@ -74,7 +112,9 @@ Or from Python:
 ```python
 from stl2prism import run
 result = run("part.stl", "part.step")
-print(result["mode"], result["metrics"], result["script"])   # 'prismatic' | 'facegroup' | 'faceted' | 'mixed'
+print(result["mode"], result["metrics"], result["script"])   # 'prismatic' | 'facegroup' | 'faceted' | 'loft' | 'mixed'
+result = run("shell.stl", "shell.step", method="loft", slice_mm=0.2, slice_axis="auto")
+print(result["metrics"]["loft"], result["fusion_script"])     # sections, runs, holes; the Fusion loft script
 ```
 
 Exit code 0 on success. The log reports which route produced the output
@@ -84,7 +124,9 @@ face-group results.
 
 Outputs next to the STEP: for prismatic results `<out>.py` (CadQuery) and
 `<out>_fusion.py` (Fusion 360 sketches + extrudes — verified: a fully
-parametric timeline you can edit); for face-group results
+parametric timeline you can edit); for sliced-loft results
+`<out>_fusion.py` (section sketches + Loft features, not yet run inside
+Fusion); for face-group results
 `<out>_fusion_bfill.py` — an **experimental Fusion 360 Boundary Fill
 script**. It recreates every fitted plane, cylinder, cone, sphere and torus
 slightly oversized as a temporary body, runs Boundary Fill, and keeps the

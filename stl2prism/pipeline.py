@@ -14,6 +14,23 @@ from .extrusion import AxisSearchTimeout
 SAMPLE_SEED = 20240817
 
 
+def accurate_volume(shape, eps=1e-5):
+    """Volume of an OCC shape (mm^3) by adaptive Gauss integration.
+
+    cq.Shape.Volume() uses BRepGProp's fixed-order integration, which is
+    exact on planes and cylinders but off by 1-2 % on B-spline faces (a
+    lofted box measured 14596 for a true 14400): the sliced loft's runs
+    and the volume gate both need the adaptive form. `shape` may be a
+    cq.Shape, a Workplane or a raw TopoDS_Shape."""
+    from OCP.BRepGProp import BRepGProp
+    from OCP.GProp import GProp_GProps
+    shape = shape.val() if hasattr(shape, 'val') else shape
+    wrapped = shape.wrapped if hasattr(shape, 'wrapped') else shape
+    props = GProp_GProps()
+    BRepGProp.VolumeProperties_s(wrapped, props, float(eps), False, True)
+    return abs(float(props.Mass()))
+
+
 def tessellate_solid(solid, tolerance=0.02, angular=0.1):
     """Triangulate a CadQuery Workplane/Shape in memory (no STL round trip)."""
     import cadquery as cq
@@ -49,8 +66,14 @@ def sample_points(mesh, n_samples=None, include_vertices=True, max_points=200000
 
 
 def validate(solid, mesh, n_samples=None, cyls=None, hole_band=0.15,
-             symmetric=True):
+             symmetric=True, tess=(0.02, 0.1)):
     """Measure the rebuilt solid against the source mesh.
+
+    `tess` is the (linear mm, angular rad) deflection the solid is
+    triangulated with for the measurement; the default is exact to 0.02
+    mm. B-spline solids (sliced lofts) triangulate 20x slower at that
+    setting (232 s against 11 s on a 19-piece loft), so the loft route
+    passes (0.05, 0.3) and reads its deviations as +-0.05 mm.
 
     Forward deviation: points on the source mesh (all vertices + a seeded
     sample) to the rebuilt surface — catches missing/misplaced material.
@@ -72,17 +95,13 @@ def validate(solid, mesh, n_samples=None, cyls=None, hole_band=0.15,
     is still caught, because the band selects points by the *mesh* fit and
     the deviation is measured against the *rebuilt* wall.
     """
-    rb = tessellate_solid(solid)
+    rb = tessellate_solid(solid, *tess)
     pts, n_uni = sample_points(mesh, n_samples)
     _, dist, _ = trimesh.proximity.closest_point(rb, pts)
     uni = dist[:n_uni]
     closed = bool(mesh.is_watertight)
     vol_mesh = mesh.volume if closed else float('nan')
-    shape = solid.val() if hasattr(solid, 'val') else solid
-    if not hasattr(shape, 'Volume'):            # raw TopoDS_Shape
-        import cadquery as cq
-        shape = cq.Shape.cast(shape)
-    vol_solid = float(shape.Volume())
+    vol_solid = accurate_volume(solid)
     worst = int(np.argmax(dist))
     out = {
         'dev_max': float(dist.max()),
@@ -141,7 +160,8 @@ def run(in_path, out_path, tol=0.08, accept_p95=0.25, accept_vol_pct=2.0,
         accept_max=0.26, accept_hole_max=0.10,
         force_prismatic=False, verbose=True, units='mm', reduce_tol=0.05,
         write_script=True, face_groups=True, workers=None, shell_timeout=None,
-        bodies=None, scale=1.0):
+        bodies=None, scale=1.0, method='auto', slice_mm=0.2, slice_axis='auto',
+        loft_ruled=False):
     """Convert one mesh file to one STEP file.
 
     Every connected body is converted on its own — prismatic where it passes
@@ -166,6 +186,13 @@ def run(in_path, out_path, tol=0.08, accept_p95=0.25, accept_vol_pct=2.0,
     enlarge (mm 1, cm 10, in 25.4 ...), so a file written ten times too
     big — a cm design exported as mm — can only be corrected here, with
     scale=0.1.
+
+    `method` 'auto' runs the route ladder (prismatic, face-group, hybrid,
+    faceted). 'loft' slices every body along `slice_axis` ('auto' = its
+    longest extent, or 'x'/'y'/'z') every `slice_mm` and lofts the section
+    outlines into smooth B-spline solids (sliced_loft.loft_body); the mode
+    is then 'loft' and the gate is reported, not enforced. `loft_ruled`
+    asks for a ruled loft (one face per section pair) instead of smooth.
     """
     from .mesh_prep import load_and_prep_bodies
     from .rebuild import write_step
@@ -180,7 +207,9 @@ def run(in_path, out_path, tol=0.08, accept_p95=0.25, accept_vol_pct=2.0,
         bodies = _pick_bodies(bodies, picked, verbose)
     gates = dict(tol=tol, accept_p95=accept_p95, accept_max=accept_max,
                  accept_hole_max=accept_hole_max, accept_vol_pct=accept_vol_pct,
-                 reduce_tol=reduce_tol, face_groups=face_groups)
+                 reduce_tol=reduce_tol, face_groups=face_groups,
+                 method=method, slice_mm=slice_mm, slice_axis=slice_axis,
+                 loft_ruled=loft_ruled)
     from .parallel import Pool
     workers = _pool_size(bodies, workers)
     pool = Pool(workers) if workers >= 1 else None
@@ -197,14 +226,14 @@ def run(in_path, out_path, tol=0.08, accept_p95=0.25, accept_vol_pct=2.0,
             stages.mark('STEP')
             if verbose:
                 print(f"[out] {mode} solid -> {out_path}")
-            script, bfill, check = _write_script([metrics.pop('build', {'mode': mode})],
-                                                 out_path, write_script, verbose, pool)
+            script, bfill, check, fusion = _write_script(
+                [metrics.pop('build', {'mode': mode})], out_path, write_script, verbose, pool)
             stages.mark('scripts and dry run')
             stages.report()
             return {'mode': mode, 'metrics': metrics,
                     'n_bodies': 1, 'n_written': 1, 'n_dropped': n_dropped,
                     'is_scan': bool(is_scan), 'script': script, 'bfill_script': bfill,
-                    'bfill_check': check}
+                    'bfill_check': check, 'fusion_script': fusion}
         return _finish_multi(bodies, results, in_path, out_path, write_script,
                              verbose, pool, n_dropped, is_scan, stages)
     finally:
@@ -396,18 +425,20 @@ def _finish_multi(bodies, results, in_path, out_path, write_script, verbose,
     for b in per_body:
         if b['metrics'] is not None:
             builds.append(b['metrics'].pop('build', {'mode': b['mode']}))
-    script, bfill, check = _write_script(builds, out_path, write_script, verbose, pool)
+    script, bfill, check, fusion = _write_script(builds, out_path, write_script, verbose, pool)
     stages.mark('scripts and dry run')
 
     n_pr = sum(1 for b in per_body if b['mode'] == 'prismatic')
     n_fg = sum(1 for b in per_body if b['mode'] == 'facegroup')
     n_fa = sum(1 for b in per_body if b['mode'] == 'faceted')
+    n_lo = sum(1 for b in per_body if b['mode'] == 'loft')
     modes = {b['mode'] for b in per_body if b['mode']}
     mode = modes.pop() if len(modes) == 1 else 'mixed'
     if verbose:
-        failed = len(per_body) - n_pr - n_fg - n_fa
+        failed = len(per_body) - n_pr - n_fg - n_fa - n_lo
         print(f"[out] {len(shapes)} solids ({n_pr} prismatic, {n_fg} face-group, "
               f"{n_fa} faceted"
+              + (f", {n_lo} sliced-loft" if n_lo else "")
               + (f", {failed} failed" if failed else "")
               + (f", {n_dropped} sliver(s) dropped" if n_dropped else "")
               + f") -> {out_path}")
@@ -415,7 +446,7 @@ def _finish_multi(bodies, results, in_path, out_path, write_script, verbose,
     return {'mode': mode, 'metrics': _aggregate(per_body), 'bodies': per_body,
             'n_bodies': len(bodies), 'n_written': len(shapes),
             'n_dropped': n_dropped, 'is_scan': bool(is_scan), 'script': script,
-            'bfill_script': bfill, 'bfill_check': check}
+            'bfill_script': bfill, 'bfill_check': check, 'fusion_script': fusion}
 
 
 def _err(e):
@@ -675,42 +706,61 @@ def _write_script(builds, out_path, write_script, verbose, pool=None):
     """Write the CadQuery script next to the STEP (same stem, .py), the
     Fusion script for prismatic bodies (<stem>_fusion.py) and the Fusion
     Boundary Fill script for face-group bodies (<stem>_fusion_bfill.py).
-    Returns (cadquery_script_path, bfill_script_path, bfill_outlook), the
-    paths None if not written, the outlook None without a Boundary Fill
+    Returns (cadquery_script_path, bfill_script_path, bfill_outlook,
+    fusion_script_path), the paths None if not written, the outlook None
+    without a Boundary Fill script. Sliced-loft bodies get a Fusion script
+    of section sketches + Loft features (<stem>_fusion.py) and no CadQuery
     script."""
     if not write_script:
-        return None, None, None
+        return None, None, None, None
+    import os
     bfill, check = _write_bfill_script(builds, out_path, verbose, pool)
+    fpath = os.path.splitext(out_path)[0] + '_fusion.py'
+    lofts = [b for b in builds if b.get('mode') == 'loft' and b.get('runs')]
+    if lofts:
+        # The loft's Fusion script rebuilds the manual Fusion workflow (section
+        # sketches + Loft); there is no CadQuery script for this mode.
+        try:
+            from .fusion_export import emit_fusion_loft_script
+            with open(fpath, 'w') as f:
+                f.write(emit_fusion_loft_script(builds))
+            if verbose:
+                print(f"[out] Fusion 360 loft script -> {fpath}")
+            return None, bfill, check, fpath
+        except Exception as e:
+            if verbose:
+                print(f"[out] Fusion loft script export failed ({type(e).__name__}: {e})")
+            return None, bfill, check, None
     if not any(b.get('mode') == 'prismatic' and 'slabs' in b for b in builds):
         # A script with no recognised bodies would be an empty program that
         # crashes on its first line; better no file than a broken one.
         if verbose:
             print('[out] no prismatic bodies; no script written')
-        return None, bfill, check
+        return None, bfill, check, None
     try:
         from .script_export import emit_script
-        import os
         py_path = os.path.splitext(out_path)[0] + '.py'
         text = emit_script(builds, os.path.basename(out_path))
         with open(py_path, 'w') as f:
             f.write(text)
         if verbose:
             print(f"[out] CadQuery script -> {py_path}")
+        fusion = None
         try:
             from .fusion_export import emit_fusion_script
-            fpath = os.path.splitext(out_path)[0] + '_fusion.py'
             with open(fpath, 'w') as f:
                 f.write(emit_fusion_script(builds))
+            fusion = fpath
             if verbose:
                 print(f"[out] Fusion 360 script -> {fpath}")
         except Exception as e:
             if verbose:
                 print(f"[out] Fusion script export failed ({type(e).__name__}: {e})")
-        return py_path, bfill, check
+        return py_path, bfill, check, fusion
     except Exception as e:
         if verbose:
             print(f"[out] script export failed ({type(e).__name__}: {e})")
-        return None, bfill, check
+        return None, bfill, check, None
 
 
 BFILL_CHECK_BUDGET_S = 120   # s: bodies past this are not dry-run (outlook 'not checked')
@@ -821,12 +871,14 @@ def _aggregate(per_body):
     pr = [b['metrics'] for b in per_body if b['mode'] == 'prismatic']
     fg = [b['metrics'] for b in per_body if b['mode'] == 'facegroup']
     fa = [b['metrics'] for b in per_body if b['mode'] == 'faceted']
+    lo = [b['metrics'] for b in per_body if b['mode'] == 'loft']
 
     def worst(key):
-        vals = [m[key] for m in pr + fg if m.get(key) == m.get(key)]  # drop NaN
+        vals = [m[key] for m in pr + fg + lo if m.get(key) == m.get(key)]  # drop NaN
         return max(vals) if vals else float('nan')
     return {
         'n_prismatic': len(pr), 'n_facegroup': len(fg), 'n_faceted': len(fa),
+        'n_loft': len(lo),
         'n_failed': sum(1 for b in per_body if b['error']),
         'dev_p95': worst('dev_p95'), 'dev_max': worst('dev_max'),
         'hole_dev_p95': worst('hole_dev_p95'),
@@ -990,10 +1042,16 @@ def _log_check(metrics, verbose, tag='[check]'):
 
 def _convert_body(mesh, is_scan, force_prismatic, verbose, tol, accept_p95,
                   accept_max, accept_hole_max, accept_vol_pct, reduce_tol=0.05,
-                  face_groups=True, pool=None):
+                  face_groups=True, pool=None, method='auto', slice_mm=0.2,
+                  slice_axis='auto', loft_ruled=False):
     """Convert one closed body. Returns (TopoDS_Shape, mode, metrics).
 
-    Route ladder, every rung held to the same gate:
+    `method='loft'` takes the sliced-loft route instead of the ladder: the
+    user chose it, so its result is written whenever it builds and the
+    gate is measured for information only (mode 'loft'); only a loft that
+    cannot be built at all falls back to faceted.
+
+    Route ladder ('auto'), every rung held to the same gate:
       1. prismatic (extrusion engine) — the only route that yields
          sketch+extrude structure for the scripts, so it goes first;
       2. face-group engine — one analytic face per fitted region;
@@ -1007,6 +1065,14 @@ def _convert_body(mesh, is_scan, force_prismatic, verbose, tol, accept_p95,
     from .rebuild import build_solid
     gates = dict(accept_p95=accept_p95, accept_max=accept_max,
                  accept_hole_max=accept_hole_max, accept_vol_pct=accept_vol_pct)
+
+    if method == 'loft':
+        try:
+            return _loft_body(mesh, verbose, slice_mm, slice_axis, loft_ruled, gates)
+        except Exception as e:
+            if verbose:
+                print(f"[loft] failed ({type(e).__name__}: {e}); falling back to faceted")
+        return _faceted_body(mesh, verbose, reduce_tol=reduce_tol)
 
     # Before any axis work: scoring an axis means cross-sectioning the mesh
     # several times per candidate, which is wasted on organic geometry.
@@ -1205,6 +1271,36 @@ def _score_axis_task(task):
     return score_axis(_payload_mesh(task), task['axis'], deadline=task['deadline'])
 
 
+# (mm, rad) tessellation of a loft solid for its check: B-spline faces
+# take minutes at the default 0.02 / 0.1, seconds here; the deviations
+# it reports are then good to +-0.05 mm
+LOFT_TESS = (0.05, 0.3)
+
+
+def _loft_body(mesh, verbose, slice_mm, slice_axis, ruled, gates):
+    """The sliced-loft route (sliced_loft.loft_body) with the standard
+    check. The gate is logged as PASS / FAIL but not enforced: the user
+    asked for a loft, and the deviation of a loft is by design (a smear
+    across a sideways hole, a smoothed corner), not a fitting failure."""
+    from .sliced_loft import loft_body, axis_index
+    axis = axis_index(mesh, slice_axis)
+    shape, info = loft_body(mesh, axis, slice_mm, ruled=ruled, verbose=verbose)
+    metrics = validate(shape, mesh, tess=LOFT_TESS)
+    _log_check(metrics, verbose, tag='[loft]')
+    if info.get('fuse') == 'compound' and verbose:
+        print("[loft] the pieces did not fuse: the STEP holds them as separate solids, and "
+              "the reverse deviation above counts their touching caps, which lie inside the part")
+    metrics['loft_compound'] = info.get('fuse') == 'compound'
+    ok, why = _passes(metrics, **gates)
+    if verbose:
+        print(f"[loft] gate {'PASS' if ok else 'FAIL'}"
+              + ("" if ok else f" ({'; '.join(why)}); the loft is written anyway"))
+    metrics['gate_ok'] = bool(ok)
+    metrics['loft'] = {k: v for k, v in info.items() if k != 'runs'}
+    metrics['build'] = info
+    return shape, 'loft', metrics
+
+
 def _facegroup_body(mesh, verbose, tol, gates):
     """Face-group engine for one body, held to the same gate as prismatic.
     Returns (shape, 'facegroup', metrics) or None when it steps aside."""
@@ -1313,6 +1409,9 @@ def main():
     ap.add_argument('--units', choices=sorted(UNIT_SCALE), default='mm',
                     help='unit the input file is in; STL/OBJ carry none, '
                          'and the tool works in mm (default mm)')
+    ap.add_argument('--scale', type=float, default=1.0,
+                    help='extra factor applied after --units (units only '
+                         'enlarge; a file written 10x too big needs 0.1)')
     ap.add_argument('--workers', type=int, default=None,
                     help='shells (bodies and cavities) converted at once in '
                          'worker processes; 0 converts in this process '
@@ -1322,6 +1421,18 @@ def main():
                     help='seconds a shell may run in a worker before it is '
                          'built faceted instead; 0 for no limit '
                          '(default: STL2PRISM_SHELL_TIMEOUT, else 900)')
+    ap.add_argument('--method', choices=['auto', 'loft'], default='auto',
+                    help="'loft': slice each body along an axis and loft the "
+                         "section outlines into a smooth B-spline solid, like "
+                         "Fusion's Mesh Section Sketch + Loft (default: auto, "
+                         "the prismatic / face-group / faceted ladder)")
+    ap.add_argument('--slice-mm', type=float, default=0.2,
+                    help='sliced loft: section spacing in mm (default 0.2)')
+    ap.add_argument('--slice-axis', choices=['auto', 'x', 'y', 'z'], default='auto',
+                    help='sliced loft: slicing axis (default auto = longest extent)')
+    ap.add_argument('--loft-ruled', action='store_true',
+                    help='sliced loft: ruled loft (one face per section pair) '
+                         'instead of one smooth face per run')
     ap.add_argument('--quiet', action='store_true')
     args = ap.parse_args()
     out = args.output or args.input.rsplit('.', 1)[0] + '.step'
@@ -1331,9 +1442,11 @@ def main():
                 accept_hole_max=args.accept_hole_max,
                 accept_vol_pct=args.accept_vol_pct,
                 force_prismatic=args.force_prismatic, verbose=not args.quiet,
-                units=args.units, reduce_tol=args.reduce_tol,
+                units=args.units, scale=args.scale, reduce_tol=args.reduce_tol,
                 face_groups=not args.no_face_groups,
-                workers=args.workers, shell_timeout=args.shell_timeout)
+                workers=args.workers, shell_timeout=args.shell_timeout,
+                method=args.method, slice_mm=args.slice_mm,
+                slice_axis=args.slice_axis, loft_ruled=args.loft_ruled)
     except Exception as e:
         # A crash must not look like a success to a calling script.
         print(f"[error] {type(e).__name__}: {e}", file=sys.stderr)
