@@ -201,3 +201,15 @@ def test_walls_are_unified_across_slabs():
     assert abs(a[2]['p0'][1] - b[2]['p0'][1]) < 1e-9
     # orientation preserved: the ring still runs the same way round
     assert a[0]['p1'][0] > a[0]['p0'][0] and a[2]['p1'][0] < a[2]['p0'][0]
+
+
+def test_full_circle_needs_the_points_to_go_round():
+    """A thin sliver loop sits within tol of a huge circle but is not one:
+    try_full_circle must refuse it (it drew a 600 mm circle on a section
+    of the RC-N1 controller), while a real polygonised circle still passes."""
+    from stl2prism.profile_fit import try_full_circle
+    t = np.linspace(0, 2 * np.pi, 48, endpoint=False)
+    assert try_full_circle(np.c_[5 * np.cos(t), 5 * np.sin(t)], 0.08) is not None
+    x = np.linspace(0, 20, 12)
+    sliver = np.vstack([np.c_[x, 0.02 * x / 20], np.c_[x[::-1], -0.02 * x[::-1] / 20]])
+    assert try_full_circle(sliver, 0.08) is None

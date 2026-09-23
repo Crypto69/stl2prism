@@ -70,7 +70,7 @@ const scheduleTrace = () => {
   traceTimer = setTimeout(() => store.traceSection(), 350)
 }
 watch(() => [store.sliceOffset, store.resolvedSliceAxis, store.params.tol, store.params.units,
-             store.params.scale, store.jobId, store.sliceJoin],
+             store.params.scale, store.jobId, store.sliceJoin, store.sliceOutline],
       ([off, axis, , , , job]) => {
         // the old outline belongs to the old plane: drop it at once, so the
         // view never shows a trace that does not sit on the plane
@@ -91,7 +91,7 @@ const sectionSummary = computed(() => {
   if (st.circles) parts.push(`${st.circles} circle${st.circles === 1 ? '' : 's'}`)
   if (st.splines) parts.push(`${st.splines} spline${st.splines === 1 ? '' : 's'}`)
   let head = `${st.loops} outline${st.loops === 1 ? '' : 's'}`
-  if (st.open) head += `, ${st.open} open curve${st.open === 1 ? '' : 's'}`
+  if (st.open) head += `, ${st.open} open curve${st.open === 1 ? '' : 's'}${store.sliceOutline ? ' skipped' : ''}`
   let tail = ''
   if (st.joins) tail = `; ${st.joins} gap${st.joins === 1 ? '' : 's'} joined (largest ${st.max_gap.toFixed(2)} mm)`
   return `${head}: ${parts.join(', ')}${tail}; worst miss ${st.dev_max.toFixed(3)} mm`
@@ -269,6 +269,13 @@ const axisOptions = computed(() => {
           closer than this are joined so the outline closes. 0 draws exactly
           what Fusion's Create Mesh Section Sketch draws, open pieces and all.
         </p>
+        <label class="check">
+          <input type="checkbox" v-model="store.sliceOutline" />
+          <span>
+            Outline only
+            <span class="help">Draw just the closed loops and leave out the loose open pieces, so the sketch is a clean profile to extrude. The summary still says how many pieces were skipped.</span>
+          </span>
+        </label>
         <p v-if="store.sectionBusy" class="hint">tracing…</p>
         <p v-else-if="store.sectionError" class="hint warn">Could not trace: {{ store.sectionError }}</p>
         <p v-else-if="sectionSummary" class="hint num">{{ sectionSummary }}</p>

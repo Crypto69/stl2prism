@@ -415,6 +415,12 @@ def _close_junctions(prims, closed=True):
         x = 0.5 * (np.asarray(a['p1'], float) + np.asarray(b['p0'], float))
         a['p1'] = x.copy()
         b['p0'] = x.copy()
+        # a spline is drawn through its 'pts', so its ends must follow too
+        # (a 0.05 mm gap here is invisible but leaves the sketch open)
+        if a['type'] == 'spline':
+            a['pts'][-1] = x
+        if b['type'] == 'spline':
+            b['pts'][0] = x
     for p in prims:
         if p['type'] == 'arc':
             _project_arc_ends(p)
@@ -525,6 +531,29 @@ def fit_loop(xy, tol=0.08, mesh_pts=None, min_prim_mm=None, min_run=3, clean=Fal
     return _close_junctions(_replace_with_splines(prims, runs, tol, closed), closed)
 
 
+def drawn_ends(p):
+    """The two end points a primitive is actually drawn with: a spline
+    through its 'pts', a line or arc from p0 to p1."""
+    if p['type'] == 'spline':
+        return np.asarray(p['pts'][0], float), np.asarray(p['pts'][-1], float)
+    return np.asarray(p['p0'], float), np.asarray(p['p1'], float)
+
+
+def junction_gap(prims, closed=True):
+    """Largest distance between the drawn end of one primitive and the
+    drawn start of the next (the closing pair included for a loop). Zero
+    means every curve of the sketch meets its neighbour exactly, which is
+    what Fusion needs to see a closed profile."""
+    if isinstance(prims, dict) or len(prims) < 2:
+        return 0.0
+    n = len(prims)
+    worst = 0.0
+    for i in range(n if closed else n - 1):
+        worst = max(worst, float(np.linalg.norm(drawn_ends(prims[i])[1]
+                                                - drawn_ends(prims[(i + 1) % n])[0])))
+    return worst
+
+
 def prim_points(prims, arc_step_deg=6.0, closed=True):
     """Dense 2-D polyline of a fitted loop (for deviation checks and
     previews). Full circles and closed splines come back closed; a loop's
@@ -576,7 +605,7 @@ def fit_section(V, F, origin, normal, tol=0.08, mesh_pts=None, join_mm=0.0):
     loops, opens, frame, jst = section_curves(V, F, origin, normal, join_mm=join_mm)
     fitted, stats = [], dict(loops=0, holes=0, open=0, lines=0, arcs=0, circles=0,
                              splines=0, joins=jst['joins'], max_gap=jst['max_gap'],
-                             dev_max=0.0)
+                             dev_max=0.0, junction_gap=0.0)
 
     def tally(prims, raw, closed):
         if isinstance(prims, dict):
@@ -584,6 +613,7 @@ def fit_section(V, F, origin, normal, tol=0.08, mesh_pts=None, join_mm=0.0):
         else:
             for p in prims:
                 stats[{'line': 'lines', 'arc': 'arcs', 'spline': 'splines'}[p['type']]] += 1
+            stats['junction_gap'] = max(stats['junction_gap'], junction_gap(prims, closed))
         if len(prims):
             sub = raw[::max(1, len(raw) // 400)]
             dev = (polyline_deviation(sub, prim_points(prims)) if closed
@@ -633,13 +663,18 @@ def lift_prims(prims, frame):
     return out
 
 
-def section_preview(V, F, origin, normal, tol=0.08, join_mm=0.0):
+def section_preview(V, F, origin, normal, tol=0.08, join_mm=0.0, closed_only=False):
     """One traced section for the web app and the sections script:
     {'origin', 'normal', 'loops': [(outer3d, [holes3d])], 'open':
     [prims3d...] (open chains), 'polylines': [[x, y, z]...] dense curves
     per loop for drawing (closed ones repeat their first point, open ones
-    do not), 'stats'}."""
+    do not), 'stats'}. `closed_only` leaves the open chains out of 'open'
+    and 'polylines' (an outline to extrude, without the loose pieces of a
+    leaky mesh); stats['open'] still counts them, so the caller can say
+    how many were skipped."""
     sec = fit_section(V, F, origin, normal, tol=tol, join_mm=join_mm)
+    if closed_only:
+        sec['open'] = []
     frame = (sec['origin'], sec['u'], sec['v'], sec['normal'])
     loops, polys = [], []
     for fo, fh in sec['loops']:

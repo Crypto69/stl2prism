@@ -115,6 +115,9 @@ def test_open_chain_stays_open():
                                         'name': 'u', 'loops': pv['loops'], 'open': pv['open']}])
     assert txt.count('sketchLines.addByTwoPoints') == 3
     compile(txt, 'u.py', 'exec')
+    # outline only: the open chain is left out, but still counted
+    pv = section_preview(V, F, [0, 0, 0], [0, 0, 1], tol=0.05, closed_only=True)
+    assert pv['polylines'] == [] and pv['open'] == [] and pv['stats']['open'] == 1
     # the loft's cutter keeps closing every chain by its chord
     from stl2prism.section_fit import signed_area
     lp, _ = section_loops(V, F, [0, 0, 0], [0, 0, 1])
@@ -171,6 +174,8 @@ def test_fit_loop_spline_fallback_on_ripple():
     prims = fit_loop(xy, tol=0.05)
     assert any(p['type'] == 'spline' for p in prims)
     assert polyline_deviation(xy[::5], prim_points(prims)) < 0.1
+    from stl2prism.section_fit import junction_gap
+    assert junction_gap(prims) < 1e-9
 
 
 def test_fit_loop_holds_tolerance_on_wave():
@@ -198,6 +203,9 @@ def test_trace_rc_n2_section_like_fusion():
     st = sec['stats']
     assert st['loops'] >= 5 and st['holes'] >= 3
     assert st['lines'] > 50 and st['arcs'] > 50 and st['splines'] > 0
+    # every curve meets its neighbour exactly, splines included, or the
+    # sketch is open in Fusion's eyes and there is no profile to extrude
+    assert st['junction_gap'] < 1e-9
     assert st['dev_max'] < 0.15, st
 
 

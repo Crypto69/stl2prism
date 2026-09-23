@@ -67,6 +67,8 @@ export const useConvertStore = defineStore('convert', {
     // traced section from /section
     sliceOffset: 0,
     sliceJoin: 2.5,
+    // closed loops only: leave out the loose open pieces of a leaky mesh
+    sliceOutline: false,
     section: null,
     sectionBusy: false,
     sectionError: null,
@@ -111,7 +113,7 @@ export const useConvertStore = defineStore('convert', {
       if (!s.jobId || !a) return null
       const q = new URLSearchParams({ axis: a, offset: String(s.sliceOffset), tol: String(s.params.tol),
                                       units: s.params.units, scale: String(s.params.scale),
-                                      join: String(s.sliceJoin) })
+                                      join: String(s.sliceJoin), outline: s.sliceOutline ? 'true' : 'false' })
       return `/api/jobs/${s.jobId}/section-script?${q}`
     },
     // The axis the sliced loft will cut along, with 'auto' resolved to the
@@ -147,7 +149,7 @@ export const useConvertStore = defineStore('convert', {
         this.$patch({
           status: 'ready', jobId: data.id, inputStats: data.input_stats,
           bodies: [], triangleBody: null, selected: [], hovered: -1,
-          sliceOffset: 0, sliceJoin: 2.5, section: null, sectionError: null,
+          sliceOffset: 0, sliceJoin: 2.5, sliceOutline: false, section: null, sectionError: null,
         })
         this.loadBodies()
       } catch (e) {
@@ -272,7 +274,7 @@ export const useConvertStore = defineStore('convert', {
       if (!this.jobId || !a) return
       const q = new URLSearchParams({ axis: a, offset: String(this.sliceOffset), tol: String(this.params.tol),
                                       units: this.params.units, scale: String(this.params.scale),
-                                      join: String(this.sliceJoin) })
+                                      join: String(this.sliceJoin), outline: this.sliceOutline ? 'true' : 'false' })
       const mine = ++traceSeq
       this.sectionBusy = true
       try {

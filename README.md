@@ -66,7 +66,8 @@ as closed loops; they are drawn open, exactly as Fusion's mesh section
 draws them, after loose ends closer than "Join gaps up to" (default
 2.5 mm, `join=`) have been joined, so an outline broken only by hairline
 cracks between patches comes back as one closed profile. 0 joins
-nothing.
+nothing. "Outline only" (`outline=true`) leaves the open pieces out
+altogether, for a clean profile to extrude.
 
 ## Screenshots
 

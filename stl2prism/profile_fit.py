@@ -565,14 +565,23 @@ def merge_pass(prims, pts_list, tol, min_arc_pts, closed=True, max_rounds=50):
 
 # ---------- full-circle detection ----------
 
-def try_full_circle(pts, tol=0.08):
-    """If a closed ring of points is one circle, return it."""
+def try_full_circle(pts, tol=0.08, min_cover=0.8):
+    """If a closed ring of points is one circle, return it.
+
+    The points must also go round the circle: a thin sliver loop (two
+    nearly coincident walls joined at their ends) sits within tol of a
+    huge circle, but its perimeter is a small fraction of that circle's
+    2*pi*r. `min_cover` is the least perimeter / circumference accepted; a
+    polygonised circle of 8 or more points is above 0.97."""
     pts = _dedupe(np.asarray(pts, float))
     if len(pts) < 8:
         return None
     ring = np.vstack([pts, pts[:1]])
     fit = fit_circle_taubin(ring)
     if fit and fit['dev'] <= tol:
+        perim = float(np.linalg.norm(np.diff(ring, axis=0), axis=1).sum())
+        if perim < min_cover * 2.0 * np.pi * float(fit['r']):
+            return None
         fit['full'] = True
         fit['_pts'] = pts
         return fit
