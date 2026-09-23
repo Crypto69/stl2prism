@@ -55,7 +55,7 @@ def _ring_code(ring, params, indent='    '):
         if p['type'] == 'line':
             out.append(f"{indent}.lineTo({_f(p['p1'][0])}, {_f(p['p1'][1])})")
         else:
-            from .rebuild import _arc_mid
+            from .profile_fit import _arc_mid
             mid = _arc_mid(p)
             out.append(f"{indent}.threePointArc(({_f(mid[0])}, {_f(mid[1])}), "
                        f"({_f(p['p1'][0])}, {_f(p['p1'][1])}))")

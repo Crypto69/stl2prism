@@ -43,7 +43,7 @@ def _ring_lines(ring, indent, W, sk='sk'):
         if p['type'] == 'line':
             L.append(f"{indent}{sk}.sketchCurves.sketchLines.addByTwoPoints({P(a[0], a[1])}, {P(b[0], b[1])})")
         else:
-            from .rebuild import _arc_mid
+            from .profile_fit import _arc_mid
             m = _arc_mid(p)
             L.append(f"{indent}{sk}.sketchCurves.sketchArcs.addByThreePoints({P(a[0], a[1])}, {P(m[0], m[1])}, {P(b[0], b[1])})")
     return L
@@ -52,7 +52,7 @@ def _ring_lines(ring, indent, W, sk='sk'):
 def _ring_area(ring):
     """Area (mm^2) of a fitted ring (arcs sampled)."""
     from shapely.geometry import Polygon
-    from .rebuild import _arc_mid
+    from .profile_fit import _arc_mid
     if isinstance(ring, dict):
         return float(np.pi * ring['r'] ** 2)
     pts = []

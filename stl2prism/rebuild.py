@@ -2,7 +2,7 @@
 import numpy as np
 import trimesh
 import cadquery as cq
-from .profile_fit import (segment_polyline, try_full_circle, snap_profile,
+from .profile_fit import (_arc_mid, segment_polyline, try_full_circle, snap_profile,
                           solve_junctions, refine_arcs_with_points)
 
 
@@ -804,20 +804,6 @@ def _draw(wp, ring):
                 (float(mid[0]), float(mid[1])),
                 (float(p['p1'][0]), float(p['p1'][1])))
     return w.close()
-
-
-def _arc_mid(p):
-    c, r = p['center'], p['r']
-    a0 = np.arctan2(p['p0'][1] - c[1], p['p0'][0] - c[0])
-    a1 = np.arctan2(p['p1'][1] - c[1], p['p1'][0] - c[0])
-    if p.get('ccw', True):
-        while a1 <= a0:
-            a1 += 2 * np.pi
-    else:
-        while a1 >= a0:
-            a1 -= 2 * np.pi
-    am = (a0 + a1) / 2
-    return c + r * np.array([np.cos(am), np.sin(am)])
 
 
 def _axis_basis(axis):

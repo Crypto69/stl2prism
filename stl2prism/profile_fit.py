@@ -899,6 +899,23 @@ def _joint_arc_arc(a, b, joint):
     return joint
 
 
+def _arc_mid(p):
+    """Midpoint of an arc primitive on its circle (the third point of a
+    three-point arc). numpy only, so the Fusion export and the section
+    sketches can use it without the OCC rebuild module."""
+    c, r = p['center'], p['r']
+    a0 = np.arctan2(p['p0'][1] - c[1], p['p0'][0] - c[0])
+    a1 = np.arctan2(p['p1'][1] - c[1], p['p1'][0] - c[0])
+    if p.get('ccw', True):
+        while a1 <= a0:
+            a1 += 2 * np.pi
+    else:
+        while a1 >= a0:
+            a1 -= 2 * np.pi
+    am = (a0 + a1) / 2
+    return c + r * np.array([np.cos(am), np.sin(am)])
+
+
 def _project_arc_ends(p):
     c = np.asarray(p['center'], float)
     for key in ('p0', 'p1'):

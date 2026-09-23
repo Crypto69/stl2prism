@@ -26,7 +26,7 @@ chord.
 """
 import numpy as np
 
-from .profile_fit import (segment_polyline, snap_profile, solve_junctions,
+from .profile_fit import (_arc_mid, segment_polyline, snap_profile, solve_junctions,
                           try_full_circle)
 
 
@@ -623,7 +623,6 @@ def lift_prims(prims, frame):
         if p['type'] == 'line':
             out.append({'type': 'line', 'p0': L(p['p0'])[0].tolist(), 'p1': L(p['p1'])[0].tolist()})
         elif p['type'] == 'arc':
-            from .rebuild import _arc_mid
             out.append({'type': 'arc', 'p0': L(p['p0'])[0].tolist(), 'p1': L(p['p1'])[0].tolist(),
                         'mid': L(_arc_mid(p))[0].tolist(), 'r': float(p['r'])})
         else:
