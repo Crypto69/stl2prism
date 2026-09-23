@@ -27,7 +27,13 @@ fi
 if [ -n "$GIT" ]; then
   if [ "$1" != "--no-pull" ]; then
     echo "pulling latest..."
-    $GIT pull --ff-only
+    # The NAS never has edits of its own, so if history was rewritten upstream
+    # (a force-push) just take origin's copy instead of failing.
+    if ! $GIT pull --ff-only; then
+      echo "note: cannot fast-forward (history rewritten?); resetting to origin/main"
+      $GIT fetch origin
+      $GIT reset --hard origin/main
+    fi
     chmod -R a+rX . 2>/dev/null || true   # NAS share ACLs strip modes on pull
   fi
   GIT_SHA="$($GIT rev-parse --short HEAD)"
