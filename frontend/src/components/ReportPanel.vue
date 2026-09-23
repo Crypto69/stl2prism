@@ -73,7 +73,7 @@ const verdict = computed(() => {
         ? ' The gate below did not pass; the loft is written anyway because you chose the method — the deviation is usually a sideways hole or a corner the smooth surface cannot follow.'
         : ' Every gate below passed.'
       return { title: 'Sliced loft solid', cls: 'loft',
-               note: `${lf.n_sections} sections along ${(lf.axis_name || '?').toUpperCase()} at ${lf.interval} mm, ${runs}${lf.n_levels ? ` (split at ${lf.n_levels} flat step${lf.n_levels === 1 ? '' : 's'})` : ''}${lf.n_holes ? `, ${lf.n_holes} hole${lf.n_holes === 1 ? '' : 's'} cut` : ''}: one smooth face per run${lf.n_ruled_runs ? ` (${lf.n_ruled_runs} run${lf.n_ruled_runs === 1 ? '' : 's'} ruled)` : ''}, like Fusion's Mesh Section Sketch + Loft.${gate}` }
+               note: `${lf.range ? `Only ${lf.range[0].toFixed(1)} to ${lf.range[1].toFixed(1)} mm along ${(lf.axis_name || '?').toUpperCase()}: ` : ''}${lf.n_sections} sections along ${(lf.axis_name || '?').toUpperCase()} at ${lf.interval} mm, ${runs}${lf.n_levels ? ` (split at ${lf.n_levels} flat step${lf.n_levels === 1 ? '' : 's'})` : ''}${lf.n_holes ? `, ${lf.n_holes} hole${lf.n_holes === 1 ? '' : 's'} cut` : ''}: one smooth face per run${lf.n_ruled_runs ? ` (${lf.n_ruled_runs} run${lf.n_ruled_runs === 1 ? '' : 's'} ruled)` : ''}, like Fusion's Mesh Section Sketch + Loft.${gate}` }
     }
     if (r.mode === 'facegroup') {
       const fg = r.metrics?.fgroup || {}

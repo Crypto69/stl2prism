@@ -284,6 +284,133 @@ def to_3d(xy, frame):
 
 
 # ---------------------------------------------------------------------------
+# sliver trimming
+
+def _crossings(P):
+    """Proper crossings between non-adjacent segments of the closed
+    polyline P: list of (i, j, X) with i < j, segment k = P[k] -> P[k+1]."""
+    n = len(P)
+    A = P
+    B = np.roll(P, -1, axis=0)
+    out = []
+    for i in range(n - 2):
+        j = np.arange(i + 2, n if i > 0 else n - 1)
+        p, r = A[i], B[i] - A[i]
+        q, s_ = A[j], B[j] - A[j]
+        rxs = r[0] * s_[:, 1] - r[1] * s_[:, 0]
+        qp = q - p
+        with np.errstate(divide='ignore', invalid='ignore'):
+            t = (qp[:, 0] * s_[:, 1] - qp[:, 1] * s_[:, 0]) / rxs
+            u = (qp[:, 0] * r[1] - qp[:, 1] * r[0]) / rxs
+        hit = (np.abs(rxs) > 1e-12) & (t > 1e-9) & (t < 1 - 1e-9) & (u > 1e-9) & (u < 1 - 1e-9)
+        for jj, tt in zip(j[hit], t[hit]):
+            out.append((i, int(jj), p + tt * r))
+    return out
+
+
+def _sub_stats(Q):
+    """(length, |area|) of the closed polygon Q (its last point closes to
+    its first)."""
+    L = float(np.linalg.norm(np.diff(np.vstack([Q, Q[:1]]), axis=0), axis=1).sum())
+    return L, abs(signed_area(Q))
+
+
+def trim_slivers(xy, w, max_rounds=50):
+    """Cut the slivers out of one closed loop: a stretch that leaves a
+    point and comes back within `w` of it, or that crosses itself, and
+    encloses a strip thinner than `w` (area < w * length / 2). That is the
+    double skin of a leaky mesh (two walls a hair apart, joined at their
+    ends) and the little bow-ties where two patches overlap: they draw as
+    hairpins and self-crossings that Fusion turns into sliver profiles.
+    The loop is otherwise untouched; a real slot wider than `w` stays.
+    A hairpin must be at least 2*w long to count (shorter ones are just
+    dense points on a bend); a twist of any length is removed, since the
+    smallest ones (0.02 mm curls where two patches overlap) are exactly
+    what makes Fusion refuse to loft the profile.
+    Returns (xy, slivers removed)."""
+    P = np.asarray(xy, float).copy()
+    removed = 0
+    for _ in range(max_rounds):
+        n = len(P)
+        if n < 6:
+            break
+        Pn = np.roll(P, -1, axis=0)
+        seg = np.linalg.norm(Pn - P, axis=1)
+        cum = np.concatenate([[0.0], np.cumsum(seg)])
+        total = cum[-1]
+        # running shoelace sum: the area of the stretch i..j closed by its
+        # chord is 0.5 * (S[j] - S[i] + (xj*yi - xi*yj)), in O(1)
+        S = np.concatenate([[0.0], np.cumsum(P[:, 0] * Pn[:, 1] - Pn[:, 0] * P[:, 1])])
+        cands = []                                    # (L, lo, hi, kind, X)
+        # stretches whose two ends nearly meet
+        D = np.linalg.norm(P[:, None, :] - P[None, :, :], axis=2)
+        near = np.argwhere(np.triu(D < w, k=3))
+        if len(near):
+            i, j = near[:, 0], near[:, 1]
+            Lf = cum[j] - cum[i]
+            d = D[i, j]
+            fwd = Lf <= total - Lf
+            L = np.where(fwd, Lf, total - Lf)
+            ok = (L >= 3.0 * np.maximum(d, 1e-9)) & (L >= 2.0 * w) & (L <= total - 2.0 * w)
+            area_f = 0.5 * np.abs(S[j] - S[i] + P[j, 0] * P[i, 1] - P[i, 0] * P[j, 1])
+            tot_area = 0.5 * abs(S[n])
+            area = np.where(fwd, area_f, np.abs(tot_area - area_f))
+            ok &= area < 0.5 * w * L
+            for k in np.nonzero(ok)[0]:
+                cands.append((float(L[k]), int(i[k]), int(j[k]), 'pin' if fwd[k] else 'pin_wrap', None))
+        # twists: the loop between two crossing segments
+        for i, j, X in _crossings(P):
+            if j - i <= n - (j - i):
+                Q = np.vstack([[X], P[i + 1:j + 1]])
+                kind = 'twist'
+            else:
+                Q = np.vstack([[X], P[j + 1:], P[:i + 1]])
+                kind = 'twist_wrap'
+            L, area = _sub_stats(Q)
+            if L > total - 2.0 * w:
+                continue
+            if area < 0.5 * w * L:
+                cands.append((L, i, j, kind, X))
+        if not cands:
+            break
+        # take every candidate whose index span is free of the ones already
+        # taken (shortest first): one pass removes all disjoint slivers
+        cands.sort(key=lambda c: c[0])
+        taken = np.zeros(n, bool)
+        drop = np.zeros(n, bool)                       # points to delete
+        insert = {}                                    # index -> point to put after it
+        keep_only = None
+        for L, i, j, kind, X in cands:
+            if kind.endswith('_wrap'):
+                if any(taken) or keep_only is not None:
+                    continue
+                keep_only = (i, j, kind, X)
+                break
+            span = slice(i + 1, j) if kind == 'pin' else slice(i + 1, j + 1)
+            lo, hi = i, j
+            if taken[lo:hi + 1].any():
+                continue
+            taken[lo:hi + 1] = True
+            drop[span] = True
+            if kind == 'twist':
+                insert[i] = X
+            removed += 1
+        if keep_only is not None:
+            i, j, kind, X = keep_only
+            P = P[i:j + 1] if kind == 'pin_wrap' else np.vstack([[X], P[i + 1:j + 1]])
+            removed += 1
+            continue
+        out = []
+        for k in range(n):
+            if not drop[k]:
+                out.append(P[k])
+            if k in insert:
+                out.append(insert[k])
+        P = np.asarray(out, float)
+    return P, removed
+
+
+# ---------------------------------------------------------------------------
 # curve fitting
 
 def douglas_peucker(pts, tol):
@@ -528,7 +655,8 @@ def fit_loop(xy, tol=0.08, mesh_pts=None, min_prim_mm=None, min_run=3, clean=Fal
         q = raw[douglas_peucker(raw, tol / 2)]
         return [{'type': 'spline', 'pts': q, 'p0': q[0].copy(), 'p1': q[-1].copy(),
                  'closed': False, '_pts': raw}]
-    return _close_junctions(_replace_with_splines(prims, runs, tol, closed), closed)
+    prims = _close_junctions(_replace_with_splines(prims, runs, tol, closed), closed)
+    return _uncross(prims, tol, closed)
 
 
 def drawn_ends(p):
@@ -552,6 +680,73 @@ def junction_gap(prims, closed=True):
         worst = max(worst, float(np.linalg.norm(drawn_ends(prims[i])[1]
                                                 - drawn_ends(prims[(i + 1) % n])[0])))
     return worst
+
+
+def _uncross(prims, tol, closed=True, max_rounds=8):
+    """Where two fitted primitives cross each other (a tiny arc hooking past
+    its neighbour at a sharp lip: the raw points never cross, the fit
+    does), redraw the stretch from the first to the second as straight
+    lines through their raw points, thinned at tol/2. Fusion refuses to
+    loft a profile that crosses itself, however small the curl."""
+    for _ in range(max_rounds):
+        n = len(prims)
+        if n < 2:
+            return prims
+        dense, owner = [], []
+        for i, p in enumerate(prims):
+            q = prim_points([p], arc_step_deg=1.0)
+            dense.append(q)
+            owner += [i] * len(q)
+        if not closed:
+            dense.append(np.asarray([prims[-1]['p1']], float))
+            owner.append(n - 1)
+        dense = np.vstack(dense)
+        owner = np.asarray(owner)
+        X = _crossings(dense) if closed else _crossings_open(dense)
+        if not X:
+            return prims
+        i, j = int(owner[X[0][0]]), int(owner[X[0][1]])
+        if i == j:
+            return prims                          # a primitive crossing itself: leave it
+        # the shorter way round from i to j
+        fwd = (j - i) % n
+        if closed and fwd > n - fwd:
+            i, j = j, i
+            fwd = (j - i) % n
+        run = [(i + k) % n for k in range(fwd + 1)]
+        if any(prims[k].get('_pts') is None for k in run):
+            return prims
+        raw = [np.asarray(prims[run[0]]['_pts'], float)] + \
+              [np.asarray(prims[k]['_pts'], float)[1:] for k in run[1:]]
+        raw = np.vstack(raw)
+        raw[0] = prims[run[0]]['p0']
+        raw[-1] = prims[run[-1]]['p1']
+        if len(_crossings_open(raw)):
+            return prims                          # the raw points cross too: trim's job, not ours
+        kidx = douglas_peucker(raw, tol / 2)
+        keep = raw[kidx]
+        # each line owns only its own stretch of raw points (never the
+        # whole run: that compounds round after round)
+        lines = [{'type': 'line', 'p0': keep[k].copy(), 'p1': keep[k + 1].copy(),
+                  '_pts': raw[kidx[k]:kidx[k + 1] + 1]} for k in range(len(keep) - 1)]
+        drop = set(run)
+        out = []
+        for k in range(n):
+            if k == run[0]:
+                out.extend(lines)
+            elif k not in drop:
+                out.append(prims[k])
+        prims = out
+    return prims
+
+
+def _crossings_open(P):
+    """Proper crossings of an open polyline (no closing edge)."""
+    n = len(P)
+    if n < 4:
+        return []
+    Q = np.vstack([P, [P[0] + 1e9]])          # a far-off closing edge crosses nothing
+    return [c for c in _crossings(Q) if c[0] < n - 1 and c[1] < n - 1]
 
 
 def prim_points(prims, arc_step_deg=6.0, closed=True):
@@ -594,18 +789,57 @@ def polyline_deviation(pts, ref):
     return _seg_dist_max(pts, ref, np.roll(ref, -1, axis=0))
 
 
-def fit_section(V, F, origin, normal, tol=0.08, mesh_pts=None, join_mm=0.0):
+def outer_only(loops):
+    """Of nested loops [(outer, holes)], keep the outers that sit inside
+    no other outer, and drop every hole. Returns (loops, inner dropped)."""
+    keep, inner = [], 0
+    areas = [abs(signed_area(o)) for o, _ in loops]
+    for i, (outer, holes) in enumerate(loops):
+        # only a bigger loop can contain this one: the even-odd test on a
+        # raw loop that still crosses itself can say otherwise
+        inside = any(j != i and areas[j] > areas[i] and point_in_loop(outer[0], loops[j][0])
+                     for j in range(len(loops)))
+        inner += len(holes) + (1 if inside else 0)
+        if not inside:
+            keep.append((outer, []))
+    return keep, inner
+
+
+def fit_section(V, F, origin, normal, tol=0.08, mesh_pts=None, join_mm=0.0, trim_mm=0.0,
+                closed_only=False):
     """Cut and fit in one go. Returns {'origin', 'u', 'v', 'normal',
     'loops': [(outer_prims, [hole_prims...]), ...], 'open': [prims, ...]
     (open chains, fitted open), 'raw': the raw loops, 'raw_open': the raw
     open chains, 'stats': {'loops', 'holes', 'open', 'lines', 'arcs',
     'circles', 'splines', 'joins', 'max_gap', 'dev_max'}} where dev_max is
     the worst distance from the raw section points to the fitted curves.
-    Free chain ends within `join_mm` are joined before fitting."""
+    Free chain ends within `join_mm` are joined before fitting; with
+    `trim_mm` > 0 the closed loops have their slivers thinner than that
+    cut out first (`trim_slivers`), counted in stats['trimmed'].
+    `closed_only` keeps just the outer outlines: inner loops and open
+    chains are counted (stats['inner'], stats['open']) but neither
+    trimmed nor fitted, which is most of the work on a busy section."""
     loops, opens, frame, jst = section_curves(V, F, origin, normal, join_mm=join_mm)
-    fitted, stats = [], dict(loops=0, holes=0, open=0, lines=0, arcs=0, circles=0,
+    fitted, stats = [], dict(loops=0, holes=0, open=0, inner=0, lines=0, arcs=0, circles=0,
                              splines=0, joins=jst['joins'], max_gap=jst['max_gap'],
-                             dev_max=0.0, junction_gap=0.0)
+                             dev_max=0.0, junction_gap=0.0, trimmed=0)
+    if closed_only:
+        stats['open'] = len(opens)
+        opens = []
+    if trim_mm > 0:
+        trimmed = []
+        for outer, holes in loops:
+            o2, k = trim_slivers(outer, trim_mm)
+            stats['trimmed'] += k
+            h2 = []
+            for h in holes:
+                q, k = trim_slivers(h, trim_mm)
+                stats['trimmed'] += k
+                h2.append(q)
+            trimmed.append((o2, h2))
+        loops = trimmed
+    if closed_only:
+        loops, stats['inner'] = outer_only(loops)
 
     def tally(prims, raw, closed):
         if isinstance(prims, dict):
@@ -663,18 +897,18 @@ def lift_prims(prims, frame):
     return out
 
 
-def section_preview(V, F, origin, normal, tol=0.08, join_mm=0.0, closed_only=False):
+def section_preview(V, F, origin, normal, tol=0.08, join_mm=0.0, closed_only=False, trim_mm=0.0):
     """One traced section for the web app and the sections script:
     {'origin', 'normal', 'loops': [(outer3d, [holes3d])], 'open':
     [prims3d...] (open chains), 'polylines': [[x, y, z]...] dense curves
     per loop for drawing (closed ones repeat their first point, open ones
-    do not), 'stats'}. `closed_only` leaves the open chains out of 'open'
-    and 'polylines' (an outline to extrude, without the loose pieces of a
-    leaky mesh); stats['open'] still counts them, so the caller can say
-    how many were skipped."""
-    sec = fit_section(V, F, origin, normal, tol=tol, join_mm=join_mm)
-    if closed_only:
-        sec['open'] = []
+    do not), 'stats'}. `closed_only` keeps just the outer outlines: the
+    open chains (loose pieces of a leaky mesh) and every inner loop (a
+    hole, an island inside a hole) are left out of the drawing, an outline
+    to extrude and nothing else; stats['open'] and stats['inner'] still
+    count them, so the caller can say how many were skipped."""
+    sec = fit_section(V, F, origin, normal, tol=tol, join_mm=join_mm, trim_mm=trim_mm,
+                      closed_only=closed_only)
     frame = (sec['origin'], sec['u'], sec['v'], sec['normal'])
     loops, polys = [], []
     for fo, fh in sec['loops']:

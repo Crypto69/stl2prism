@@ -70,7 +70,7 @@ const scheduleTrace = () => {
   traceTimer = setTimeout(() => store.traceSection(), 350)
 }
 watch(() => [store.sliceOffset, store.resolvedSliceAxis, store.params.tol, store.params.units,
-             store.params.scale, store.jobId, store.sliceJoin, store.sliceOutline],
+             store.params.scale, store.jobId, store.params.slice_join, store.sliceOutline, store.params.slice_trim],
       ([off, axis, , , , job]) => {
         // the old outline belongs to the old plane: drop it at once, so the
         // view never shows a trace that does not sit on the plane
@@ -92,8 +92,10 @@ const sectionSummary = computed(() => {
   if (st.splines) parts.push(`${st.splines} spline${st.splines === 1 ? '' : 's'}`)
   let head = `${st.loops} outline${st.loops === 1 ? '' : 's'}`
   if (st.open) head += `, ${st.open} open curve${st.open === 1 ? '' : 's'}${store.sliceOutline ? ' skipped' : ''}`
+  if (st.inner) head += `, ${st.inner} inner loop${st.inner === 1 ? '' : 's'} skipped`
   let tail = ''
   if (st.joins) tail = `; ${st.joins} gap${st.joins === 1 ? '' : 's'} joined (largest ${st.max_gap.toFixed(2)} mm)`
+  if (st.trimmed) tail += `; ${st.trimmed} sliver${st.trimmed === 1 ? '' : 's'} trimmed`
   return `${head}: ${parts.join(', ')}${tail}; worst miss ${st.dev_max.toFixed(3)} mm`
 })
 // Axis choices with the file's side along each, so X / Y / Z mean
@@ -261,19 +263,38 @@ const axisOptions = computed(() => {
           </label>
           <input
             id="slice_join" type="number" step="0.1" min="0" max="20"
-            v-model.number="store.sliceJoin"
+            v-model.number="store.params.slice_join"
+            :class="{ touched: !isDefault('slice_join') }"
           />
         </div>
         <p class="hint">
           A leaky mesh (loose surface patches) cuts into pieces; loose ends
           closer than this are joined so the outline closes. 0 draws exactly
           what Fusion's Create Mesh Section Sketch draws, open pieces and all.
+          The loft's cutter uses the same setting.
+        </p>
+        <div class="row">
+          <label for="slice_trim">
+            Trim slivers up to
+            <span class="unit num">mm</span>
+          </label>
+          <input
+            id="slice_trim" type="number" step="0.1" min="0" max="5"
+            v-model.number="store.params.slice_trim"
+            :class="{ touched: !isDefault('slice_trim') }"
+          />
+        </div>
+        <p class="hint">
+          Where the mesh has a double skin, the outline goes out and back along
+          the same path and Fusion makes thin sliver profiles there. Slivers
+          narrower than this are cut out of the loop before fitting. 0 leaves
+          the outline exactly as traced; 0.3 is a good start.
         </p>
         <label class="check">
           <input type="checkbox" v-model="store.sliceOutline" />
           <span>
             Outline only
-            <span class="help">Draw just the closed loops and leave out the loose open pieces, so the sketch is a clean profile to extrude. The summary still says how many pieces were skipped.</span>
+            <span class="help">Draw just the outer outline: loose open pieces and inner loops (holes, islands) are left out, so the sketch is one clean profile to extrude. The summary still says how many were skipped.</span>
           </span>
         </label>
         <p v-if="store.sectionBusy" class="hint">tracing…</p>
@@ -282,6 +303,31 @@ const axisOptions = computed(() => {
         <a v-if="store.section && store.sectionScriptUrl" class="dl" :href="store.sectionScriptUrl" download>
           Download Fusion sketch of this slice (.py)
         </a>
+        <div class="row">
+          <label for="slice_range">
+            Loft only
+            <span class="unit num">mm from this plane</span>
+          </label>
+          <input
+            id="slice_range" type="number" step="1" min="0" max="2000"
+            v-model.number="store.params.slice_range_mm"
+            :class="{ touched: !isDefault('slice_range_mm') }"
+          />
+        </div>
+        <div v-if="store.params.slice_range_mm > 0" class="row">
+          <label for="slice_dir">Going</label>
+          <select id="slice_dir" v-model="store.params.slice_range_dir"
+                  :class="{ touched: !isDefault('slice_range_dir') }">
+            <option value="+">+ (along the axis arrow)</option>
+            <option value="-">− (against it)</option>
+          </select>
+        </div>
+        <p class="hint">
+          0 lofts the whole body. A length lofts just that stretch, starting
+          at the plane above and going the chosen way, with flat ends: 20 mm
+          from the 36 mm plane going − gives a 36 → 16 mm slab. The check
+          then measures only that stretch of the mesh.
+        </p>
       </div>
       <label class="check loft">
         <input type="checkbox" v-model="store.params.loft_ruled" />

@@ -30,6 +30,15 @@ export const DEFAULT_PARAMS = {
   slice_mm: 0.2,
   slice_axis: 'auto',
   loft_ruled: false,
+  // the loft cutter and the single-slice view share these: loose ends
+  // closer than slice_join mm are joined, slivers thinner than slice_trim
+  // mm are cut out (0 = off)
+  slice_join: 2.5,
+  slice_trim: 0,
+  // partial loft: only slice_range_mm from the single-slice plane in this
+  // direction (0 = the whole body); slice_from is filled in at submit time
+  slice_range_mm: 0,
+  slice_range_dir: '-',
 }
 
 let pollTimer = null
@@ -66,7 +75,6 @@ export const useConvertStore = defineStore('convert', {
     // 0 draws exactly what Fusion's mesh section draws), and the last
     // traced section from /section
     sliceOffset: 0,
-    sliceJoin: 2.5,
     // closed loops only: leave out the loose open pieces of a leaky mesh
     sliceOutline: false,
     section: null,
@@ -113,7 +121,8 @@ export const useConvertStore = defineStore('convert', {
       if (!s.jobId || !a) return null
       const q = new URLSearchParams({ axis: a, offset: String(s.sliceOffset), tol: String(s.params.tol),
                                       units: s.params.units, scale: String(s.params.scale),
-                                      join: String(s.sliceJoin), outline: s.sliceOutline ? 'true' : 'false' })
+                                      join: String(s.params.slice_join), outline: s.sliceOutline ? 'true' : 'false',
+                                      trim: String(s.params.slice_trim || 0) })
       return `/api/jobs/${s.jobId}/section-script?${q}`
     },
     // The axis the sliced loft will cut along, with 'auto' resolved to the
@@ -149,7 +158,7 @@ export const useConvertStore = defineStore('convert', {
         this.$patch({
           status: 'ready', jobId: data.id, inputStats: data.input_stats,
           bodies: [], triangleBody: null, selected: [], hovered: -1,
-          sliceOffset: 0, sliceJoin: 2.5, sliceOutline: false, section: null, sectionError: null,
+          sliceOffset: 0, sliceOutline: false, section: null, sectionError: null,
         })
         this.loadBodies()
       } catch (e) {
@@ -198,6 +207,8 @@ export const useConvertStore = defineStore('convert', {
           // complete list means "everything", which the API takes as null.
           body: JSON.stringify({
             ...this.params,
+            // a partial loft starts at the single-slice plane
+            slice_from: this.params.slice_range_mm > 0 ? this.sliceOffset : null,
             bodies: this.selected.length && this.selected.length < this.bodies.length
               ? [...this.selected].sort((a, b) => a - b)
               : null,
@@ -274,7 +285,8 @@ export const useConvertStore = defineStore('convert', {
       if (!this.jobId || !a) return
       const q = new URLSearchParams({ axis: a, offset: String(this.sliceOffset), tol: String(this.params.tol),
                                       units: this.params.units, scale: String(this.params.scale),
-                                      join: String(this.sliceJoin), outline: this.sliceOutline ? 'true' : 'false' })
+                                      join: String(this.params.slice_join), outline: this.sliceOutline ? 'true' : 'false',
+                                      trim: String(this.params.slice_trim || 0) })
       const mine = ++traceSeq
       this.sectionBusy = true
       try {

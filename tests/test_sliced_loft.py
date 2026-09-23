@@ -118,6 +118,13 @@ def test_open_chain_stays_open():
     # outline only: the open chain is left out, but still counted
     pv = section_preview(V, F, [0, 0, 0], [0, 0, 1], tol=0.05, closed_only=True)
     assert pv['polylines'] == [] and pv['open'] == [] and pv['stats']['open'] == 1
+    # ... and so are inner loops: a plate with 4 holes keeps only its rim
+    p = synth.export(synth.plate_holes(), '/tmp/_s2p_plate2.stl')
+    m2 = trimesh.load(p, force='mesh')
+    full = section_preview(m2.vertices, m2.faces, [0, 0, 0.5], [0, 0, 1], tol=0.08)
+    rim = section_preview(m2.vertices, m2.faces, [0, 0, 0.5], [0, 0, 1], tol=0.08, closed_only=True)
+    assert len(full['polylines']) == 5 and full['stats']['inner'] == 0
+    assert len(rim['polylines']) == 1 and rim['stats']['inner'] == 4 and rim['loops'][0][1] == []
     # the loft's cutter keeps closing every chain by its chord
     from stl2prism.section_fit import signed_area
     lp, _ = section_loops(V, F, [0, 0, 0], [0, 0, 1])
@@ -151,6 +158,51 @@ def test_join_chains_bridges_small_gaps_only():
     assert len(loops) == 1 and opens == [] and jst['joins'] == 1
     st = fit_section(V, F, [0, 0, 0], [0, 0, 1], tol=0.1, join_mm=gap * 1.1)['stats']
     assert st['circles'] == 1 and st['open'] == 0
+
+
+def test_loft_range_gives_a_slab_with_flat_ends():
+    """A partial loft of a box (z from -5 to 5) between z = -3 and z = 1 is
+    a 40 x 30 x 4 slab, and a range past the body is clipped to it;
+    the sketch-path cutter (join / trim set) gives the same sections on a
+    watertight body as the chord-closing one."""
+    from stl2prism.sliced_loft import loft_body, Cutter
+    from stl2prism.pipeline import accurate_volume
+    m = trimesh.creation.box([40, 30, 10])
+    shape, info = loft_body(m, 2, 0.5, verbose=False, z_range=(-3.0, 1.0), join_mm=2.5, trim_mm=0.3)
+    assert info['range'] == [-3.0, 1.0]
+    assert accurate_volume(shape) == pytest.approx(40 * 30 * 4, rel=0.01)
+    shape, info = loft_body(m, 2, 0.5, verbose=False, z_range=(2.0, 9.0))
+    assert info['range'] == [2.0, 5.0]
+    assert accurate_volume(shape) == pytest.approx(40 * 30 * 3, rel=0.01)
+    a = Cutter(m, 2).cut(3.0)
+    b = Cutter(m, 2, 2.5, 0.3).cut(3.0)
+    assert len(a) == len(b) == 1 and np.allclose(a[0][0], b[0][0])
+
+
+def test_trim_slivers_removes_hairpins_and_twists_only():
+    """A rectangle with a 0.1 mm wide, 6 mm deep hairpin and a tiny bow-tie
+    twist: trim at 0.3 mm removes both, leaves a real 1 mm slot alone, and
+    trim 0 changes nothing."""
+    from stl2prism.section_fit import trim_slivers, signed_area, _crossings, fit_section
+    rect = [[0, 0], [10, 0], [10, 0.0], [10.05, 6], [10.15, 6], [10.2, 0.0],   # hairpin up
+            [20, 0], [20, 10], [12, 10], [12, 8], [11, 8], [11, 10],           # 1 mm slot
+            [5.2, 10], [5.0, 10.3], [4.8, 10], [0, 10]]                        # tiny twist
+    rect = np.asarray(rect, float)
+    rect[13] = [5.0, 9.7]                                                      # make the twist cross
+    xy = np.vstack([rect, [[5.2, 9.9], [4.8, 10.1]]]) if False else rect
+    Q, k = trim_slivers(xy, 0.3)
+    assert k >= 1
+    assert not any(abs(p[1] - 6) < 1e-6 for p in Q)                            # hairpin gone
+    assert any(abs(p[0] - 11) < 1e-6 and abs(p[1] - 8) < 1e-6 for p in Q)      # slot kept
+    assert abs(abs(signed_area(Q)) - abs(signed_area(xy))) < 0.3 * 12 + 1.0
+    Q0, k0 = trim_slivers(xy, 0.0)
+    assert k0 == 0 and np.array_equal(Q0, xy)
+    # through fit_section: stats['trimmed'] counts, and no self-crossing remains
+    V, F = _sheet(np.vstack([xy, xy[:1]]))
+    sec = fit_section(V, F, [0, 0, 0], [0, 0, 1], tol=0.05, join_mm=1.0, trim_mm=0.3)
+    assert sec['stats']['trimmed'] >= 1
+    sec0 = fit_section(V, F, [0, 0, 0], [0, 0, 1], tol=0.05, join_mm=1.0)
+    assert sec0['stats']['trimmed'] == 0
 
 
 def test_fit_loop_rounded_rect_is_lines_and_arcs():

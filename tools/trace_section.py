@@ -34,6 +34,7 @@ def main():
     ap.add_argument('--scale', type=float, default=1.0)
     ap.add_argument('--tol', type=float, default=0.08)
     ap.add_argument('--join', type=float, default=2.5, help='join free ends closer than this, mm')
+    ap.add_argument('--trim', type=float, default=0.0, help='cut slivers thinner than this out of loops, mm')
     ap.add_argument('--out', default=None)
     a = ap.parse_args()
 
@@ -48,13 +49,13 @@ def main():
     normal = np.zeros(3)
     normal[k] = 1.0
     t0 = time.time()
-    sec = fit_section(m.vertices, m.faces, origin, normal, tol=a.tol, join_mm=a.join)
+    sec = fit_section(m.vertices, m.faces, origin, normal, tol=a.tol, join_mm=a.join, trim_mm=a.trim)
     dt = time.time() - t0
     st = sec['stats']
     print(f"{os.path.basename(a.mesh)} {a.axis}={at:.2f} mm: {st['loops']} loops "
           f"({st['holes']} holes), {st['open']} open chains -> {st['lines']} lines, "
           f"{st['arcs']} arcs, {st['circles']} circles, {st['splines']} splines; "
-          f"{st['joins']} gaps joined (largest {st['max_gap']:.2f} mm); worst deviation "
+          f"{st['joins']} gaps joined (largest {st['max_gap']:.2f} mm), {st['trimmed']} slivers trimmed; worst deviation "
           f"{st['dev_max']:.3f} mm; {dt:.2f} s")
     raw_pts = sum(len(o) + sum(len(h) for h in hs) for o, hs in sec['raw'])
     raw_pts += sum(len(q) for q in sec['raw_open'])

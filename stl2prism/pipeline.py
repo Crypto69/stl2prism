@@ -161,7 +161,8 @@ def run(in_path, out_path, tol=0.08, accept_p95=0.25, accept_vol_pct=2.0,
         force_prismatic=False, verbose=True, units='mm', reduce_tol=0.05,
         write_script=True, face_groups=True, workers=None, shell_timeout=None,
         bodies=None, scale=1.0, method='auto', slice_mm=0.2, slice_axis='auto',
-        loft_ruled=False):
+        loft_ruled=False, slice_join=2.5, slice_trim=0.0, slice_from=None,
+        slice_range_mm=0.0, slice_range_dir='-'):
     """Convert one mesh file to one STEP file.
 
     Every connected body is converted on its own — prismatic where it passes
@@ -193,9 +194,35 @@ def run(in_path, out_path, tol=0.08, accept_p95=0.25, accept_vol_pct=2.0,
     outlines into smooth B-spline solids (sliced_loft.loft_body); the mode
     is then 'loft' and the gate is reported, not enforced. `loft_ruled`
     asks for a ruled loft (one face per section pair) instead of smooth.
+    `slice_join` / `slice_trim` are the loft cutter's gap joining and
+    sliver trimming (mm; the single-slice view's settings; 0 / 0 is the
+    old chord-closing cutter). `slice_range_mm` > 0 lofts only a stretch
+    of the body: from the plane `slice_from` mm from the file's
+    bounding-box centre (the single-slice slider), `slice_range_mm` long
+    in direction `slice_range_dir` ('+' or '-') along the slicing axis
+    ('auto' then means the file's longest side, as the slider does).
     """
     from .mesh_prep import load_and_prep_bodies
     from .rebuild import write_step
+
+    loft_opts = {'join_mm': float(slice_join or 0.0), 'trim_mm': float(slice_trim or 0.0),
+                 'z_range': None}
+    if method == 'loft' and slice_range_mm and slice_range_mm > 0:
+        from .mesh_prep import load_mesh, UNIT_SCALE
+        from .sliced_loft import axis_index
+        whole = load_mesh(in_path)
+        k = UNIT_SCALE.get(units, 1.0) * float(scale)
+        if k != 1.0:
+            whole.apply_scale(k)
+        axis = axis_index(whole, slice_axis)
+        slice_axis = 'xyz'[axis]
+        z0 = float(whole.bounding_box.centroid[axis]) + float(slice_from or 0.0)
+        z1 = z0 + float(slice_range_mm) * (-1.0 if str(slice_range_dir).strip() == '-' else 1.0)
+        loft_opts['z_range'] = (min(z0, z1), max(z0, z1))
+        if verbose:
+            print(f"[loft] only {loft_opts['z_range'][0]:.2f}..{loft_opts['z_range'][1]:.2f} mm "
+                  f"along {slice_axis.upper()} ({slice_range_mm} mm from the slider plane, "
+                  f"direction {slice_range_dir})")
 
     picked = bodies
     # Filter before repair, not after: repairing sixty-nine bodies the user
@@ -205,11 +232,36 @@ def run(in_path, out_path, tol=0.08, accept_p95=0.25, accept_vol_pct=2.0,
         in_path, verbose=verbose, units=units, scale=scale, keep=keep)
     if picked is not None:
         bodies = _pick_bodies(bodies, picked, verbose)
+    if loft_opts['z_range'] is not None:
+        # a partial loft: bodies the stretch never touches are left out,
+        # not written whole
+        z0, z1 = loft_opts['z_range']
+        k = 'xyz'.index(slice_axis)
+        inside = [b for b in bodies if b.mesh.bounds[0][k] < z1 and b.mesh.bounds[1][k] > z0]
+        if verbose and len(inside) < len(bodies):
+            print(f"[loft] {len(bodies) - len(inside)} of {len(bodies)} bodies lie outside "
+                  f"{z0:.2f}..{z1:.2f} mm and are left out")
+        bodies = inside
+        if not bodies:
+            raise RuntimeError(f'no body crosses {z0:.2f}..{z1:.2f} mm along {slice_axis.upper()}')
+        if len(bodies) > 1:
+            # cut all of them together, as the single-slice view does: a
+            # leaky shell is many loose patches, and only their sections
+            # taken together join into a closed outline. Cavities go in as
+            # well; their loops nest as holes of the outline.
+            import trimesh
+            from .mesh_prep import Body
+            parts = [m for b in bodies for m in [b.mesh] + list(b.voids or [])]
+            merged = trimesh.util.concatenate(parts)
+            if verbose:
+                print(f"[loft] {len(bodies)} bodies cut together as one mesh "
+                      f"({len(merged.faces)} faces) for the partial loft")
+            bodies = [Body(merged)]
     gates = dict(tol=tol, accept_p95=accept_p95, accept_max=accept_max,
                  accept_hole_max=accept_hole_max, accept_vol_pct=accept_vol_pct,
                  reduce_tol=reduce_tol, face_groups=face_groups,
                  method=method, slice_mm=slice_mm, slice_axis=slice_axis,
-                 loft_ruled=loft_ruled)
+                 loft_ruled=loft_ruled, loft_opts=loft_opts)
     from .parallel import Pool
     workers = _pool_size(bodies, workers)
     pool = Pool(workers) if workers >= 1 else None
@@ -1043,7 +1095,7 @@ def _log_check(metrics, verbose, tag='[check]'):
 def _convert_body(mesh, is_scan, force_prismatic, verbose, tol, accept_p95,
                   accept_max, accept_hole_max, accept_vol_pct, reduce_tol=0.05,
                   face_groups=True, pool=None, method='auto', slice_mm=0.2,
-                  slice_axis='auto', loft_ruled=False):
+                  slice_axis='auto', loft_ruled=False, loft_opts=None):
     """Convert one closed body. Returns (TopoDS_Shape, mode, metrics).
 
     `method='loft'` takes the sliced-loft route instead of the ladder: the
@@ -1068,8 +1120,13 @@ def _convert_body(mesh, is_scan, force_prismatic, verbose, tol, accept_p95,
 
     if method == 'loft':
         try:
-            return _loft_body(mesh, verbose, slice_mm, slice_axis, loft_ruled, gates)
+            return _loft_body(mesh, verbose, slice_mm, slice_axis, loft_ruled, gates,
+                              loft_opts or {})
         except Exception as e:
+            if (loft_opts or {}).get('z_range') is not None:
+                # a partial loft has no whole-body fallback: the faceted
+                # body would be the full shell, not the stretch asked for
+                raise RuntimeError(f'partial loft failed ({type(e).__name__}: {e})') from e
             if verbose:
                 print(f"[loft] failed ({type(e).__name__}: {e}); falling back to faceted")
         return _faceted_body(mesh, verbose, reduce_tol=reduce_tol)
@@ -1277,15 +1334,32 @@ def _score_axis_task(task):
 LOFT_TESS = (0.05, 0.3)
 
 
-def _loft_body(mesh, verbose, slice_mm, slice_axis, ruled, gates):
+def _loft_body(mesh, verbose, slice_mm, slice_axis, ruled, gates, loft_opts=None):
     """The sliced-loft route (sliced_loft.loft_body) with the standard
     check. The gate is logged as PASS / FAIL but not enforced: the user
     asked for a loft, and the deviation of a loft is by design (a smear
-    across a sideways hole, a smoothed corner), not a fitting failure."""
+    across a sideways hole, a smoothed corner), not a fitting failure.
+    With a z_range in `loft_opts` only that stretch is lofted, and the
+    check measures against the mesh clipped to the same stretch."""
     from .sliced_loft import loft_body, axis_index
+    opts = loft_opts or {}
     axis = axis_index(mesh, slice_axis)
-    shape, info = loft_body(mesh, axis, slice_mm, ruled=ruled, verbose=verbose)
-    metrics = validate(shape, mesh, tess=LOFT_TESS)
+    z_range = opts.get('z_range')
+    shape, info = loft_body(mesh, axis, slice_mm, ruled=ruled, verbose=verbose, z_range=z_range,
+                            join_mm=opts.get('join_mm', 0.0), trim_mm=opts.get('trim_mm', 0.0))
+    ref = mesh
+    if z_range is not None:
+        n = np.zeros(3)
+        n[axis] = 1.0
+        o0, o1 = np.zeros(3), np.zeros(3)
+        o0[axis], o1[axis] = z_range
+        try:
+            ref = mesh.slice_plane(o0, n, cap=False).slice_plane(o1, -n, cap=False)
+            if len(ref.faces) == 0:
+                ref = mesh
+        except Exception:
+            ref = mesh
+    metrics = validate(shape, ref, tess=LOFT_TESS)
     _log_check(metrics, verbose, tag='[loft]')
     if info.get('fuse') == 'compound' and verbose:
         print("[loft] the pieces did not fuse: the STEP holds them as separate solids, and "
@@ -1433,6 +1507,16 @@ def main():
     ap.add_argument('--loft-ruled', action='store_true',
                     help='sliced loft: ruled loft (one face per section pair) '
                          'instead of one smooth face per run')
+    ap.add_argument('--slice-join', type=float, default=2.5,
+                    help='sliced loft: join loose section ends closer than this, mm (default 2.5)')
+    ap.add_argument('--slice-trim', type=float, default=0.0,
+                    help='sliced loft: cut slivers thinner than this out of the sections, mm (default 0)')
+    ap.add_argument('--slice-from', type=float, default=None,
+                    help='sliced loft, partial: start plane, mm from the bounding-box centre')
+    ap.add_argument('--slice-range', type=float, default=0.0,
+                    help='sliced loft, partial: length to loft from the start plane, mm (0 = whole body)')
+    ap.add_argument('--slice-dir', choices=['+', '-'], default='-',
+                    help="sliced loft, partial: direction from the start plane (default '-')")
     ap.add_argument('--quiet', action='store_true')
     args = ap.parse_args()
     out = args.output or args.input.rsplit('.', 1)[0] + '.step'
@@ -1446,7 +1530,10 @@ def main():
                 face_groups=not args.no_face_groups,
                 workers=args.workers, shell_timeout=args.shell_timeout,
                 method=args.method, slice_mm=args.slice_mm,
-                slice_axis=args.slice_axis, loft_ruled=args.loft_ruled)
+                slice_axis=args.slice_axis, loft_ruled=args.loft_ruled,
+                slice_join=args.slice_join, slice_trim=args.slice_trim,
+                slice_from=args.slice_from, slice_range_mm=args.slice_range,
+                slice_range_dir=args.slice_dir)
     except Exception as e:
         # A crash must not look like a success to a calling script.
         print(f"[error] {type(e).__name__}: {e}", file=sys.stderr)

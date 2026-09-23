@@ -30,7 +30,7 @@ def _mesh(path, units, scale):
     return m
 
 
-def trace(path, axis, offset, tol=0.08, units='mm', scale=1.0, join=2.5, outline=False):
+def trace(path, axis, offset, tol=0.08, units='mm', scale=1.0, join=2.5, outline=False, trim=0.0):
     """Section of the mesh at `offset` mm from its bounding-box centre
     along `axis` ('x'|'y'|'z'), in the converted (mm) frame. Open chains
     stay open (a leaky mesh), but free ends within `join` mm of each other
@@ -47,7 +47,7 @@ def trace(path, axis, offset, tol=0.08, units='mm', scale=1.0, join=2.5, outline
     normal = np.zeros(3)
     normal[k] = 1.0
     sec = section_preview(m.vertices, m.faces, origin, normal, tol=tol, join_mm=join,
-                          closed_only=outline)
+                          closed_only=outline, trim_mm=trim)
     sec.update(axis=axis, at=at, offset=float(offset), centre=float(c[k]), extent=ext,
                bbox_centre=np.asarray(c).tolist())
     return sec

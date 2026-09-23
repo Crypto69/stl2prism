@@ -45,6 +45,11 @@ def main():
                 slice_mm=params.get('slice_mm', 0.2),
                 slice_axis=params.get('slice_axis', 'auto'),
                 loft_ruled=params.get('loft_ruled', False),
+                slice_join=params.get('slice_join', 2.5),
+                slice_trim=params.get('slice_trim', 0.0),
+                slice_from=params.get('slice_from'),
+                slice_range_mm=params.get('slice_range_mm', 0.0),
+                slice_range_dir=params.get('slice_range_dir', '-'),
                 verbose=True)
         # Pass the whole pipeline result through (mode, metrics, and for
         # multi-body files the per-body list and counts).

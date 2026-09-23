@@ -36,7 +36,7 @@ generated Fusion script draws (fusion_export.emit_fusion_loft_script).
 """
 import numpy as np
 
-from .section_fit import section_loops, to_3d, signed_area, douglas_peucker
+from .section_fit import section_loops, section_curves, trim_slivers, to_3d, signed_area, douglas_peucker
 
 EPS = 1e-3                 # mm: end / level slices sit this far inside the material
 MAX_SECTIONS_PER_RUN = 60  # smooth loft sections per run (plan: ~60)
@@ -97,13 +97,19 @@ def step_levels(mesh, axis, frac=STEP_AREA_FRAC, gap=0.05):
     return out
 
 
-def slice_plan(mesh, axis, interval, levels):
+def slice_plan(mesh, axis, interval, levels, z_range=None):
     """[(z_query, z_target, kind)] sorted by z_query. Regular slices every
     `interval` from the low end; an 'end' slice EPS inside each end
     (snapped onto the end); a 'level' pair EPS either side of each step
     level (both snapped onto it, so the run above and the run below meet
-    exactly). Regular slices within 3*EPS of a snapped one are dropped."""
+    exactly). Regular slices within 3*EPS of a snapped one are dropped.
+    `z_range` = (lo, hi) plans only that stretch of the body (clipped to
+    the body), with 'end' slices at the stretch's ends."""
     lo, hi = float(mesh.bounds[0][axis]), float(mesh.bounds[1][axis])
+    if z_range is not None:
+        lo, hi = max(lo, float(min(z_range))), min(hi, float(max(z_range)))
+        if hi - lo < 2 * EPS:
+            return []
     reqs = [(lo + EPS, lo, 'end'), (hi - EPS, hi, 'end')]
     reqs += [(float(z), float(z), 'reg') for z in np.arange(lo + interval, hi - interval * 0.5, interval)]
     for L in levels:
@@ -135,9 +141,18 @@ def slice_plan(mesh, axis, interval, levels):
 class Cutter:
     """Plane cuts of one mesh perpendicular to one axis, with the faces
     pre-filtered by their extent along the axis (one boolean mask per cut
-    instead of the whole mesh through the chainer)."""
+    instead of the whole mesh through the chainer).
 
-    def __init__(self, mesh, axis):
+    With `join_mm` or `trim_mm` set, a cut goes through the sketch path
+    (`section_curves`: free ends within join_mm joined, open chains left
+    out, slivers thinner than trim_mm cut) instead of `section_loops`,
+    which closes every open chain by its chord. On a watertight body both
+    give the same loops; on a leaky one only the sketch path gives the
+    outline the single-slice view shows."""
+
+    def __init__(self, mesh, axis, join_mm=0.0, trim_mm=0.0):
+        self.join_mm = float(join_mm or 0.0)
+        self.trim_mm = float(trim_mm or 0.0)
         self.V = np.asarray(mesh.vertices, float)
         self.F = np.asarray(mesh.faces, np.int64)
         self.axis = axis
@@ -151,19 +166,31 @@ class Cutter:
         if not m.any():
             return []
         o = self.n * z
-        loops, _ = section_loops(self.V, self.F[m], o, self.n, min_area=1e-4)
+        if self.join_mm <= 0 and self.trim_mm <= 0:
+            loops, _ = section_loops(self.V, self.F[m], o, self.n, min_area=1e-4)
+            return loops
+        loops, _, _, _ = section_curves(self.V, self.F[m], o, self.n, min_area=1e-4,
+                                        join_mm=self.join_mm)
+        if self.trim_mm > 0:
+            loops = [(trim_slivers(outer, self.trim_mm)[0],
+                      [trim_slivers(h, self.trim_mm)[0] for h in holes]) for outer, holes in loops]
+            loops = [(o_, h_) for o_, h_ in loops if len(o_) >= 3]
         return loops
 
     def to_3d(self, xy, z):
         return to_3d(xy, (self.n * z, self.u, self.v, self.n))
 
 
-def slice_mesh(mesh, axis, interval, verbose=True):
+def slice_mesh(mesh, axis, interval, verbose=True, z_range=None, join_mm=0.0, trim_mm=0.0):
     """All sections: [(z_target, kind, loops)] with empty cuts dropped,
-    plus the step levels used."""
+    plus the step levels used. `z_range` limits the stack to one stretch
+    of the body; `join_mm` / `trim_mm` pick the sketch-path cutter."""
     levels = step_levels(mesh, axis, gap=max(0.05, interval / 2))
-    plan = slice_plan(mesh, axis, interval, levels)
-    cutter = Cutter(mesh, axis)
+    if z_range is not None:
+        lo, hi = min(z_range), max(z_range)
+        levels = [L for L in levels if lo < L < hi]
+    plan = slice_plan(mesh, axis, interval, levels, z_range)
+    cutter = Cutter(mesh, axis, join_mm, trim_mm)
     out = []
     for zq, zt, kind in plan:
         loops = cutter.cut(zq)
@@ -587,8 +614,14 @@ def _fuse_all(solids, verbose, tol_pct=2.0):
 # ---------------------------------------------------------------------------
 # the body
 
-def loft_body(mesh, axis, interval=0.2, ruled=False, verbose=True):
+def loft_body(mesh, axis, interval=0.2, ruled=False, verbose=True, z_range=None,
+              join_mm=0.0, trim_mm=0.0):
     """Sliced-loft solid of one closed body. Returns (TopoDS_Shape, info).
+
+    `z_range` = (z0, z1), absolute along the axis, lofts only that stretch
+    of the body with flat ends (no dome tips at a cut end); info gains
+    'range'. `join_mm` / `trim_mm` are the sketch-path cutter's settings
+    (see Cutter).
 
     info: {'mode': 'loft', 'axis': [..], 'axis_name', 'interval', 'ruled'
     (requested), 'n_sections', 'n_runs', 'n_levels', 'n_holes',
@@ -600,16 +633,21 @@ def loft_body(mesh, axis, interval=0.2, ruled=False, verbose=True):
     import cadquery as cq
     if isinstance(axis, str):
         axis = axis_index(mesh, axis)
-    slices, levels, cutter = slice_mesh(mesh, axis, interval, verbose)
+    slices, levels, cutter = slice_mesh(mesh, axis, interval, verbose, z_range, join_mm, trim_mm)
     if len(slices) < 2:
         raise RuntimeError(f'only {len(slices)} section(s) along {"xyz"[axis]}; nothing to loft')
-    slices, apex_lo, apex_hi = drop_dome_ends(slices)
+    if z_range is None:
+        slices, apex_lo, apex_hi = drop_dome_ends(slices)
+    else:
+        apex_lo = apex_hi = False          # a cut end is a flat face, never a dome tip
     runs = build_runs(slices)
     if verbose:
         print(f"[loft] {len(runs)} run(s): "
               + ", ".join(f"{slices[a][0]:.2f}..{slices[b][0]:.2f} ({b - a + 1} sections, {len(c)} outline(s))"
                           for a, b, c in runs))
     lo, hi = float(mesh.bounds[0][axis]), float(mesh.bounds[1][axis])
+    if z_range is not None:
+        lo, hi = max(lo, float(min(z_range))), min(hi, float(max(z_range)))
     ax_vec = np.zeros(3)
     ax_vec[axis] = 1.0
 
@@ -728,6 +766,8 @@ def loft_body(mesh, axis, interval=0.2, ruled=False, verbose=True):
               f"({how} fuse), volume {_volume(shape):.0f} mm^3")
     info = {'mode': 'loft', 'axis': ax_vec.tolist(), 'axis_name': 'xyz'[axis],
             'interval': float(interval), 'ruled': bool(ruled),
+            'range': [lo, hi] if z_range is not None else None,
+            'join_mm': float(join_mm or 0.0), 'trim_mm': float(trim_mm or 0.0),
             'n_sections': len(slices), 'n_runs': len(runs), 'n_levels': len(levels),
             'n_holes': n_holes, 'n_ruled_runs': int(n_ruled), 'fuse': how,
             'faces': len(shape.Faces()), 'skipped': skipped, 'runs': run_infos}

@@ -66,8 +66,18 @@ as closed loops; they are drawn open, exactly as Fusion's mesh section
 draws them, after loose ends closer than "Join gaps up to" (default
 2.5 mm, `join=`) have been joined, so an outline broken only by hairline
 cracks between patches comes back as one closed profile. 0 joins
-nothing. "Outline only" (`outline=true`) leaves the open pieces out
-altogether, for a clean profile to extrude.
+nothing. "Outline only" (`outline=true`) draws just the outer outline,
+leaving the open pieces and every inner loop out, for one clean profile
+to extrude; "Trim slivers up to"
+(`trim=`) cuts hairpins and thin twists narrower than that out of the
+loops, where the mesh has a double skin.
+
+The sliced loft's cutter uses the same join and trim settings
+(`--slice-join`, `--slice-trim`), so a leaky shell lofts from the same
+outlines the slice view shows. "Loft only N mm from this plane" (`--slice-from`,
+`--slice-range`, `--slice-dir`) lofts just a stretch of the body, starting
+at the slider's plane, with flat ends; the check then measures only that
+stretch of the mesh.
 
 ## Screenshots
 
