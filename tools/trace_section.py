@@ -21,7 +21,7 @@ import numpy as np
 import trimesh
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
-from stl2prism.section_fit import fit_section, prim_points   # noqa: E402
+from stl_to_solid.section_fit import fit_section, prim_points   # noqa: E402
 
 
 def main():

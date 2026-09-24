@@ -39,7 +39,7 @@ CASES = [
 
 @pytest.mark.parametrize('name,builder,mode,faces,dev', CASES, ids=[c[0] for c in CASES])
 def test_matrix(tmp_path, name, builder, mode, faces, dev):
-    from stl2prism.pipeline import run
+    from stl_to_solid.pipeline import run
     p = synth.export(builder(), tmp_path / f'{name}.stl')
     out = str(tmp_path / f'{name}.step')
     r = run(p, out, verbose=False)

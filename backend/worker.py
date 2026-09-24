@@ -14,7 +14,7 @@ def main():
     with open(params_path) as f:
         params = json.load(f)
 
-    from stl2prism import run
+    from stl_to_solid import run
     from .analysis import sanitize, step_stats, body_list
 
     # The UI picks shells by their index in /bodies (every connected shell

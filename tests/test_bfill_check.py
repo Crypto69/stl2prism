@@ -14,9 +14,9 @@ from . import synth
 
 
 def _script(tmp_path, name, builder):
-    from stl2prism.mesh_prep import load_and_prep_bodies
-    from stl2prism import facegroups
-    from stl2prism.fusion_boundary_fill import emit_boundary_fill_script
+    from stl_to_solid.mesh_prep import load_and_prep_bodies
+    from stl_to_solid import facegroups
+    from stl_to_solid.fusion_boundary_fill import emit_boundary_fill_script
     p = synth.export(builder(), tmp_path / f'{name}.stl')
     bodies, _, _ = load_and_prep_bodies(p, verbose=False)
     _, stats = facegroups.convert(bodies[0].mesh, tol=0.08)
@@ -24,8 +24,8 @@ def _script(tmp_path, name, builder):
 
 
 def _runtime_ns():
-    from stl2prism.fusion_boundary_fill import RUNTIME
-    from stl2prism.bfill_check import parse_script
+    from stl_to_solid.fusion_boundary_fill import RUNTIME
+    from stl_to_solid.bfill_check import parse_script
     return parse_script('BODIES = []\nEXPAND = 0.1\nEXPAND_MIN = 0.01\nSKIP = []\n' + RUNTIME)
 
 
@@ -33,7 +33,7 @@ def test_arc_growth_is_the_runtimes_own():
     """The dry run grows arcs with the script's _arc_span — min(pi, E/r) per
     side, the whole circle within 0.02 rad of closing — the rule the old
     emulation (a pi/6 cap, no closure) had drifted from."""
-    from stl2prism.bfill_check import _ax2
+    from stl_to_solid.bfill_check import _ax2
     span = _runtime_ns()['_arc_span']
     assert span(1.0, 0.0, 1.0, 0.1) == pytest.approx((-0.1, 1.1))
     assert span(0.05, 0.0, 1.5, 0.1) == pytest.approx((-2.0, 3.5))         # E/r = 2 rad, not pi/6
@@ -56,15 +56,15 @@ def test_runtime_helpers_the_dry_run_executes_are_present():
 
 
 def test_old_scripts_are_refused_clearly():
-    from stl2prism.fusion_boundary_fill import RUNTIME
-    from stl2prism.bfill_check import parse_script
+    from stl_to_solid.fusion_boundary_fill import RUNTIME
+    from stl_to_solid.bfill_check import parse_script
     old = RUNTIME.replace('def _arc_span', 'def _arc_span_gone')
     with pytest.raises(ValueError, match='regenerate'):
         parse_script('BODIES = []\nEXPAND = 0.1\nEXPAND_MIN = 0.01\n' + old)
 
 
 def test_dry_run_closes_a_clean_part_quickly(tmp_path):
-    from stl2prism.bfill_check import check_script, outlook
+    from stl_to_solid.bfill_check import check_script, outlook
     text = _script(tmp_path, 'ft', synth.fillet_top)
     t0 = time.time()
     res = check_script(text)
@@ -81,7 +81,7 @@ def test_dry_run_closes_a_clean_part_quickly(tmp_path):
 def test_dry_run_honours_the_scripts_skip_list(tmp_path):
     """SKIP indexes the tools that were built, as in the runtime; with two
     walls of the box left out the cells no longer enclose the part."""
-    from stl2prism.bfill_check import check_script, outlook
+    from stl_to_solid.bfill_check import check_script, outlook
     text = _script(tmp_path, 'ft', synth.fillet_top).replace('SKIP = []', 'SKIP = [0, 1]', 1)
     res = check_script(text)
     r = res[0]
@@ -98,7 +98,7 @@ def _script_n_bodies(tmp_path, n):
 
 
 def test_dry_run_budget_leaves_later_bodies_unchecked(tmp_path):
-    from stl2prism.bfill_check import check_script, outlook
+    from stl_to_solid.bfill_check import check_script, outlook
     text = _script(tmp_path, 'ft', synth.fillet_top)
     # one body: a zero budget still checks it (the budget is tested between bodies)
     res = check_script(text, budget_s=0.0)
@@ -110,7 +110,7 @@ def test_dry_run_budget_leaves_later_bodies_unchecked(tmp_path):
 
 
 def test_outlook_judges_every_body_and_the_dropped_ones():
-    from stl2prism.bfill_check import outlook
+    from stl_to_solid.bfill_check import outlook
     good = dict(name='a', enclosed_pct=100.0, unenclosed=[], n_probes=10, error=None,
                 probes_by_region={'3 plane': 2, '4 cone': 4, '5 plane': 4})
     assert outlook([good])['ok'] is True
@@ -138,7 +138,7 @@ def test_outlook_judges_every_body_and_the_dropped_ones():
 def test_unbuildable_tools_are_skipped_not_fatal(tmp_path):
     """A degenerate tool record must not abort the dry run (the runtime skips
     it and runs the fill without it): it is counted and the rest is checked."""
-    from stl2prism.bfill_check import check_script
+    from stl_to_solid.bfill_check import check_script
     text = _script(tmp_path, 'ft', synth.fillet_top)
     # a record no builder exists for (OCC builds most degenerate records
     # silently; an unknown kind is refused for sure)

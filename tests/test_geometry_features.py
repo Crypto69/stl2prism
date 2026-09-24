@@ -9,7 +9,7 @@ from . import synth
 
 
 def _run(wp, tmp_path, name, **kw):
-    from stl2prism.pipeline import run
+    from stl_to_solid.pipeline import run
     p = synth.export(wp, tmp_path / f'{name}.stl')
     out = str(tmp_path / f'{name}.step')
     r = run(p, out, verbose=False, **kw)
@@ -49,7 +49,7 @@ def test_stacked_slabs_share_one_cylinder(tmp_path):
 # --- B3 / C2: primitive fitting on vertices ---------------------------------------
 
 def test_cylinder_fit_exact_on_coarse_mesh(tmp_path):
-    from stl2prism.features import find_cross_cylinders
+    from stl_to_solid.features import find_cross_cylinders
     m = trimesh.load(synth.export(synth.cross_blind(), tmp_path / 'cb.stl', tol=0.3, ang=0.5),
                      force='mesh')
     cyls = find_cross_cylinders(m, np.array([0, 0, 1.0]), exclude_parallel=False)
@@ -61,7 +61,7 @@ def test_cylinder_fit_exact_on_coarse_mesh(tmp_path):
 def test_cross_axis_countersink_is_a_cone(tmp_path):
     """Countersink along X in a block; primary axis given as Z, so the cone
     is a cross-axis feature."""
-    from stl2prism.features import find_cross_cones
+    from stl_to_solid.features import find_cross_cones
     blk = (cq.Workplane('XY').box(30, 30, 30).faces('>X').workplane().cskHole(6, 12, 90))
     m = trimesh.load(synth.export(blk, tmp_path / 'csk.stl'), force='mesh')
     cones = find_cross_cones(m, np.array([0, 0, 1.0]))
@@ -74,7 +74,7 @@ def test_cross_axis_countersink_is_a_cone(tmp_path):
 
 
 def test_partial_cylinder_is_not_a_cone(tmp_path):
-    from stl2prism.features import find_cross_cones
+    from stl_to_solid.features import find_cross_cones
     m = trimesh.load(synth.export(synth.rounded_rect(), tmp_path / 'rr.stl'), force='mesh')
     assert find_cross_cones(m, np.array([1.0, 0, 0])) == []
 

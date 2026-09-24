@@ -19,7 +19,7 @@ def mesh_stats(path):
     # Same loader as the pipeline, so watertight/vertex/volume numbers here
     # describe the geometry the conversion will actually see (an OBJ with
     # per-corner normals would otherwise report as open with 4x the vertices).
-    from stl2prism.mesh_prep import load_mesh, suggest_units, unit_warning
+    from stl_to_solid.mesh_prep import load_mesh, suggest_units, unit_warning
     m = load_mesh(path)
     ext = m.bounding_box.primitive.extents
     stats = {
@@ -83,7 +83,7 @@ def _solid_check(path):
         while e.More():
             n += 1
             e.Next()
-        from stl2prism.rebuild import _naked_edges
+        from stl_to_solid.rebuild import _naked_edges
         return n, _naked_edges(shape) == 0
     except Exception:
         return None, None
@@ -156,7 +156,7 @@ def body_list(path, max_bodies=400):
     """
     import numpy as np
     from trimesh.graph import connected_components
-    from stl2prism.mesh_prep import load_mesh
+    from stl_to_solid.mesh_prep import load_mesh
     m = load_mesh(path)
     n_faces = len(m.faces)
     # Label faces from the connectivity split() uses, because split() does
@@ -179,7 +179,7 @@ def body_list(path, max_bodies=400):
             subs.append(m.submesh([comps[i]], append=True, repair=False))
     # Keys are measured against the whole file's box, so they must all be
     # built together (see pipeline.shell_keys).
-    from stl2prism.pipeline import shell_keys
+    from stl_to_solid.pipeline import shell_keys
     keys = shell_keys(subs)
     bodies = []
     for new_i, old_i in enumerate(order[:max_bodies]):

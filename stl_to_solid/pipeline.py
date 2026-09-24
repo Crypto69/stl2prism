@@ -539,7 +539,7 @@ def _shell_tag(i, n, k=None, m=0):
 
 def _pool_size(bodies, workers):
     """The worker count a run may use: an explicit `workers` as given, the
-    default (None: STL2PRISM_WORKERS, else half the cores) only when the
+    default (None: STLTOSOLID_WORKERS, else half the cores) only when the
     file carries enough faces for the work to outlast the workers'
     start-up (POOL_MIN_FACES); 0 means everything in this process."""
     from .parallel import default_workers
@@ -694,7 +694,7 @@ def _convert_all_pooled(bodies, force_prismatic, verbose, gates, pool, workers,
             print(f"[progress] {n_done}/{n_all} shells", flush=True)
         return on_done
 
-    with tempfile.TemporaryDirectory(prefix='stl2prism-shells-') as td:
+    with tempfile.TemporaryDirectory(prefix='stltosolid-shells-') as td:
         for sh in shells:
             sh['payload'] = _mesh_payload(sh['mesh'], td, sh['name'])
         got = pool.run(_shell_task, [task(sh) for sh in shells], timeout=shell_timeout,
@@ -843,21 +843,21 @@ def _env_float(name, default):
 # straight to the face-group route. The search is bounded per candidate
 # too (extrusion.MAX_LEVELS), so this is the backstop for the case nobody
 # predicted, not the normal path.
-AXIS_SEARCH_BUDGET_S = _env_float('STL2PRISM_AXIS_BUDGET', 120.0)
+AXIS_SEARCH_BUDGET_S = _env_float('STLTOSOLID_AXIS_BUDGET', 120.0)
 
 def _env_int(name, default):
     return _env_num(name, default, int, 'a whole number')
 
 
-# Shells converted at once (STL2PRISM_WORKERS; None: half the cores) and
-# the wall clock per shell (STL2PRISM_SHELL_TIMEOUT; 0: none) before it is
+# Shells converted at once (STLTOSOLID_WORKERS; None: half the cores) and
+# the wall clock per shell (STLTOSOLID_SHELL_TIMEOUT; 0: none) before it is
 # built faceted instead. Without an explicit count a file under
 # POOL_MIN_FACES faces stays in-process: a worker's start-up (interpreter
 # plus OCP, a few seconds) would outlast its conversion. The shells in
 # flight together stay under POOL_ONE_WORKER_FACES faces: a CAD shell in a
 # worker is a few hundred megabytes and the NAS has 12 GB for everything.
-WORKERS = _env_int('STL2PRISM_WORKERS', None)
-SHELL_TIMEOUT_S = _env_float('STL2PRISM_SHELL_TIMEOUT', 900.0)
+WORKERS = _env_int('STLTOSOLID_WORKERS', None)
+SHELL_TIMEOUT_S = _env_float('STLTOSOLID_SHELL_TIMEOUT', 900.0)
 POOL_MIN_FACES = 20_000          # also: a shell's axis candidates go to the pool from here
 POOL_ONE_WORKER_FACES = 1_000_000
 
@@ -1296,7 +1296,7 @@ def _scored_candidates(mesh, cands, budget, verbose, pool):
         import tempfile
         if verbose:
             print(f"[axis] {len(cands)} candidates scored on {n_workers} worker(s)")
-        with tempfile.TemporaryDirectory(prefix='stl2prism-axis-') as td:
+        with tempfile.TemporaryDirectory(prefix='stltosolid-axis-') as td:
             payload = _mesh_payload(mesh, td, 'shell')
             got = pool.run(_score_axis_task,
                            [{'mesh': payload, 'axis': np.asarray(ax, float),
@@ -1456,7 +1456,7 @@ def _faceted_body(mesh, verbose, accept_vol_pct=5.0, reduce_tol=0.05):
 
 def main():
     ap = argparse.ArgumentParser(
-        prog='stl2prism',
+        prog='stltosolid',
         description='Convert an STL or OBJ mesh into a prismatic STEP solid '
                     'via extrusion-structure recognition, with faceted '
                     'fallback.')
@@ -1489,12 +1489,12 @@ def main():
     ap.add_argument('--workers', type=int, default=None,
                     help='shells (bodies and cavities) converted at once in '
                          'worker processes; 0 converts in this process '
-                         '(default: STL2PRISM_WORKERS, else half the cores, '
+                         '(default: STLTOSOLID_WORKERS, else half the cores, '
                          'and in-process for files under 20k faces)')
     ap.add_argument('--shell-timeout', type=float, default=None,
                     help='seconds a shell may run in a worker before it is '
                          'built faceted instead; 0 for no limit '
-                         '(default: STL2PRISM_SHELL_TIMEOUT, else 900)')
+                         '(default: STLTOSOLID_SHELL_TIMEOUT, else 900)')
     ap.add_argument('--method', choices=['auto', 'loft'], default='auto',
                     help="'loft': slice each body along an axis and loft the "
                          "section outlines into a smooth B-spline solid, like "

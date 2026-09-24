@@ -157,7 +157,7 @@ class Pool:
     @property
     def log_dir(self):
         if self._log_dir is None:
-            self._tmp = tempfile.TemporaryDirectory(prefix='stl2prism-pool-')
+            self._tmp = tempfile.TemporaryDirectory(prefix='stltosolid-pool-')
             self._log_dir = self._tmp.name
         return self._log_dir
 

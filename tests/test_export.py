@@ -11,7 +11,7 @@ from . import synth
 
 
 def test_script_rebuilds_the_part(tmp_path):
-    from stl2prism.pipeline import run
+    from stl_to_solid.pipeline import run
     p = synth.export(synth.slot_hex(), tmp_path / 'slot.stl')
     out = str(tmp_path / 'slot.step')
     r = run(p, out, verbose=False)
@@ -31,7 +31,7 @@ def test_script_rebuilds_the_part(tmp_path):
 
 
 def test_script_for_multi_body_and_hole_cut(tmp_path):
-    from stl2prism.pipeline import run
+    from stl_to_solid.pipeline import run
     p = synth.export(synth.cross_blind(), tmp_path / 'cb.stl')
     r = run(p, str(tmp_path / 'cb.step'), verbose=False)
     txt = open(r['script']).read()
@@ -41,7 +41,7 @@ def test_script_for_multi_body_and_hole_cut(tmp_path):
 
 
 def test_step_has_body_names_and_colours(tmp_path):
-    from stl2prism.pipeline import run
+    from stl_to_solid.pipeline import run
     p = synth.export(synth.csk_plate(), tmp_path / 'named_part.stl')
     out = str(tmp_path / 'named_part.step')
     r = run(p, out, verbose=False)
@@ -72,7 +72,7 @@ def test_step_has_body_names_and_colours(tmp_path):
 
 
 def test_multi_body_step_names(tmp_path):
-    from stl2prism.pipeline import run
+    from stl_to_solid.pipeline import run
     a = trimesh.creation.box((20, 10, 5))
     b = trimesh.creation.box((8, 8, 8)); b.apply_translation((40, 0, 0))
     p = str(tmp_path / 'asm.stl'); trimesh.util.concatenate([a, b]).export(p)
@@ -86,14 +86,14 @@ def test_multi_body_step_names(tmp_path):
 # --- B5 ---------------------------------------------------------------------
 
 def test_planar_merge_before_sewing_gives_few_faces():
-    from stl2prism.rebuild import faceted_solid
+    from stl_to_solid.rebuild import faceted_solid
     m = trimesh.creation.box((20, 10, 5)).subdivide().subdivide()   # 12*16 = 192 tris
     shape, st = faceted_solid(m, verbose=False, merge_planar=True)
     assert st['faces_out'] == 6 and st['is_solid'] and st['planar_faces_merged'] == 6
 
 
 def test_reduce_mesh_respects_tolerance():
-    from stl2prism.rebuild import reduce_mesh
+    from stl_to_solid.rebuild import reduce_mesh
     m = trimesh.creation.icosphere(subdivisions=5, radius=20)
     r, info = reduce_mesh(m, 0.05, verbose=False)
     assert info['reduced'] and info['faces_after'] < 0.25 * info['faces_before']
@@ -103,7 +103,7 @@ def test_reduce_mesh_respects_tolerance():
 
 
 def test_faceted_fallback_uses_reduce(tmp_path):
-    from stl2prism.pipeline import run
+    from stl_to_solid.pipeline import run
     m = trimesh.creation.icosphere(subdivisions=4, radius=10)
     p = str(tmp_path / 'sphere.stl'); m.export(p)
     # (the face-group engine would make this one analytic sphere; this test
@@ -121,7 +121,7 @@ def test_faceted_fallback_uses_reduce(tmp_path):
 def test_no_script_when_nothing_is_prismatic(tmp_path):
     """A faceted-only result must not offer a script: it would be an empty
     program (no recognised bodies) that crashes on `bodies[0]`."""
-    from stl2prism.pipeline import run
+    from stl_to_solid.pipeline import run
     m = trimesh.creation.icosphere(subdivisions=3, radius=10)
     p = str(tmp_path / 'sphere.stl'); m.export(p)
     r = run(p, str(tmp_path / 'sphere.step'), verbose=False, face_groups=False)
@@ -138,7 +138,7 @@ def test_fusion_script_is_emitted_and_parses(tmp_path):
     """Cannot run Fusion here: check the script exists, parses, and carries
     the expected structure (planes, sketches, extrude/loft/cut calls)."""
     import ast
-    from stl2prism.pipeline import run
+    from stl_to_solid.pipeline import run
     p = synth.export(synth.csk_plate(), tmp_path / 'csk.stl')
     r = run(p, str(tmp_path / 'csk.step'), verbose=False)
     f = tmp_path / 'csk_fusion.py'

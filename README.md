@@ -1,4 +1,4 @@
-# stl2prism
+# stlToSolid
 
 ## Why
 
@@ -49,7 +49,7 @@ becomes a trough, because no slice sees it as a circle (the prismatic
 engine handles those); sharp corners *around* an outline are followed
 within the spline tolerance (0.02 mm) but are not sharp edges.
 
-`stl2prism/section_fit.py` holds the shared plane cutter and the curve
+`stl_to_solid/section_fit.py` holds the shared plane cutter and the curve
 fitter (lines and arcs where they hold the tolerance, fitted splines where
 they do not) — numpy only, so the same file can run inside Fusion.
 `tools/trace_section.py` draws one section the way the fitter sees it.
@@ -95,13 +95,13 @@ the CadQuery / Fusion 360 scripts).
 The same `servo_bracket_1.stl`, opened in Fusion 360 three ways. Left:
 Fusion's own *Mesh → Solid* (the free tier's faceted conversion — every
 triangle becomes a face). Middle: the STL mesh as loaded. Right: the STEP
-from stl2prism — 23 faces, planes and cylinders, holes that are real holes.
+from stl_to_solid — 23 faces, planes and cylinders, holes that are real holes.
 
-![Fusion Mesh to Solid (left), the STL mesh (middle) and the stl2prism STEP (right)](docs/img/side-by-side.png)
+![Fusion Mesh to Solid (left), the STL mesh (middle) and the stlToSolid STEP (right)](docs/img/side-by-side.png)
 
 | | |
 |---|---|
-| ![Fusion Mesh to Solid, zoomed](docs/img/fusion-mesh-solid.png) *Fusion Mesh → Solid, zoomed in: one face per triangle, so the "solid" carries all 1,644 facets and cannot be sketched on, filleted or measured like a modelled part.* | ![stl2prism STEP, zoomed](docs/img/Stl-prism-zoom.png) *stl2prism output, zoomed in: flat faces are single planes, the blend is one cylinder, the edges are where the design has them.* |
+| ![Fusion Mesh to Solid, zoomed](docs/img/fusion-mesh-solid.png) *Fusion Mesh → Solid, zoomed in: one face per triangle, so the "solid" carries all 1,644 facets and cannot be sketched on, filleted or measured like a modelled part.* | ![stlToSolid STEP, zoomed](docs/img/Stl-prism-zoom.png) *stlToSolid output, zoomed in: flat faces are single planes, the blend is one cylinder, the edges are where the design has them.* |
 
 ## Install
 
@@ -113,21 +113,21 @@ pip install .[scan]      # + pymeshlab, for 3D-scan repair (Poisson; Linux x86_6
 ## Usage
 
 ```bash
-stl2prism part.stl                 # -> part.step  (+ part.py CadQuery script)
-stl2prism part.obj --units cm      # file is in cm (Fusion's OBJ default); scale to mm
-stl2prism part.stl out.step --tol 0.05 --accept-max 0.3 --accept-vol-pct 3
-stl2prism scan.stl --reduce-tol 0.1     # faceted output: simplify curved regions within 0.1 mm
-stl2prism scan.stl --force-prismatic    # attempt prismatic on scan input
-stl2prism part.stl --no-face-groups     # skip the face-group engine (prismatic -> faceted only)
-stl2prism shell.stl --method loft       # sliced loft: sections every 0.2 mm along the longest axis, smooth loft
-stl2prism shell.stl --method loft --slice-mm 0.5 --slice-axis z --loft-ruled
-stl2prism big.stl --scale 0.1           # a cm design exported as mm: shrink by ten
+stltosolid part.stl                 # -> part.step  (+ part.py CadQuery script)
+stltosolid part.obj --units cm      # file is in cm (Fusion's OBJ default); scale to mm
+stltosolid part.stl out.step --tol 0.05 --accept-max 0.3 --accept-vol-pct 3
+stltosolid scan.stl --reduce-tol 0.1     # faceted output: simplify curved regions within 0.1 mm
+stltosolid scan.stl --force-prismatic    # attempt prismatic on scan input
+stltosolid part.stl --no-face-groups     # skip the face-group engine (prismatic -> faceted only)
+stltosolid shell.stl --method loft       # sliced loft: sections every 0.2 mm along the longest axis, smooth loft
+stltosolid shell.stl --method loft --slice-mm 0.5 --slice-axis z --loft-ruled
+stltosolid big.stl --scale 0.1           # a cm design exported as mm: shrink by ten
 ```
 
 Or from Python:
 
 ```python
-from stl2prism import run
+from stl_to_solid import run
 result = run("part.stl", "part.step")
 print(result["mode"], result["metrics"], result["script"])   # 'prismatic' | 'facegroup' | 'faceted' | 'loft' | 'mixed'
 result = run("shell.stl", "shell.step", method="loft", slice_mm=0.2, slice_axis="auto")
@@ -197,14 +197,14 @@ To run it on a home NAS (any x86_64 box with Docker: clone on the NAS, build
 natively, optional Tailscale HTTPS front), follow
 [docs/DEPLOY-NAS.md](docs/DEPLOY-NAS.md).
 
-Environment knobs: `STL2PRISM_DATA` (job storage dir, default `/data` in
-the container), `STL2PRISM_JOB_TTL` (seconds before old jobs are purged,
-default 86400), `STL2PRISM_MAX_UPLOAD` (bytes, default 200 MB),
-`STL2PRISM_WORKERS` (shells converted at once in worker processes, default
+Environment knobs: `STLTOSOLID_DATA` (job storage dir, default `/data` in
+the container), `STLTOSOLID_JOB_TTL` (seconds before old jobs are purged,
+default 86400), `STLTOSOLID_MAX_UPLOAD` (bytes, default 200 MB),
+`STLTOSOLID_WORKERS` (shells converted at once in worker processes, default
 half the cores; 0 converts in-process, as does any file under 20k faces
-when the count is not set explicitly), `STL2PRISM_SHELL_TIMEOUT` (seconds
+when the count is not set explicitly), `STLTOSOLID_SHELL_TIMEOUT` (seconds
 a shell may run in a worker before it is built faceted instead, default
-900; 0 means no limit), `STL2PRISM_AXIS_BUDGET` (seconds one shell's extrusion-axis search may
+900; 0 means no limit), `STLTOSOLID_AXIS_BUDGET` (seconds one shell's extrusion-axis search may
 take before the best candidate so far is used, default 120; 0 means no
 limit). The budgets are backstops: a shell that reaches one is scored on
 what was done by then, so its result can depend on machine load. The CLI
@@ -367,7 +367,7 @@ v0.3.7 (shells in parallel): a file's shells (each body's outer surface
 and each cavity) are converted side by side in spawned worker processes,
 largest first, and each body reassembled afterwards exactly as before: the
 same STEP, per-solid faces and volumes, with one worker or four. A shell
-past its wall clock (`STL2PRISM_SHELL_TIMEOUT`, 900 s) or whose worker
+past its wall clock (`STLTOSOLID_SHELL_TIMEOUT`, 900 s) or whose worker
 died under it (an OCC crash costs that shell, not the job) is built
 faceted in the pool on a shorter clock and says so in its metrics
 (`timed_out`, `shell_error`). The pool is one per run: its workers start
@@ -378,8 +378,8 @@ in-process, where a worker's start-up would outlast the conversion. The
 log carries one block per shell as it finishes, `[progress] k/n shells`,
 and a closing `[time]` line per stage. On the 68-body controller (72
 shells) four workers convert every shell in about 18 minutes; the file
-previously never finished. Knobs: `STL2PRISM_WORKERS`,
-`STL2PRISM_SHELL_TIMEOUT`, `--workers`, `--shell-timeout`; the NAS runs
+previously never finished. Knobs: `STLTOSOLID_WORKERS`,
+`STLTOSOLID_SHELL_TIMEOUT`, `--workers`, `--shell-timeout`; the NAS runs
 two workers.
 
 v0.3.6 (the extrusion search made finite): a 12k-face textured cavity in
@@ -393,7 +393,7 @@ not once per round; bisection probes chain their own loops (trimesh's path
 machinery was the cost on sections of hundreds of tiny loops) over just the
 faces that span the slab; the same-section test runs its cheap parts
 first; candidate scoring stops once no remaining candidate can win; and a
-budget (`STL2PRISM_AXIS_BUDGET`, 120 s per shell) backstops the whole
+budget (`STLTOSOLID_AXIS_BUDGET`, 120 s per shell) backstops the whole
 search — past it the best candidate so far is used, or the shell goes to
 the face-group route. The sample STEPs are unchanged.
 

@@ -13,10 +13,10 @@ import threading
 import time
 import uuid
 
-DATA_DIR = os.environ.get('STL2PRISM_DATA', os.path.join(os.getcwd(), 'data'))
+DATA_DIR = os.environ.get('STLTOSOLID_DATA', os.path.join(os.getcwd(), 'data'))
 # Seconds a cancelled worker gets to stop politely before it is killed.
 CANCEL_GRACE_S = 5
-MAX_AGE_S = int(os.environ.get('STL2PRISM_JOB_TTL', 24 * 3600))
+MAX_AGE_S = int(os.environ.get('STLTOSOLID_JOB_TTL', 24 * 3600))
 
 _lock = threading.Lock()
 _jobs = {}  # id -> dict
@@ -24,7 +24,7 @@ _jobs = {}  # id -> dict
 # A scan-repair run can peak at several GB; on a shared NAS conversions
 # must queue up rather than run concurrently.
 _run_slot = threading.BoundedSemaphore(
-    max(1, int(os.environ.get('STL2PRISM_CONCURRENCY', 1))))
+    max(1, int(os.environ.get('STLTOSOLID_CONCURRENCY', 1))))
 
 
 def job_dir(job_id):
@@ -176,7 +176,7 @@ def _killed_by(code):
         return {'signal': sig, 'kind': 'oom', 'message':
                 'The conversion ran out of memory and was stopped by the '
                 'system. Convert fewer bodies at once, or give the server '
-                'more memory (STL2PRISM_WORKERS controls how many bodies '
+                'more memory (STLTOSOLID_WORKERS controls how many bodies '
                 'are converted at the same time).'}
     return {'signal': sig, 'kind': kind or 'signal', 'message':
             f'The conversion was stopped by the system (signal {sig}) '

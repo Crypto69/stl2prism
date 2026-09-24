@@ -892,7 +892,7 @@ def _write_step_xde(shapes, path, names, colours, schema):
     from OCP.TopExp import TopExp_Explorer
     from OCP.TopAbs import TopAbs_FACE
     from OCP.TopoDS import TopoDS
-    doc = TDocStd_Document(TCollection_ExtendedString('stl2prism'))
+    doc = TDocStd_Document(TCollection_ExtendedString('stlToSolid'))
     shape_tool = XCAFDoc_DocumentTool.ShapeTool_s(doc.Main())
     color_tool = XCAFDoc_DocumentTool.ColorTool_s(doc.Main())
     for shape, name in zip(shapes, names):

@@ -9,8 +9,8 @@ import threading
 
 import numpy as np
 
-from stl2prism.mesh_prep import load_mesh, UNIT_SCALE
-from stl2prism.section_fit import section_preview
+from stl_to_solid.mesh_prep import load_mesh, UNIT_SCALE
+from stl_to_solid.section_fit import section_preview
 
 _lock = threading.Lock()
 _cache = {'key': None, 'mesh': None}

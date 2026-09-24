@@ -8,9 +8,9 @@ from . import synth
 
 def _ring(wp, tmp_path, name, tol=0.08):
     """Fit the mid-slab outer ring of a single-slab part; return prims."""
-    from stl2prism.extrusion import dominant_axis, score_axis
-    from stl2prism.rebuild import _fit_ring, _slab_vertices_2d, _axis_basis
-    from stl2prism.profile_fit import solve_junctions
+    from stl_to_solid.extrusion import dominant_axis, score_axis
+    from stl_to_solid.rebuild import _fit_ring, _slab_vertices_2d, _axis_basis
+    from stl_to_solid.profile_fit import solve_junctions
     m = trimesh.load(synth.export(wp, tmp_path / f'{name}.stl'), force='mesh')
     best = None
     for frac, ax in dominant_axis(m):
@@ -51,7 +51,7 @@ def test_rounded_rect_is_four_lines_four_arcs(tmp_path):
 
 
 def test_fillets_are_tangent_and_lines_axis_aligned(tmp_path):
-    from stl2prism.profile_fit import _line_dir, _arc_tangent_at
+    from stl_to_solid.profile_fit import _line_dir, _arc_tangent_at
     ring, poly = _ring(synth.rounded_rect(), tmp_path, 'rr2')
     n = len(ring)
     for i in range(n):
@@ -69,7 +69,7 @@ def test_bogus_big_arc_rejected():
     """A straight wall sampled only at its ends: a big circle through the
     two endpoints has zero vertex deviation but the chord interior sags by
     r(1-cos) — the polyline deviation must see it."""
-    from stl2prism.profile_fit import polyline_circle_dev
+    from stl_to_solid.profile_fit import polyline_circle_dev
     r = 52.0
     c = np.array([-7.0, -6.0 + np.sqrt(r * r - 7.0 ** 2)])   # circle through (0,-6),(-14,-6)
     pts = np.array([[0.0, -6.0], [-14.0, -6.0]])
@@ -80,7 +80,7 @@ def test_bogus_big_arc_rejected():
 
 
 def test_end_to_end_face_counts(tmp_path):
-    from stl2prism.pipeline import run
+    from stl_to_solid.pipeline import run
     for name, wp, faces in [('obround', synth.obround(), 10),
                             ('rounded_rect', synth.rounded_rect(), 10),
                             ('plate_fillets', synth.plate_holes_fillets(), 14),
@@ -99,7 +99,7 @@ def test_end_to_end_face_counts(tmp_path):
 def test_arc_radius_refined_on_vertices(tmp_path):
     """Coarse tessellation: section vertices sit on chords (radius biased
     low); refinement on mesh vertices recovers the true radius."""
-    from stl2prism.pipeline import run
+    from stl_to_solid.pipeline import run
     p = synth.export(synth.stepped_shaft(), tmp_path / 'shaft.stl', tol=0.5, ang=0.5)
     out = str(tmp_path / 'shaft.step')
     r = run(p, out, verbose=False)
@@ -141,7 +141,7 @@ def test_exact_wall_is_not_swallowed_by_a_gentle_arc():
     20 degrees of an r=12 arc: one circle through all of it stays within
     0.08 mm, but the wall must come out as a line and the arc as an arc of
     about r=12 — not one r=50..70 arc."""
-    from stl2prism.profile_fit import segment_polyline, fit_line
+    from stl_to_solid.profile_fit import segment_polyline, fit_line
     r = 12.0
     c = np.array([5.0, -r])                             # arc starts tangent at (5, 0)
     arc = _tessellated_arc(c, r, np.pi / 2, np.pi / 2 - np.radians(20), 8)
@@ -159,7 +159,7 @@ def test_exact_wall_is_not_swallowed_by_a_gentle_arc():
 def test_true_arc_with_uneven_chords_stays_one_arc():
     """An r=8.45 fillet whose section alternates long and short chords
     (facet edge, facet diagonal) is one arc, not a chain of pieces."""
-    from stl2prism.profile_fit import segment_polyline
+    from stl_to_solid.profile_fit import segment_polyline
     r = 8.45
     pts = _tessellated_arc(np.array([0.0, 0.0]), r, 0.0, np.pi / 2, 14)
     prims = segment_polyline(pts, tol=0.08, closed=False)
@@ -172,7 +172,7 @@ def test_line_with_transition_facet_keeps_the_wall_exact():
     (the tessellator's first step into a blend) is still the wall's own
     line: endpoints projected onto it, not a chord tilted towards the
     facet."""
-    from stl2prism.profile_fit import _mk_line, _collinear_runs
+    from stl_to_solid.profile_fit import _mk_line, _collinear_runs
     pts = np.array([[0.0, 0.0], [0.5, 0.0], [3.0, 0.0], [3.5, 0.0], [6.0, 0.0],
                     [7.2, 0.021]])
     assert len(_collinear_runs(pts)) == 2
@@ -184,7 +184,7 @@ def test_line_with_transition_facet_keeps_the_wall_exact():
 def test_walls_are_unified_across_slabs():
     """Two slabs whose fitted walls sit 4 microns apart (a 0.1 degree
     export tilt sampled at two heights) share one line afterwards."""
-    from stl2prism.rebuild import _snap_lines_across_slabs
+    from stl_to_solid.rebuild import _snap_lines_across_slabs
     def ring(y):
         pts = np.array([[0.0, y], [10.0, y]])
         return [{'type': 'line', 'p0': pts[0].copy(), 'p1': pts[1].copy(), '_pts': pts, 'snapped': True},
@@ -207,7 +207,7 @@ def test_full_circle_needs_the_points_to_go_round():
     """A thin sliver loop sits within tol of a huge circle but is not one:
     try_full_circle must refuse it (it drew a 600 mm circle on a section
     of the RC-N1 controller), while a real polygonised circle still passes."""
-    from stl2prism.profile_fit import try_full_circle
+    from stl_to_solid.profile_fit import try_full_circle
     t = np.linspace(0, 2 * np.pi, 48, endpoint=False)
     assert try_full_circle(np.c_[5 * np.cos(t), 5 * np.sin(t)], 0.08) is not None
     x = np.linspace(0, 20, 12)

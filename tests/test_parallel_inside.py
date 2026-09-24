@@ -7,7 +7,7 @@ import pytest
 import trimesh
 
 from . import synth
-from stl2prism import pipeline
+from stl_to_solid import pipeline
 
 
 def test_pooled_axis_candidates_give_the_same_step(tmp_path, monkeypatch):
@@ -35,7 +35,7 @@ def test_pooled_axis_candidates_log_and_respect_the_budget(tmp_path, monkeypatch
 def test_small_shells_score_candidates_in_process(tmp_path, monkeypatch):
     def boom(*a, **k):
         raise AssertionError('pool used')
-    from stl2prism.parallel import Pool
+    from stl_to_solid.parallel import Pool
     monkeypatch.setattr(Pool, 'run', boom)
     p = synth.export(synth.plate_holes(), tmp_path / 'part.stl')
     assert pipeline.run(p, str(tmp_path / 'a.step'), verbose=False, workers=4)['mode'] == 'prismatic'
@@ -47,8 +47,8 @@ def _script_with_bodies(tmp_path, n):
 
 
 def test_pooled_dry_run_matches_serial(tmp_path):
-    from stl2prism.bfill_check import check_script, outlook
-    from stl2prism.parallel import Pool
+    from stl_to_solid.bfill_check import check_script, outlook
+    from stl_to_solid.parallel import Pool
     text = _script_with_bodies(tmp_path, 3)
     serial = check_script(text)
     with Pool(2) as pool:
@@ -63,7 +63,7 @@ def test_pooled_dry_run_matches_serial(tmp_path):
 def test_pooled_dry_run_reports_lost_bodies_as_unchecked(tmp_path, monkeypatch):
     """A body past its budget, or one whose worker died, is 'not checked'
     with the reason, never a guessed verdict."""
-    from stl2prism.bfill_check import check_script, outlook
+    from stl_to_solid.bfill_check import check_script, outlook
     text = _script_with_bodies(tmp_path, 2)
 
     class FakePool:

@@ -73,8 +73,8 @@ if [ "$1" != "--force" ] && [ "$2" != "--force" ]; then
   esac
 fi
 
-echo "building stl2prism ${GIT_SHA} (${BUILD_TIME})"
+echo "building stlToSolid ${GIT_SHA} (${BUILD_TIME})"
 docker compose build
-docker compose up -d
+docker compose up -d --remove-orphans   # drops the old stl2prism container after the rename
 sleep 3
 echo "running: $(curl -s http://localhost:8321/api/version || echo '(not up yet)')"

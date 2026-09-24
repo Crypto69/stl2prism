@@ -98,6 +98,6 @@ if __name__ == '__main__':
     interval = float(mesh.extents[axis]) / 40 if len(sys.argv) < 4 else float(sys.argv[3])
     print(f"{what}: {len(mesh.faces)} tris extents {np.round(mesh.extents,1)} axis {axis} interval {interval:.2f} watertight {mesh.is_watertight}")
     t0 = T(); shape = build_dbg(mesh, axis, interval); print(f"  total {T()-t0:.1f}s")
-    from stl2prism.pipeline import validate
+    from stl_to_solid.pipeline import validate
     m = validate(cq.Workplane('XY').add(shape), mesh)
     print(f"  dev p95 {m['dev_p95']:.3f} max {m['dev_max']:.3f} rev max {m['rev_dev_max']:.3f} vol err {m['vol_err_pct']:.2f}%")

@@ -7,9 +7,9 @@ import trimesh
 import cadquery as cq
 
 from . import synth
-from stl2prism.rebuild import add_cavities, _volume
-from stl2prism.mesh_prep import Body
-from stl2prism import pipeline
+from stl_to_solid.rebuild import add_cavities, _volume
+from stl_to_solid.mesh_prep import Body
+from stl_to_solid import pipeline
 
 
 def _run(wp_or_path, tmp_path, name, **kw):
@@ -25,7 +25,7 @@ def _box(size, at=(0, 0, 0)):
 
 def _faceted(mesh):
     """An OCC solid with one planar face per triangle, like the faceted rung."""
-    from stl2prism.rebuild import faceted_solid
+    from stl_to_solid.rebuild import faceted_solid
     shape, _ = faceted_solid(mesh, verbose=False)
     return shape
 
@@ -170,7 +170,7 @@ def test_two_shell_assembly_keeps_the_hollow_box(tmp_path):
 # --- nesting: a shell that crosses its container is a body, not a void ------
 
 def _shells(*meshes):
-    from stl2prism.mesh_prep import nest_shells
+    from stl_to_solid.mesh_prep import nest_shells
     return nest_shells(sorted(meshes, key=lambda m: -len(m.faces)))
 
 
@@ -182,7 +182,7 @@ def _tbox(size, at=(0, 0, 0)):
 
 def _tube_block():
     """40 cube with a D10 hole through it along Z, as a mesh."""
-    from stl2prism.pipeline import tessellate_solid
+    from stl_to_solid.pipeline import tessellate_solid
     m = tessellate_solid(cq.Workplane('XY').box(40, 40, 40).faces('>Z').workplane().hole(10))
     return trimesh.Trimesh(m.vertices, m.faces)          # merge the per-face vertices: closed
 
@@ -200,7 +200,7 @@ def _crossing_sphere():
 
 
 def test_shell_crossing_the_wall_is_its_own_body():
-    from stl2prism.mesh_prep import nest_shells
+    from stl_to_solid.mesh_prep import nest_shells
     bodies = _shells(_tube_block(), _crossing_sphere())
     assert len(bodies) == 2 and all(not b.voids for b in bodies)
     (i, j, reach), = nest_shells.last_crossings
@@ -213,7 +213,7 @@ def test_shell_touching_the_wall_is_still_a_cavity():
 
 
 def test_shell_inside_is_still_a_cavity():
-    from stl2prism.mesh_prep import nest_shells
+    from stl_to_solid.mesh_prep import nest_shells
     bodies = _shells(_tbox(40), _tbox(20))
     assert len(bodies) == 1 and len(bodies[0].voids) == 1
     assert nest_shells.last_crossings == []

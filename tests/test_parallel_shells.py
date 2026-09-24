@@ -10,7 +10,7 @@ import pytest
 import trimesh
 
 from . import synth
-from stl2prism import pipeline
+from stl_to_solid import pipeline
 
 
 def _run(path, out, **kw):

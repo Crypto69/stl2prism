@@ -1,4 +1,4 @@
-# Build for the NAS with:  docker buildx build --platform linux/amd64 -t stl2prism .
+# Build for the NAS with:  docker buildx build --platform linux/amd64 -t stltosolid .
 
 # ---- frontend ----
 FROM node:22-alpine AS webbuild
@@ -23,7 +23,7 @@ WORKDIR /app
 # day, and this stack has proven version-sensitive. Update the pins
 # deliberately, then rebuild.
 COPY pyproject.toml README.md LICENSE constraints.txt ./
-COPY stl2prism/ stl2prism/
+COPY stl_to_solid/ stl_to_solid/
 RUN pip install --no-cache-dir --timeout 300 --retries 10 -c constraints.txt '.[scan]' fastapi 'uvicorn[standard]' python-multipart
 COPY backend/ backend/
 COPY --from=webbuild /build/dist frontend/dist
@@ -33,12 +33,12 @@ COPY --from=webbuild /build/dist frontend/dist
 # --build-arg GIT_SHA=... BUILD_TIME=... by hand); defaults say 'unknown'.
 ARG GIT_SHA=unknown
 ARG BUILD_TIME=unknown
-ENV STL2PRISM_BUILD_SHA=$GIT_SHA
-ENV STL2PRISM_BUILD_TIME=$BUILD_TIME
+ENV STLTOSOLID_BUILD_SHA=$GIT_SHA
+ENV STLTOSOLID_BUILD_TIME=$BUILD_TIME
 
-ENV STL2PRISM_DATA=/data
+ENV STLTOSOLID_DATA=/data
 # shells converted at once inside a job; docker-compose.yml overrides
-ENV STL2PRISM_WORKERS=2
+ENV STLTOSOLID_WORKERS=2
 VOLUME /data
 EXPOSE 8000
 CMD ["uvicorn", "backend.main:app", "--host", "0.0.0.0", "--port", "8000"]

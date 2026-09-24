@@ -290,7 +290,7 @@ def reimport(path):
     """Round-trip through OCC: solids, faces, naked edges, validity, volume."""
     from OCP.TopAbs import TopAbs_SOLID, TopAbs_FACE
     from OCP.BRepCheck import BRepCheck_Analyzer
-    from stl2prism.rebuild import _naked_edges
+    from stl_to_solid.rebuild import _naked_edges
     s = read_step(path)
     return {'solids': _count(s, TopAbs_SOLID), 'faces': _count(s, TopAbs_FACE),
             'naked_edges': _naked_edges(s), 'valid': BRepCheck_Analyzer(s).IsValid(),

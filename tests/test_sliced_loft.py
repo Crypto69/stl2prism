@@ -38,7 +38,7 @@ def _valid(shape):
 
 
 def _check(shape, mesh, faces_max, dev_p95=0.1, vol_pct=1.0):
-    from stl2prism.pipeline import validate
+    from stl_to_solid.pipeline import validate
     assert _valid(shape)
     s = cq.Shape.cast(shape)
     assert len(s.Solids()) == 1
@@ -53,7 +53,7 @@ def _check(shape, mesh, faces_max, dev_p95=0.1, vol_pct=1.0):
 # --- the section cutter ---------------------------------------------------
 
 def test_section_loops_box_and_hole():
-    from stl2prism.section_fit import section_loops, signed_area
+    from stl_to_solid.section_fit import section_loops, signed_area
     m = trimesh.creation.box([40, 30, 10])
     loops, frame = section_loops(m.vertices, m.faces, [0, 0, 1.0], [0, 0, 1])
     assert len(loops) == 1 and not loops[0][1]
@@ -69,7 +69,7 @@ def test_section_loops_box_and_hole():
 
 
 def test_section_matches_trimesh():
-    from stl2prism.section_fit import section_loops, signed_area
+    from stl_to_solid.section_fit import section_loops, signed_area
     m = _ellipsoid()
     z = 2.0
     loops, _ = section_loops(m.vertices, m.faces, [0, 0, z], [0, 0, 1])
@@ -97,8 +97,8 @@ def test_open_chain_stays_open():
     """A U-shaped sheet cuts into one open chain: no loop, no chord, three
     lines whose ends are the sheet's ends, an open preview polyline and a
     script that draws exactly those three lines."""
-    from stl2prism.section_fit import section_curves, section_loops, fit_section, section_preview
-    from stl2prism.fusion_export import emit_fusion_sections_script
+    from stl_to_solid.section_fit import section_curves, section_loops, fit_section, section_preview
+    from stl_to_solid.fusion_export import emit_fusion_sections_script
     V, F = _sheet([[0, 10], [0, 0], [20, 0], [20, 10]])
     loops, opens, _, jst = section_curves(V, F, [0, 0, 0], [0, 0, 1])
     assert loops == [] and len(opens) == 1 and jst['joins'] == 0
@@ -126,7 +126,7 @@ def test_open_chain_stays_open():
     assert len(full['polylines']) == 5 and full['stats']['inner'] == 0
     assert len(rim['polylines']) == 1 and rim['stats']['inner'] == 4 and rim['loops'][0][1] == []
     # the loft's cutter keeps closing every chain by its chord
-    from stl2prism.section_fit import signed_area
+    from stl_to_solid.section_fit import signed_area
     lp, _ = section_loops(V, F, [0, 0, 0], [0, 0, 1])
     assert len(lp) == 1 and abs(signed_area(lp[0][0])) == pytest.approx(200.0)
 
@@ -135,7 +135,7 @@ def test_join_chains_bridges_small_gaps_only():
     """Two sheets 0.5 mm apart are two open chains at join 0, one at join
     1; a ring sheet missing one facet closes on itself once the join
     reaches the gap, and becomes a loop."""
-    from stl2prism.section_fit import section_curves, fit_section
+    from stl_to_solid.section_fit import section_curves, fit_section
     Va, Fa = _sheet([[0, 0], [10, 0]])
     Vb, Fb = _sheet([[10.5, 0], [20, 0]])
     V = np.vstack([Va, Vb])
@@ -165,8 +165,8 @@ def test_loft_range_gives_a_slab_with_flat_ends():
     a 40 x 30 x 4 slab, and a range past the body is clipped to it;
     the sketch-path cutter (join / trim set) gives the same sections on a
     watertight body as the chord-closing one."""
-    from stl2prism.sliced_loft import loft_body, Cutter
-    from stl2prism.pipeline import accurate_volume
+    from stl_to_solid.sliced_loft import loft_body, Cutter
+    from stl_to_solid.pipeline import accurate_volume
     m = trimesh.creation.box([40, 30, 10])
     shape, info = loft_body(m, 2, 0.5, verbose=False, z_range=(-3.0, 1.0), join_mm=2.5, trim_mm=0.3)
     assert info['range'] == [-3.0, 1.0]
@@ -183,7 +183,7 @@ def test_trim_slivers_removes_hairpins_and_twists_only():
     """A rectangle with a 0.1 mm wide, 6 mm deep hairpin and a tiny bow-tie
     twist: trim at 0.3 mm removes both, leaves a real 1 mm slot alone, and
     trim 0 changes nothing."""
-    from stl2prism.section_fit import trim_slivers, signed_area, _crossings, fit_section
+    from stl_to_solid.section_fit import trim_slivers, signed_area, _crossings, fit_section
     rect = [[0, 0], [10, 0], [10, 0.0], [10.05, 6], [10.15, 6], [10.2, 0.0],   # hairpin up
             [20, 0], [20, 10], [12, 10], [12, 8], [11, 8], [11, 10],           # 1 mm slot
             [5.2, 10], [5.0, 10.3], [4.8, 10], [0, 10]]                        # tiny twist
@@ -206,7 +206,7 @@ def test_trim_slivers_removes_hairpins_and_twists_only():
 
 
 def test_fit_loop_rounded_rect_is_lines_and_arcs():
-    from stl2prism.section_fit import section_loops, fit_loop
+    from stl_to_solid.section_fit import section_loops, fit_loop
     p = synth.export(synth.rounded_rect(), '/tmp/_s2p_rr.stl')
     m = trimesh.load(p, force='mesh')
     loops, _ = section_loops(m.vertices, m.faces, [0, 0, 0.0], [0, 0, 1])
@@ -219,20 +219,20 @@ def test_fit_loop_rounded_rect_is_lines_and_arcs():
 def test_fit_loop_spline_fallback_on_ripple():
     """A ring with ripples too short for any line or arc to hold at the
     tolerance comes back as a spline, within tolerance of the raw points."""
-    from stl2prism.section_fit import fit_loop, prim_points, polyline_deviation
+    from stl_to_solid.section_fit import fit_loop, prim_points, polyline_deviation
     t = np.linspace(0, 2 * np.pi, 2000, endpoint=False)
     r = 10 + 0.25 * np.sin(80 * t)
     xy = np.c_[r * np.cos(t), r * np.sin(t)]
     prims = fit_loop(xy, tol=0.05)
     assert any(p['type'] == 'spline' for p in prims)
     assert polyline_deviation(xy[::5], prim_points(prims)) < 0.1
-    from stl2prism.section_fit import junction_gap
+    from stl_to_solid.section_fit import junction_gap
     assert junction_gap(prims) < 1e-9
 
 
 def test_fit_loop_holds_tolerance_on_wave():
     """Gentle waves are arcs; whatever the mix, the fit stays within tol."""
-    from stl2prism.section_fit import fit_loop, prim_points, polyline_deviation
+    from stl_to_solid.section_fit import fit_loop, prim_points, polyline_deviation
     t = np.linspace(0, 2 * np.pi, 720, endpoint=False)
     r = 10 + 1.5 * np.sin(5 * t)
     xy = np.c_[r * np.cos(t), r * np.sin(t)]
@@ -246,7 +246,7 @@ def test_trace_rc_n2_section_like_fusion():
     26 mm from the box centre) traced from the mesh: a few hundred lines
     and arcs plus splines on the domes, all within 0.15 mm of the raw cut."""
     from .test_pipeline import _sample
-    from stl2prism.section_fit import fit_section
+    from stl_to_solid.section_fit import fit_section
     p = _sample('fixed-rc-n2-360.stl')
     m = trimesh.load(p, force='mesh')
     m.apply_scale(0.1)                      # the file is written 10x too big
@@ -264,7 +264,7 @@ def test_trace_rc_n2_section_like_fusion():
 # --- the loft -------------------------------------------------------------
 
 def test_step_levels_on_shaft(tmp_path):
-    from stl2prism.sliced_loft import step_levels
+    from stl_to_solid.sliced_loft import step_levels
     p = synth.export(synth.stepped_shaft(), tmp_path / 'shaft.stl')
     m = trimesh.load(p, force='mesh')
     lv = step_levels(m, 2)
@@ -272,7 +272,7 @@ def test_step_levels_on_shaft(tmp_path):
 
 
 def test_loft_sphere_one_face_per_run():
-    from stl2prism.sliced_loft import loft_body
+    from stl_to_solid.sliced_loft import loft_body
     m = _sphere()
     shape, info = loft_body(m, 2, 0.2, verbose=False)
     assert info['mode'] == 'loft' and info['n_runs'] == 1
@@ -283,7 +283,7 @@ def test_loft_sphere_one_face_per_run():
 
 
 def test_loft_ellipsoid_along_x():
-    from stl2prism.sliced_loft import loft_body
+    from stl_to_solid.sliced_loft import loft_body
     m = _ellipsoid()
     shape, info = loft_body(m, 'auto', 0.2, verbose=False)
     assert info['axis_name'] == 'x'
@@ -291,7 +291,7 @@ def test_loft_ellipsoid_along_x():
 
 
 def test_loft_stepped_shaft_breaks_at_levels(tmp_path):
-    from stl2prism.sliced_loft import loft_body
+    from stl_to_solid.sliced_loft import loft_body
     p = synth.export(synth.stepped_shaft(), tmp_path / 'shaft.stl')
     m = trimesh.load(p, force='mesh')
     shape, info = loft_body(m, 2, 0.2, verbose=False)
@@ -302,7 +302,7 @@ def test_loft_stepped_shaft_breaks_at_levels(tmp_path):
 
 
 def test_loft_plate_holes_are_cut(tmp_path):
-    from stl2prism.sliced_loft import loft_body
+    from stl_to_solid.sliced_loft import loft_body
     p = synth.export(synth.plate_holes(), tmp_path / 'plate.stl')
     m = trimesh.load(p, force='mesh')
     shape, info = loft_body(m, 2, 0.5, verbose=False)
@@ -311,7 +311,7 @@ def test_loft_plate_holes_are_cut(tmp_path):
 
 
 def test_loft_ruled_option(tmp_path):
-    from stl2prism.sliced_loft import loft_body
+    from stl_to_solid.sliced_loft import loft_body
     m = _sphere()
     shape, info = loft_body(m, 2, 0.5, ruled=True, verbose=False)
     assert info['ruled'] and info['n_ruled_runs'] == 1
@@ -321,7 +321,7 @@ def test_loft_ruled_option(tmp_path):
 
 
 def test_pipeline_loft_mode_writes_step_and_fusion_script(tmp_path):
-    from stl2prism.pipeline import run
+    from stl_to_solid.pipeline import run
     p = synth.export(synth.stepped_shaft(), tmp_path / 'shaft.stl')
     out = str(tmp_path / 'shaft.step')
     r = run(p, out, method='loft', slice_mm=0.5, verbose=False)
@@ -341,7 +341,7 @@ def test_pipeline_loft_mode_writes_step_and_fusion_script(tmp_path):
 
 def test_pipeline_loft_gate_is_reported_not_enforced(tmp_path):
     """A sideways hole smears under a loft; the loft is still written."""
-    from stl2prism.pipeline import run
+    from stl_to_solid.pipeline import run
     p = synth.export(synth.cross_blind(), tmp_path / 'cb.stl')
     out = str(tmp_path / 'cb.step')
     r = run(p, out, method='loft', slice_mm=0.5, slice_axis='z', verbose=False)
@@ -357,7 +357,7 @@ def test_cli_flags_parse(tmp_path):
     import subprocess, sys
     p = synth.export(synth.stepped_shaft(), tmp_path / 'shaft.stl')
     out = str(tmp_path / 'shaft.step')
-    res = subprocess.run([sys.executable, '-m', 'stl2prism.pipeline', p, out,
+    res = subprocess.run([sys.executable, '-m', 'stl_to_solid.pipeline', p, out,
                           '--method', 'loft', '--slice-mm', '1.0', '--slice-axis', 'z',
                           '--workers', '0', '--quiet'], capture_output=True, text=True)
     assert res.returncode == 0, res.stderr
@@ -373,7 +373,7 @@ def test_section_api_and_sketch_script(tmp_path, monkeypatch):
     pytest.importorskip('httpx')
     import importlib
     from fastapi.testclient import TestClient
-    monkeypatch.setenv('STL2PRISM_DATA', str(tmp_path / 'data'))
+    monkeypatch.setenv('STLTOSOLID_DATA', str(tmp_path / 'data'))
     from backend import jobs, main
     importlib.reload(jobs)
     p = synth.export(synth.stepped_shaft(), tmp_path / 'shaft.stl')
@@ -400,8 +400,8 @@ def test_section_api_and_sketch_script(tmp_path, monkeypatch):
 
 
 def test_sections_script_draws_lines_arcs_and_splines():
-    from stl2prism.section_fit import section_preview
-    from stl2prism.fusion_export import emit_fusion_sections_script
+    from stl_to_solid.section_fit import section_preview
+    from stl_to_solid.fusion_export import emit_fusion_sections_script
     p = synth.export(synth.rounded_rect(), '/tmp/_s2p_rr2.stl')
     m = trimesh.load(p, force='mesh')
     sec = section_preview(m.vertices, m.faces, [0, 0, 0], [0, 0, 1], tol=0.08)

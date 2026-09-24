@@ -8,7 +8,7 @@ not (the domes of a controller shell, a scanned handle).
 
 numpy only, on purpose: the same file is copied into the Fusion add-in,
 which has no shapely or trimesh. The pipeline's sliced-loft mode uses the
-plane cut too (`stl2prism.sliced_loft`), so every slice of a loft and every
+plane cut too (`stl_to_solid.sliced_loft`), so every slice of a loft and every
 sketch in the generated Fusion script comes from this one cutter.
 
 Coordinates: `section_loops` returns 2-D points in an in-plane frame (u, v)

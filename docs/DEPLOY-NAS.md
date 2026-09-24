@@ -1,4 +1,4 @@
-# Deploying stl2prism on a NAS — step by step
+# Deploying stlToSolid on a NAS — step by step
 
 Runs the web app as one Docker container on a home NAS, reachable from any
 browser on your LAN (and optionally over Tailscale). Written for a small
@@ -45,8 +45,8 @@ SSH.
 
 ```bash
 cd <share-path>
-git clone https://github.com/Crypto69/stl2prism.git
-cd stl2prism
+git clone https://github.com/Crypto69/stlToSolid.git
+cd stlToSolid
 chmod -R a+rX .       # some NAS shares strip file modes on checkout; harmless elsewhere
 mkdir -p data         # job storage, bind-mounted to /data inside the container
 ```
@@ -80,7 +80,7 @@ top-right shows `version · commit · build time` (also at `/api/version`).
 ## Step 6 — Update to a new version
 
 ```bash
-cd <share-path>/stl2prism
+cd <share-path>/stlToSolid
 ./deploy.sh            # pulls main, fixes share file modes, builds, restarts
 ./deploy.sh --no-pull  # rebuild what is checked out, without pulling
 ```
@@ -101,12 +101,12 @@ All settings live in `docker-compose.yml`; edit, then `docker compose up -d`.
 | Setting | Default | Meaning |
 |---|---|---|
 | `ports` | `8321:8000` | LAN port (change the left side) |
-| `STL2PRISM_JOB_TTL` | `86400` | seconds before job directories are deleted |
-| `STL2PRISM_CONCURRENCY` | `1` | parallel conversions; keep 1 unless RAM is plentiful |
-| `STL2PRISM_MAX_UPLOAD` | 200 MB | maximum upload size |
-| `STL2PRISM_WORKERS` | `2` | shells (bodies and cavities) converted at once inside one job; each worker holds a few hundred MB |
-| `STL2PRISM_SHELL_TIMEOUT` | `900` | seconds a shell may run in a worker before it is built faceted instead; 0 means no limit |
-| `STL2PRISM_AXIS_BUDGET` | `120` | seconds one shell's extrusion-axis search may take before the best candidate so far is used; 0 means no limit |
+| `STLTOSOLID_JOB_TTL` | `86400` | seconds before job directories are deleted |
+| `STLTOSOLID_CONCURRENCY` | `1` | parallel conversions; keep 1 unless RAM is plentiful |
+| `STLTOSOLID_MAX_UPLOAD` | 200 MB | maximum upload size |
+| `STLTOSOLID_WORKERS` | `2` | shells (bodies and cavities) converted at once inside one job; each worker holds a few hundred MB |
+| `STLTOSOLID_SHELL_TIMEOUT` | `900` | seconds a shell may run in a worker before it is built faceted instead; 0 means no limit |
+| `STLTOSOLID_AXIS_BUDGET` | `120` | seconds one shell's extrusion-axis search may take before the best candidate so far is used; 0 means no limit |
 | `mem_limit` | `12g` | container memory cap; lower it if other services suffer |
 
 `data/` is disposable: `rm -rf data/*` with the container stopped is always
@@ -135,7 +135,7 @@ checkout (copy your sample meshes into `samples/` first):
 ```bash
 docker compose run --rm \
   -v "$PWD/tests:/app/tests:ro" -v "$PWD/samples:/app/samples:ro" \
-  stl2prism sh -c 'pip install -q pytest httpx && python -m pytest -q -m "not slow"'
+  stltosolid sh -c 'pip install -q pytest httpx && python -m pytest -q -m "not slow"'
 # use `-m slow` instead for the scan end-to-ends (takes minutes)
 ```
 
@@ -172,9 +172,9 @@ These apply to several vendor firmwares; check the equivalents on yours.
 | Symptom | Fix |
 |---|---|
 | Build fails in `apt-get` / `pip` with a timeout | Mirror hiccup — rerun `./deploy.sh`. |
-| Upload rejected with 413 | File exceeds `STL2PRISM_MAX_UPLOAD` — raise it in compose `environment`. |
+| Upload rejected with 413 | File exceeds `STLTOSOLID_MAX_UPLOAD` — raise it in compose `environment`. |
 | Button stuck on "Waiting in queue…" | A previous conversion is still running (they are serialised). Scans take minutes on a small CPU — `docker compose logs -f`. |
 | Conversion dies with no result, container fine | The worker was OOM-killed under `mem_limit` — raise the limit or convert a decimated mesh. |
-| Errors mentioning pymeshlab / Qt on scan uploads | The image installs `libgl1 libglu1-mesa libxrender1 libxext6 libsm6 libx11-6 fontconfig libcom-err2 libp11-kit0 libgpg-error0`; `docker compose exec stl2prism python -c "import pymeshlab"` should print nothing. Rebuild with `--no-cache` if not. |
+| Errors mentioning pymeshlab / Qt on scan uploads | The image installs `libgl1 libglu1-mesa libxrender1 libxext6 libsm6 libx11-6 fontconfig libcom-err2 libp11-kit0 libgpg-error0`; `docker compose exec stltosolid python -c "import pymeshlab"` should print nothing. Rebuild with `--no-cache` if not. |
 | UI loads but every API call 404s | Stale image — `docker compose build --no-cache`. |
 | Port already in use | Change the left side of `ports:` in compose (and the `tailscale serve` target). |

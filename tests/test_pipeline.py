@@ -58,7 +58,7 @@ def _reimport(path):
             e.Next()
         return c
 
-    from stl2prism.rebuild import _naked_edges
+    from stl_to_solid.rebuild import _naked_edges
     return {'solids': n(TopAbs_SOLID), 'shells': n(TopAbs_SHELL),
             'faces': n(TopAbs_FACE), 'naked_edges': _naked_edges(s)}
 
@@ -67,7 +67,7 @@ def _reimport(path):
 
 @pytest.mark.parametrize('name', SCANS)
 def test_scans_classified_as_scan(name):
-    from stl2prism.mesh_prep import mean_dihedral_deg, SCAN_DIHEDRAL_DEG
+    from stl_to_solid.mesh_prep import mean_dihedral_deg, SCAN_DIHEDRAL_DEG
     m = trimesh.load(_sample(name), force='mesh')
     assert mean_dihedral_deg(m) < SCAN_DIHEDRAL_DEG
 
@@ -76,7 +76,7 @@ def test_scans_classified_as_scan(name):
     None, marks=pytest.mark.skip(reason='no CAD samples present'))])
 def test_cad_not_classified_as_scan(path):
     """A CAD export must never be routed away from the prismatic path."""
-    from stl2prism.mesh_prep import mean_dihedral_deg, SCAN_DIHEDRAL_DEG
+    from stl_to_solid.mesh_prep import mean_dihedral_deg, SCAN_DIHEDRAL_DEG
     m = trimesh.load(path, force='mesh')
     assert mean_dihedral_deg(m) > SCAN_DIHEDRAL_DEG
 
@@ -93,7 +93,7 @@ def _leaky_plate(path):
 
 
 def test_non_watertight_cad_not_classified_as_scan(tmp_path):
-    from stl2prism.mesh_prep import load_and_prep
+    from stl_to_solid.mesh_prep import load_and_prep
     _, is_scan = load_and_prep(_leaky_plate(str(tmp_path / 'leaky.stl')),
                                verbose=False)
     assert is_scan is False
@@ -102,7 +102,7 @@ def test_non_watertight_cad_not_classified_as_scan(tmp_path):
 @pytest.mark.slow
 def test_leaky_cad_part_still_reaches_prismatic(tmp_path):
     """End-to-end: repair must not cost a CAD part the prismatic path."""
-    from stl2prism.pipeline import run
+    from stl_to_solid.pipeline import run
     out = str(tmp_path / 'leaky.step')
     r = run(_leaky_plate(str(tmp_path / 'leaky.stl')), out, verbose=False)
     assert r['mode'] == 'prismatic', 'leaky CAD export was misrouted'
@@ -136,7 +136,7 @@ def _hard_obj(path, mesh=None):
 
 def test_obj_with_split_normals_loads_watertight(tmp_path):
     """OBJ per-corner vn/vt must not turn a closed part into an open one."""
-    from stl2prism.mesh_prep import load_and_prep
+    from stl_to_solid.mesh_prep import load_and_prep
     src = trimesh.creation.box(extents=(20, 10, 5))
     m, is_scan = load_and_prep(_hard_obj(str(tmp_path / 'hard.obj'), src),
                                verbose=False)
@@ -148,7 +148,7 @@ def test_obj_with_split_normals_loads_watertight(tmp_path):
 
 
 def test_obj_quads_are_triangulated(tmp_path):
-    from stl2prism.mesh_prep import load_mesh
+    from stl_to_solid.mesh_prep import load_mesh
     cube = """v 0 0 0
 v 10 0 0
 v 10 20 0
@@ -175,7 +175,7 @@ f 4 1 5 8
 def test_units_scale_on_load(tmp_path):
     """A 20x10x5 box in cm must arrive as 200x100x50 mm; unknown units
     are refused before anything is loaded."""
-    from stl2prism.mesh_prep import load_and_prep, PrepError
+    from stl_to_solid.mesh_prep import load_and_prep, PrepError
     p = str(tmp_path / 'box.obj')
     trimesh.creation.box(extents=(20, 10, 5)).export(p)
     m, _ = load_and_prep(p, verbose=False, units='cm')
@@ -189,7 +189,7 @@ def test_units_scale_on_load(tmp_path):
 
 
 def test_unsupported_extension_rejected(tmp_path):
-    from stl2prism.mesh_prep import load_mesh, PrepError
+    from stl_to_solid.mesh_prep import load_mesh, PrepError
     p = tmp_path / 'part.xyz'
     p.write_text('0 0 0\n1 0 0\n0 1 0\n')
     with pytest.raises(PrepError, match='unsupported'):
@@ -198,7 +198,7 @@ def test_unsupported_extension_rejected(tmp_path):
 
 @pytest.mark.parametrize('ext', ['ply', 'off', 'glb', '3mf'])
 def test_other_mesh_formats_load(tmp_path, ext):
-    from stl2prism.mesh_prep import load_mesh
+    from stl_to_solid.mesh_prep import load_mesh
     p = tmp_path / f'box.{ext}'
     trimesh.creation.box((20, 10, 5)).export(str(p))
     m = load_mesh(str(p))
@@ -209,7 +209,7 @@ def test_dji_obj_sample_loads_and_is_scan():
     """The real-world sample: 21 objects, no .mtl, open, dense -> scan path.
     Only the load + classification is checked; the repair ladder needs
     pymeshlab, which is not available everywhere the tests run."""
-    from stl2prism.mesh_prep import (load_mesh, mean_dihedral_deg,
+    from stl_to_solid.mesh_prep import (load_mesh, mean_dihedral_deg,
                                      SCAN_DIHEDRAL_DEG, SCAN_MIN_FACES)
     m = load_mesh(_sample('DJI_RC-N1_controller.obj'))
     assert len(m.faces) == 301220
@@ -223,7 +223,7 @@ def test_dji_obj_sample_loads_and_is_scan():
 def test_obj_matches_stl_endtoend(tmp_path):
     """End-to-end: a CAD part must convert identically whether it arrives as
     STL or as a hard OBJ of the same triangles (same mode, same fidelity)."""
-    from stl2prism.pipeline import run
+    from stl_to_solid.pipeline import run
     stl = _sample('servo_bracket_1.stl')
     r_stl = run(stl, str(tmp_path / 'stl.step'), verbose=False)
     obj = _hard_obj(str(tmp_path / 'cad.obj'), trimesh.load(stl, force='mesh'))
@@ -248,7 +248,7 @@ def _assembly(path):
 def test_split_bodies_drops_only_slivers(tmp_path):
     """CAD input keeps every closable body, however small (a 12-face box is
     a part); only fragments that cannot close are dropped."""
-    from stl2prism.mesh_prep import load_mesh, split_bodies
+    from stl_to_solid.mesh_prep import load_mesh, split_bodies
     m = load_mesh(_assembly(str(tmp_path / 'asm.stl')))
     parts, dropped = split_bodies(m, is_scan=False, verbose=False)
     assert dropped == 1
@@ -259,7 +259,7 @@ def test_zero_volume_bodies_are_slivers():
     """A 'closed' body with no volume — two triangles back to back, or a
     flattened fan — passed the old face-count rule and then failed the
     faceted volume gate 58 times over on a real assembly export."""
-    from stl2prism.mesh_prep import is_sliver
+    from stl_to_solid.mesh_prep import is_sliver
     # two coincident triangles, opposite winding: closed, zero volume
     flat = trimesh.Trimesh(vertices=[[0, 0, 0], [1, 0, 0], [0, 1, 0]],
                            faces=[[0, 1, 2], [0, 2, 1]], process=False)
@@ -282,7 +282,7 @@ def test_faceted_merge_never_changes_volume():
     """Coplanar merging is cosmetic; if it moves the volume by more than 1%
     the unmerged (exact) solid must be kept. Regression for micron-thick
     decal bodies where unify collapsed the two skins into each other."""
-    from stl2prism.rebuild import faceted_solid
+    from stl_to_solid.rebuild import faceted_solid
     # A thin, slightly bent sheet: many near-coplanar facets, 20um thick.
     g = trimesh.creation.box((4, 3, 0.02))
     g = g.subdivide().subdivide()
@@ -297,7 +297,7 @@ def test_faceted_merge_never_changes_volume():
 def test_multi_body_writes_every_body_into_one_step(tmp_path):
     """The bug that shipped one knurled dial out of an 85-body controller:
     every body must be converted on its own and land in the same STEP."""
-    from stl2prism.pipeline import run
+    from stl_to_solid.pipeline import run
     out = str(tmp_path / 'asm.step')
     r = run(_assembly(str(tmp_path / 'asm.stl')), out, verbose=False)
     assert r['mode'] == 'mixed'
@@ -313,7 +313,7 @@ def test_multi_body_writes_every_body_into_one_step(tmp_path):
 
 def test_single_body_result_shape_unchanged(tmp_path):
     """Callers of run() on ordinary parts must see the old keys and values."""
-    from stl2prism.pipeline import run
+    from stl_to_solid.pipeline import run
     p = str(tmp_path / 'box.stl')
     trimesh.creation.box((20, 10, 5)).export(p)
     r = run(p, str(tmp_path / 'box.step'), verbose=False)
@@ -327,7 +327,7 @@ def test_single_body_result_shape_unchanged(tmp_path):
 
 def test_faceted_export_keeps_the_geometry(tmp_path):
     """The bug that produced a 6KB two-face STEP from a 40k-face mesh."""
-    from stl2prism.rebuild import faceted_fallback
+    from stl_to_solid.rebuild import faceted_fallback
     m = trimesh.creation.icosphere(subdivisions=3)
     m.apply_scale(10.0)
     out = str(tmp_path / 'sphere.step')
@@ -344,7 +344,7 @@ def test_faceted_export_keeps_the_geometry(tmp_path):
 
 def test_faceted_export_refuses_fragments(tmp_path):
     """Two loose triangles must raise, not silently export as a solid."""
-    from stl2prism.rebuild import faceted_fallback, FacetedError
+    from stl_to_solid.rebuild import faceted_fallback, FacetedError
     m = trimesh.Trimesh(
         vertices=[[0, 0, 0], [1, 0, 0], [0, 1, 0], [9, 9, 9], [10, 9, 9], [9, 10, 9]],
         faces=[[0, 1, 2], [3, 4, 5]], process=False)
@@ -358,7 +358,7 @@ def test_faceted_export_refuses_fragments(tmp_path):
 @pytest.mark.parametrize('name', SCANS)
 def test_scan_endtoend_produces_real_solid(tmp_path, name):
     pytest.importorskip('pymeshlab')          # scan repair ladder: Linux x86_64 only
-    from stl2prism.pipeline import run
+    from stl_to_solid.pipeline import run
     out = str(tmp_path / 'scan.step')
     r = run(_sample(name), out, verbose=False)
     assert r['mode'] == 'faceted'
@@ -370,7 +370,7 @@ def test_scan_endtoend_produces_real_solid(tmp_path, name):
 @pytest.mark.slow
 def test_cad_endtoend_hits_prismatic_gate(tmp_path):
     """CAD parts either pass the prismatic gate or fall back honestly."""
-    from stl2prism.pipeline import run
+    from stl_to_solid.pipeline import run
     paths = _cad_samples()
     if not paths:
         pytest.skip('no CAD samples present')

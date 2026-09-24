@@ -12,8 +12,8 @@ from . import synth
 
 
 def _regions(wp, tmp_path, name):
-    from stl2prism.mesh_prep import load_and_prep_bodies
-    from stl2prism import facegroups
+    from stl_to_solid.mesh_prep import load_and_prep_bodies
+    from stl_to_solid import facegroups
     p = synth.export(wp, tmp_path / f'{name}.stl')
     bodies, _, _ = load_and_prep_bodies(p, verbose=False)
     m = bodies[0].mesh
@@ -39,7 +39,7 @@ def _script_ns(text):
 ])
 def test_export_regions_and_script(tmp_path, name, builder, kinds):
     from collections import Counter
-    from stl2prism.fusion_boundary_fill import emit_boundary_fill_script
+    from stl_to_solid.fusion_boundary_fill import emit_boundary_fill_script
     m, stats = _regions(builder(), tmp_path, name)
     ex = stats['export']
     regs = ex['regions']
@@ -122,7 +122,7 @@ def test_export_regions_and_script(tmp_path, name, builder, kinds):
 
 
 def test_script_refuses_huge_and_skips_other_modes(tmp_path):
-    from stl2prism.fusion_boundary_fill import emit_boundary_fill_script, TooManyRegions
+    from stl_to_solid.fusion_boundary_fill import emit_boundary_fill_script, TooManyRegions
     _, stats = _regions(synth.fillet_top(), tmp_path, 'ft')
     build = dict(stats['export'], mode='facegroup')
     with pytest.raises(TooManyRegions):
@@ -136,7 +136,7 @@ def test_script_refuses_huge_and_skips_other_modes(tmp_path):
 
 
 def test_pipeline_writes_bfill_script_for_facegroup_only(tmp_path):
-    from stl2prism import run
+    from stl_to_solid import run
     # fillet_top is not an extrusion along any axis: face-group route
     p = synth.export(synth.fillet_top(), tmp_path / 'ft.stl')
     r = run(str(p), str(tmp_path / 'ft.step'), verbose=False)
@@ -159,7 +159,7 @@ def test_tangent_fillet_snapped_to_its_plane():
     """A fillet fitted a few microns short of its tangent plane must be moved
     so the emitted cylinder touches the emitted plane exactly; a cylinder
     that merely crosses a plane is left alone."""
-    from stl2prism.fusion_boundary_fill import _surface_record, _snap_tangencies
+    from stl_to_solid.fusion_boundary_fill import _surface_record, _snap_tangencies
     plane = {'id': 0, 'kind': 'plane', 'normal': [0, 0, 1], 'point': [0, 0, 10.0],
              'hull': [[-10, -10, 10.0], [10, -10, 10.0], [10, 10, 10.0], [-10, 10, 10.0]],
              'area': 400.0, 'adjacent': {1: list(range(12)), 2: list(range(12)), 3: list(range(8))}}
@@ -194,7 +194,7 @@ def test_same_fit_pieces_become_one_tool():
     """Two pieces of one torus/sphere/cone fit (the engine's pinch repair
     gives the peeled piece the core's params) must not become two
     coincident whole tools — a kernel failure — but one."""
-    from stl2prism.fusion_boundary_fill import _merge_same_surface
+    from stl_to_solid.fusion_boundary_fill import _merge_same_surface
     t = {'kind': 'torus', 'built': 'analytic', 'center': [0, 0, 5.0], 'axis': [0, 0, 1],
          'R': 6.0, 'r': 1.5, 'area': 30.0, 'inside': [[6, 0, 4]], 'adjacent': {1: [0, 1]}}
     a = dict(t, id=0)
@@ -224,7 +224,7 @@ def test_tapered_fillet_cone_snapped_to_its_planes():
     a ruling: after the snap the apex lies on both planes and the axis makes
     exactly (90 - half) degrees with each normal — a fit a hair off is
     corrected, not left with a growing gap along the ruling."""
-    from stl2prism.fusion_boundary_fill import _surface_record, _snap_tangencies
+    from stl_to_solid.fusion_boundary_fill import _surface_record, _snap_tangencies
     half = math.radians(10.0)
     s = math.sin(half)
     axis = np.array([math.sqrt(1 - 2 * s * s), s, s])          # tangent to z=0 and y=0
@@ -255,7 +255,7 @@ def test_tapered_fillet_cone_snapped_to_its_planes():
 
 
 def test_same_surface_neighbours_are_merged():
-    from stl2prism.fusion_boundary_fill import _merge_same_surface
+    from stl_to_solid.fusion_boundary_fill import _merge_same_surface
     a = {'id': 0, 'kind': 'plane', 'normal': [0, 0, 1], 'point': [0, 0, 10.0], 'area': 100.0,
          'hull': [[0, 0, 10.0], [10, 0, 10.0], [10, 10, 10.0], [0, 10, 10.0]],
          'inside': [[5, 5, 9.7]], 'adjacent': {1: [0, 1, 2, 3], 2: [4, 5, 6]}}
@@ -281,7 +281,7 @@ def test_pipeline_outlook_is_the_dry_run_and_the_header_agrees(tmp_path, monkeyp
     outlook says so (ok None) instead of a heuristic verdict; and a run
     without scripts carries no outlook at all (nothing stale from the
     run before)."""
-    from stl2prism import run, bfill_check
+    from stl_to_solid import run, bfill_check
     p = synth.export(synth.fillet_top(), tmp_path / 'ft.stl')
     r = run(str(p), str(tmp_path / 'ft.step'), verbose=False)
     c = r['bfill_check']
@@ -316,7 +316,7 @@ def test_outlook_flags_band_blends(tmp_path):
     blend, which is one torus region since the torus fit — and flag a
     blend kept as a chain of short cylinder bands, the one thing Fusion's
     Boundary Fill is known to choke on."""
-    from stl2prism.fusion_boundary_fill import assess
+    from stl_to_solid.fusion_boundary_fill import assess
     _, stats = _regions(synth.fillet_top(), tmp_path, 'ft')
     c = assess(stats['export'])
     assert c['ok'] and c['bands'] == 0 and c['unfitted'] == 0

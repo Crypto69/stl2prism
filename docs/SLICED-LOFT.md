@@ -1,7 +1,7 @@
 # Sliced loft: mesh → section outlines → loft (research + plan)
 
 Status (2026-09-22, later the same day): **implemented as v0.4.0** —
-`stl2prism/section_fit.py` (plane cut + curve fit), `stl2prism/sliced_loft.py`
+`stl_to_solid/section_fit.py` (plane cut + curve fit), `stl_to_solid/sliced_loft.py`
 (the loft), `method='loft'` through pipeline / CLI / API / web UI, the
 Fusion loft script, `tests/test_sliced_loft.py`. The Phase 0 findings and
 what changed against the plan are in "What Phase 0 found" below; the
@@ -93,7 +93,7 @@ Sources: [Create a mesh section sketch](https://help.autodesk.com/cloudhelp/ENU/
 [Loft Feature API sample](https://help.autodesk.com/cloudhelp/ENU/Fusion-360-API/files/LoftFeatureSample_Sample.htm),
 [LoftFeatureInput.loftSections](https://help.autodesk.com/cloudhelp/ENU/Fusion-360-API/files/LoftFeatureInput_loftSections.htm).
 
-## Can stl2prism do the same? Yes, with limits
+## Can stlToSolid do the same? Yes, with limits
 
 The whole workflow can be automated outside Fusion:
 
@@ -200,7 +200,7 @@ Decisions already made (do not re-open):
 
 ### Plumbing (mirror the existing options exactly)
 
-- `stl2prism/sliced_loft.py` (new): `step_levels`, `slice_heights`,
+- `stl_to_solid/sliced_loft.py` (new): `step_levels`, `slice_heights`,
   `sections`, `resample`, `align`, `match`, `build_runs`,
   `loft_body(mesh, axis, interval, ruled=False, verbose=True) ->
   (TopoDS_Shape, build_info)`; `build_info` holds the thinned section
@@ -218,7 +218,7 @@ Decisions already made (do not re-open):
   'auto'`, `slice_mm: float = Field(0.2, gt=0, le=50)`, `slice_axis:
   Literal['auto','x','y','z'] = 'auto'`, `loft_ruled: bool = False`.
   `backend/worker.py`: pass them to `run`.
-- `stl2prism/fusion_export.py`: `emit_fusion_loft_script(bodies_info)`:
+- `stl_to_solid/fusion_export.py`: `emit_fusion_loft_script(bodies_info)`:
   reuse `_plane` and `_pick`; per section a sketch on an offset plane
   with `sketchFittedSplines.add(ObjectCollection of
   sk.modelToSketchSpace(Point3D))` and `isClosed = True` (verify the

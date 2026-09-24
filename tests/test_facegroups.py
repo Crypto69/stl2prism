@@ -9,7 +9,7 @@ from . import synth
 
 
 def _mesh(wp, tmp_path, name):
-    from stl2prism.mesh_prep import load_and_prep_bodies
+    from stl_to_solid.mesh_prep import load_and_prep_bodies
     p = synth.export(wp, tmp_path / f'{name}.stl')
     bodies, _, _ = load_and_prep_bodies(p, verbose=False)
     return bodies[0].mesh
@@ -18,7 +18,7 @@ def _mesh(wp, tmp_path, name):
 # --- fits ---------------------------------------------------------------------
 
 def test_fit_sphere_exact_and_noisy():
-    from stl2prism.facegroups import fit_sphere
+    from stl_to_solid.facegroups import fit_sphere
     rng = np.random.default_rng(0)
     d = rng.normal(size=(200, 3))
     d /= np.linalg.norm(d, axis=1)[:, None]
@@ -37,7 +37,7 @@ def test_fit_sphere_exact_and_noisy():
 
 
 def test_fit_torus_exact_and_noisy():
-    from stl2prism.features import fit_torus
+    from stl_to_solid.features import fit_torus
     rng = np.random.default_rng(1)
     c, a, R, r = np.array([2.0, -1.0, 3.0]), np.array([0.0, 0.6, 0.8]), 6.5, 1.5
     b0 = np.cross([1.0, 0.0, 0.0], a)
@@ -59,7 +59,7 @@ def test_fit_torus_exact_and_noisy():
 
 
 def test_fit_cone_exact_and_noisy():
-    from stl2prism.features import fit_cone
+    from stl_to_solid.features import fit_cone
     rng = np.random.default_rng(2)
     apex, a, al = np.array([1.0, 2.0, -3.0]), np.array([0.6, 0.0, 0.8]), np.radians(20.0)
     b0 = np.cross([0.0, 1.0, 0.0], a)
@@ -102,7 +102,7 @@ SEG_CASES = [
 @pytest.mark.parametrize('name,builder,expected', SEG_CASES, ids=[c[0] for c in SEG_CASES])
 def test_segment_finds_the_cad_face_groups(tmp_path, name, builder, expected):
     from collections import Counter
-    from stl2prism.facegroups import segment
+    from stl_to_solid.facegroups import segment
     m = _mesh(builder(), tmp_path, name)
     regions = segment(m, fit_tol=0.08)
     got = Counter(r.kind for r in regions)
@@ -118,7 +118,7 @@ def test_segment_does_not_let_a_plane_eat_fillet_strips(tmp_path):
     """The failure mode of vertex-only fitting: a wide plane plus its first
     fillet strip fit an exact, huge cylinder. The interior-residual test must
     keep the top plane a plane and the fillet a full quarter cylinder."""
-    from stl2prism.facegroups import segment
+    from stl_to_solid.facegroups import segment
     m = _mesh(synth.fillet_top(), tmp_path, 'fillet_top')
     regions = segment(m, fit_tol=0.08)
     top = [r for r in regions if r.kind == 'plane' and abs(r.params['normal'][2] - 1) < 1e-6]
@@ -147,9 +147,9 @@ ENGINE_CASES = [
 
 @pytest.mark.parametrize('name,builder,faces,kinds', ENGINE_CASES, ids=[c[0] for c in ENGINE_CASES])
 def test_engine_builds_the_cad_solid(tmp_path, name, builder, faces, kinds):
-    from stl2prism import facegroups
-    from stl2prism.pipeline import validate, gate_values
-    from stl2prism.rebuild import write_step
+    from stl_to_solid import facegroups
+    from stl_to_solid.pipeline import validate, gate_values
+    from stl_to_solid.rebuild import write_step
     m = _mesh(builder(), tmp_path, name)
     shape, stats = facegroups.convert(m, tol=0.08)
     assert stats['unfitted_regions'] == 0, stats['fallbacks']
@@ -174,7 +174,7 @@ def test_engine_reports_fitted_radius_exactly(tmp_path):
     from OCP.TopExp import TopExp_Explorer
     from OCP.TopAbs import TopAbs_FACE
     from OCP.TopoDS import TopoDS
-    from stl2prism import facegroups
+    from stl_to_solid import facegroups
     m = _mesh(synth.sphere_boss(), tmp_path, 'sphere_boss')
     shape, _ = facegroups.convert(m, tol=0.08)
     ex = TopExp_Explorer(shape, TopAbs_FACE)
@@ -194,7 +194,7 @@ def test_engine_reports_torus_radii_exactly(tmp_path):
     from OCP.TopExp import TopExp_Explorer
     from OCP.TopAbs import TopAbs_FACE
     from OCP.TopoDS import TopoDS
-    from stl2prism import facegroups
+    from stl_to_solid import facegroups
     m = _mesh(synth.boss_fillet(), tmp_path, 'boss_fillet')
     shape, stats = facegroups.convert(m, tol=0.08)
     assert stats['torus_merges'] == 1
@@ -224,7 +224,7 @@ def test_engine_reports_cone_angle_exactly(tmp_path):
     from OCP.TopExp import TopExp_Explorer
     from OCP.TopAbs import TopAbs_FACE
     from OCP.TopoDS import TopoDS
-    from stl2prism import facegroups
+    from stl_to_solid import facegroups
     m = _mesh(synth.pencil(), tmp_path, 'pencil')
     shape, stats = facegroups.convert(m, tol=0.08)
     cones = []
@@ -249,7 +249,7 @@ def test_taper_pin_grows_two_exact_cones():
     """Two straight taper slopes: with Taubin-centred cone seeding, growth
     alone fits exactly two cones — no bands, no merge needed."""
     from collections import Counter
-    from stl2prism import facegroups
+    from stl_to_solid import facegroups
     m = synth.taper_pin_mesh()
     regs = facegroups.segment(m, fit_tol=0.08)
     assert Counter(r.kind for r in regs) == {'plane': 2, 'cone': 2}
@@ -264,7 +264,7 @@ def test_spiral_taper_sphere_bands_merge_to_cones():
     bands (any two vertex rings lie exactly on some sphere): the cone-chain
     merge must chain those ring-like spheres and refit them as cones."""
     from collections import Counter
-    from stl2prism import facegroups
+    from stl_to_solid import facegroups
     m = synth.spiral_taper_mesh()
     regs = facegroups.segment(m, fit_tol=0.08)
     kinds = Counter(r.kind for r in regs)
@@ -280,8 +280,8 @@ def test_pinched_region_is_peeled_into_clean_pieces():
     _split_pinched must peel the faces at the pinch and return pieces whose
     loops all group cleanly."""
     import trimesh
-    from stl2prism.facegroups import _split_pinched
-    from stl2prism.rebuild import _group_loops
+    from stl_to_solid.facegroups import _split_pinched
+    from stl_to_solid.rebuild import _group_loops
     # a proper annulus strip whose inner ring reuses rim vertex 0: the hole
     # touches the rim there, degenerate triangles at the weld are dropped
     n = 12
@@ -314,8 +314,8 @@ def test_two_lobes_touching_at_a_vertex_are_split_into_both():
     the peeled fans, not a two-component 'core' that _region_face then
     builds as a plate with a hole."""
     import trimesh
-    from stl2prism.facegroups import _split_pinched
-    from stl2prism.rebuild import _group_loops
+    from stl_to_solid.facegroups import _split_pinched
+    from stl_to_solid.rebuild import _group_loops
 
     def grid(x0, y0):
         V = [(x0 + i, y0 + j, 0.0) for j in range(3) for i in range(3)]
@@ -348,7 +348,7 @@ def test_blend_chain_is_walked_from_an_end():
     """consolidate_blends tries runs of consecutive bands: the component
     must be in chain order (from an end band), not BFS order from the
     smallest id, or a mid-chain start hides the real sub-chains."""
-    from stl2prism.facegroups import _chain_order, _connected
+    from stl_to_solid.facegroups import _chain_order, _connected
     # a-b-c-d-e with ids c=0, b=1, d=2, a=3, e=4
     adj = {3: {1}, 1: {3, 0}, 0: {1, 2}, 2: {0, 4}, 4: {2}}
     order = _chain_order([0, 1, 2, 3, 4], adj)
@@ -365,7 +365,7 @@ def test_rounded_box_corners_stay_spheres(tmp_path):
     """Three fillets meeting at a box corner blend as a sphere, not a torus:
     the band-chain merge must leave them alone (straight fillets are not
     bands, and the corner has no band chain)."""
-    from stl2prism import facegroups
+    from stl_to_solid import facegroups
     m = _mesh(synth.rounded_box(), tmp_path, 'rounded_box')
     shape, stats = facegroups.convert(m, tol=0.08)
     assert stats['torus_merges'] == 0 and stats['by_type'].get('torus', 0) == 0
@@ -379,8 +379,8 @@ def test_engine_steps_aside_on_scan_like_meshes(tmp_path):
     """No coplanar structure = tens of thousands of seeds: the engine must
     return quickly and let the faceted route handle it."""
     import time
-    from stl2prism.mesh_prep import load_and_prep_bodies
-    from stl2prism import facegroups
+    from stl_to_solid.mesh_prep import load_and_prep_bodies
+    from stl_to_solid import facegroups
     p = synth.scan_like_cube(str(tmp_path / 'scan.stl'))
     bodies, _, _ = load_and_prep_bodies(p, verbose=False)
     t = time.time()
@@ -393,7 +393,7 @@ def test_cone_tip_loops_are_refused_before_occ():
     """A boundary loop passing next to a cone's axis (a drill tip) is not a
     usable trimmed face — ShapeFix_Face crashes the process on it, so it
     has to be caught beforehand and the region emitted as triangles."""
-    from stl2prism.facegroups import _loops_param_ok
+    from stl_to_solid.facegroups import _loops_param_ok
     ax = np.array([0.0, 0.0, 1.0])
     ang = np.linspace(0, 2 * np.pi, 13)[:-1]
     ring = np.column_stack([np.cos(ang), np.sin(ang), np.ones_like(ang)])
@@ -420,7 +420,7 @@ def test_torus_loops_are_checked_in_both_periodic_directions():
     ring about the tube (two loops winding in v), or a patch; a loop that
     winds both ways, three rings, or a chord jumping across the tube are
     refused before OCC sees them."""
-    from stl2prism.facegroups import _loops_param_ok
+    from stl_to_solid.facegroups import _loops_param_ok
     R, r = 5.0, 1.5
     c, ax = np.zeros(3), np.array([0.0, 0.0, 1.0])
 
@@ -468,7 +468,7 @@ def test_regularise_snaps_within_uncertainty_and_reverts_the_rest(tmp_path):
     either by never proposing the merge (offset beyond the uncertainty the
     revert would accept, the current behaviour) or by reverting it."""
     import cadquery as cq
-    from stl2prism.facegroups import segment, regularise
+    from stl_to_solid.facegroups import segment, regularise
     wp = (cq.Workplane('XY').box(100, 100, 8).faces('>Z').workplane()
           .rect(6, 6).extrude(0.03))
     m = _mesh(wp, tmp_path, 'thin_pad')
@@ -487,7 +487,7 @@ def test_regularise_snaps_within_uncertainty_and_reverts_the_rest(tmp_path):
 # --- pipeline route -----------------------------------------------------------
 
 def test_pipeline_routes_to_facegroup_before_hybrid(tmp_path):
-    from stl2prism.pipeline import run
+    from stl_to_solid.pipeline import run
     p = synth.export(synth.sphere_boss(), tmp_path / 'sb.stl')
     out = str(tmp_path / 'sb.step')
     r = run(p, out, verbose=False)
@@ -500,7 +500,7 @@ def test_pipeline_routes_to_facegroup_before_hybrid(tmp_path):
 
 
 def test_pipeline_flag_disables_the_engine(tmp_path):
-    from stl2prism.pipeline import run
+    from stl_to_solid.pipeline import run
     p = synth.export(synth.fillet_top(), tmp_path / 'ft.stl')
     r = run(p, str(tmp_path / 'ft.step'), verbose=False, face_groups=False)
     assert r['mode'] == 'faceted'
@@ -512,7 +512,7 @@ def test_cli_accepts_no_face_groups(tmp_path):
     import subprocess, sys
     p = synth.export(synth.fillet_top(), tmp_path / 'ft.stl')
     out = tmp_path / 'ft.step'
-    res = subprocess.run([sys.executable, '-m', 'stl2prism.pipeline', p, str(out),
+    res = subprocess.run([sys.executable, '-m', 'stl_to_solid.pipeline', p, str(out),
                           '--no-face-groups', '--quiet'], capture_output=True, text=True)
     assert res.returncode == 0, res.stderr
     n, kinds = synth.step_faces(str(out))

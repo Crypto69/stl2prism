@@ -12,7 +12,7 @@ from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
-from stl2prism.mesh_prep import SUPPORTED_EXTS
+from stl_to_solid.mesh_prep import SUPPORTED_EXTS
 
 from . import jobs
 from .analysis import sanitize, mesh_stats, body_list
@@ -27,21 +27,21 @@ async def _lifespan(app):
     yield
 
 
-app = FastAPI(title='stl2prism', lifespan=_lifespan)
+app = FastAPI(title='stlToSolid', lifespan=_lifespan)
 
 
 @app.get('/api/version')
 def version():
     """Package version plus the git commit / time the image was built from
     (set via Docker build args; 'unknown' when run from a checkout)."""
-    from stl2prism import __version__
+    from stl_to_solid import __version__
     return {'version': __version__,
-            'commit': os.environ.get('STL2PRISM_BUILD_SHA', 'unknown'),
-            'built': os.environ.get('STL2PRISM_BUILD_TIME', 'unknown')}
+            'commit': os.environ.get('STLTOSOLID_BUILD_SHA', 'unknown'),
+            'built': os.environ.get('STLTOSOLID_BUILD_TIME', 'unknown')}
 
 
 def _write_preview(src, dst):
-    from stl2prism.mesh_prep import load_mesh
+    from stl_to_solid.mesh_prep import load_mesh
     load_mesh(src).export(dst)
 
 # Dev convenience: the Vite dev server runs on another port. In production
@@ -49,7 +49,7 @@ def _write_preview(src, dst):
 app.add_middleware(CORSMiddleware, allow_origins=['*'],
                    allow_methods=['*'], allow_headers=['*'])
 
-MAX_UPLOAD = int(os.environ.get('STL2PRISM_MAX_UPLOAD', 200 * 1024 * 1024))
+MAX_UPLOAD = int(os.environ.get('STLTOSOLID_MAX_UPLOAD', 200 * 1024 * 1024))
 
 
 class ConvertParams(BaseModel):
@@ -237,7 +237,7 @@ async def section_script(job_id: str, axis: str = 'z', offset: float = 0.0, tol:
         raise HTTPException(400, 'trim must be in [0, 5] mm')
     job, src = _input_path(job_id)
     from .sections import trace
-    from stl2prism.fusion_export import emit_fusion_sections_script
+    from stl_to_solid.fusion_export import emit_fusion_sections_script
     try:
         sec = await run_in_threadpool(trace, src, axis, offset, tol, units, scale, join, outline,
                                       trim)
@@ -323,7 +323,7 @@ def download(job_id: str):
 
 # Production: serve the built frontend. Registered last so /api wins.
 _static = os.environ.get(
-    'STL2PRISM_STATIC',
+    'STLTOSOLID_STATIC',
     os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
                  'frontend', 'dist'))
 if os.path.isdir(_static):

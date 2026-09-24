@@ -1,6 +1,6 @@
 """Emulate a generated Fusion Boundary Fill script in OpenCascade.
 
-Thin CLI over stl2prism.bfill_check (the pipeline runs the same check for
+Thin CLI over stl_to_solid.bfill_check (the pipeline runs the same check for
 its Boundary Fill outlook). Builds the oversized tool surfaces from the
 script's BODIES table exactly as the script would (its SKIP list included),
 computes the cells, keeps the material ones and reports probe coverage and
@@ -15,8 +15,8 @@ import time
 from collections import Counter
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from stl2prism.bfill_check import parse_script, check_body, outlook  # noqa: E402
-from stl2prism.rebuild import _faces, _volume  # noqa: E402
+from stl_to_solid.bfill_check import parse_script, check_body, outlook  # noqa: E402
+from stl_to_solid.rebuild import _faces, _volume  # noqa: E402
 
 
 def main(argv=None):

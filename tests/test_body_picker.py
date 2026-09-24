@@ -5,9 +5,9 @@ import pytest
 import trimesh
 
 from . import synth
-from stl2prism import pipeline
-from stl2prism.pipeline import shell_keys, _pick_bodies
-from stl2prism.mesh_prep import Body, load_and_prep_bodies
+from stl_to_solid import pipeline
+from stl_to_solid.pipeline import shell_keys, _pick_bodies
+from stl_to_solid.mesh_prep import Body, load_and_prep_bodies
 from backend.analysis import body_list
 
 
@@ -101,7 +101,7 @@ def test_pick_by_shell_key_survives_unit_scaling(tmp_path):
 
 
 def synth_scale(units):
-    from stl2prism.mesh_prep import UNIT_SCALE
+    from stl_to_solid.mesh_prep import UNIT_SCALE
     return UNIT_SCALE[units]
 
 
@@ -174,7 +174,7 @@ def test_run_without_a_selection_converts_everything(tmp_path):
 def test_unit_warning_flags_a_mesh_ten_times_too_big(tmp_path):
     """The case that cost a real conversion: a cm file written as mm reads
     10x too big, and no input unit divides, so the UI must say rescale."""
-    from stl2prism.mesh_prep import unit_warning
+    from stl_to_solid.mesh_prep import unit_warning
     w = unit_warning(_box(1500))
     assert w and w['too'] == 'big'
     assert w['scale'] == 0.1 and w['unit'] is None
@@ -182,14 +182,14 @@ def test_unit_warning_flags_a_mesh_ten_times_too_big(tmp_path):
 
 
 def test_unit_warning_names_the_unit_when_one_fits(tmp_path):
-    from stl2prism.mesh_prep import unit_warning
+    from stl_to_solid.mesh_prep import unit_warning
     w = unit_warning(_box(0.033))          # metres
     assert w and w['too'] == 'small' and w['unit'] == 'm'
     assert w['would_be'] == pytest.approx(33.0)
 
 
 def test_unit_warning_is_quiet_for_a_normal_part():
-    from stl2prism.mesh_prep import unit_warning
+    from stl_to_solid.mesh_prep import unit_warning
     assert unit_warning(_box(40)) is None
     assert unit_warning(_box(500)) is None
 
@@ -204,7 +204,7 @@ def test_upload_stats_carry_the_warning(tmp_path):
 # --- rescaling --------------------------------------------------------------
 
 def test_resolve_scale_combines_units_and_the_free_factor():
-    from stl2prism.mesh_prep import resolve_scale
+    from stl_to_solid.mesh_prep import resolve_scale
     assert resolve_scale('mm', 1.0) == 1.0
     assert resolve_scale('mm', 0.1) == pytest.approx(0.1)     # the 10x-too-big case
     assert resolve_scale('cm', 1.0) == 10.0
@@ -213,13 +213,13 @@ def test_resolve_scale_combines_units_and_the_free_factor():
 
 @pytest.mark.parametrize('bad', [0, -1, 'x', float('nan'), float('inf')])
 def test_resolve_scale_refuses_nonsense(bad):
-    from stl2prism.mesh_prep import PrepError, resolve_scale
+    from stl_to_solid.mesh_prep import PrepError, resolve_scale
     with pytest.raises(PrepError):
         resolve_scale('mm', bad)
 
 
 def test_resolve_scale_refuses_an_absurd_total():
-    from stl2prism.mesh_prep import PrepError, resolve_scale
+    from stl_to_solid.mesh_prep import PrepError, resolve_scale
     with pytest.raises(PrepError, match='sensible range'):
         resolve_scale('m', 1e9)
 
@@ -247,7 +247,7 @@ def test_scale_one_is_unchanged(tmp_path):
 
 
 def test_scale_is_refused_before_any_conversion(tmp_path):
-    from stl2prism.mesh_prep import PrepError
+    from stl_to_solid.mesh_prep import PrepError
     stl = str(tmp_path / 'plain.stl')
     _box(40).export(stl)
     with pytest.raises(PrepError):
@@ -321,7 +321,7 @@ def test_contains_is_batched_and_matches_the_unbatched_answer():
     """trimesh's contains() allocates points x triangles in one go: 21,833
     vertices against an 18,664-face housing asked for 15.5 GB and the
     kernel killed the conversion before it converted anything."""
-    from stl2prism import mesh_prep
+    from stl_to_solid import mesh_prep
     outer = trimesh.creation.icosphere(subdivisions=3, radius=20)
     pts = trimesh.creation.icosphere(subdivisions=4, radius=10).vertices
     assert len(pts) > mesh_prep.CONTAINS_BATCH
@@ -333,12 +333,12 @@ def test_contains_is_batched_and_matches_the_unbatched_answer():
 
 
 def test_reach_outside_is_zero_for_a_contained_shell():
-    from stl2prism.mesh_prep import _reach_outside
+    from stl_to_solid.mesh_prep import _reach_outside
     assert _reach_outside(_tbox(40), _tbox(20)) == pytest.approx(0.0, abs=1e-6)
 
 
 def test_reach_outside_measures_how_far_a_shell_pokes_out():
-    from stl2prism.mesh_prep import _reach_outside
+    from stl_to_solid.mesh_prep import _reach_outside
     # a 20 cube centred 15 from the origin reaches 5 mm past a 40 cube's wall
     assert _reach_outside(_tbox(40), _tbox(20, (15, 0, 0))) == pytest.approx(5.0, abs=0.05)
 
@@ -347,7 +347,7 @@ def test_reach_outside_is_deterministic():
     """This decides whether a shell is a cavity or a body of its own, so
     the same file must always give the same answer. An unseeded surface
     sample once gave 0.4 mm on one run and 1.5 mm on the next."""
-    from stl2prism.mesh_prep import _reach_outside
+    from stl_to_solid.mesh_prep import _reach_outside
     a, b = _tbox(40), _tbox(20, (12, 3, 0))
     first = _reach_outside(a, b)
     for _ in range(4):
@@ -357,7 +357,7 @@ def test_reach_outside_is_deterministic():
 def test_reach_outside_stays_accurate_on_a_dense_shell():
     """The sample must not change the verdict on a shell with far more
     vertices than REACH_SAMPLE."""
-    from stl2prism import mesh_prep
+    from stl_to_solid import mesh_prep
     outer = trimesh.creation.icosphere(subdivisions=3, radius=20)
     inner = trimesh.creation.icosphere(subdivisions=5, radius=10)   # 10242 verts
     inner.apply_translation((15, 0, 0))
@@ -371,7 +371,7 @@ def test_split_bodies_stays_within_memory_on_many_shells(tmp_path):
     """A regression guard for the out-of-memory kill: prep runs over every
     shell whatever the user picked, so it must stay bounded."""
     import resource
-    from stl2prism.mesh_prep import classify, split_bodies
+    from stl_to_solid.mesh_prep import classify, split_bodies
     parts = [trimesh.creation.icosphere(subdivisions=4, radius=20)]
     for k in range(6):
         s = trimesh.creation.icosphere(subdivisions=3, radius=3)
@@ -405,7 +405,7 @@ def test_suggested_ranks_open_shells_by_size(tmp_path):
 # --- filtering before repair ------------------------------------------------
 
 def test_keep_selected_narrows_by_face_count():
-    from stl2prism.pipeline import _keep_selected
+    from stl_to_solid.pipeline import _keep_selected
     keep = _keep_selected([(12, 1.0, 1.0, 1.0, 0.5, 0.5, 0.5, 1.0)])
     assert keep is not None
     assert keep(Body(_box(40)))                        # 12 faces
@@ -413,7 +413,7 @@ def test_keep_selected_narrows_by_face_count():
 
 
 def test_keep_selected_keeps_a_body_whose_cavity_was_picked():
-    from stl2prism.pipeline import _keep_selected
+    from stl_to_solid.pipeline import _keep_selected
     keep = _keep_selected([(12, 1.0, 1.0, 1.0, 0.5, 0.5, 0.5, 0.5)])
     body = Body(trimesh.creation.icosphere(subdivisions=2), [_box(2)])
     assert keep(body)                                  # matched via the void
@@ -422,15 +422,15 @@ def test_keep_selected_keeps_a_body_whose_cavity_was_picked():
 def test_keep_selected_declines_plain_indices():
     """Indices name positions in the prepared list, which does not exist
     when the filter runs: keep everything and decide afterwards."""
-    from stl2prism.pipeline import _keep_selected
+    from stl_to_solid.pipeline import _keep_selected
     assert _keep_selected([0, 2]) is None
 
 
 def test_early_filter_and_late_filter_agree(tmp_path):
     """The point of the whole mechanism: repairing only what was asked for
     must give exactly what repairing everything would have given."""
-    from stl2prism.mesh_prep import load_and_prep_bodies
-    from stl2prism.pipeline import _keep_selected, _pick_bodies
+    from stl_to_solid.mesh_prep import load_and_prep_bodies
+    from stl_to_solid.pipeline import _keep_selected, _pick_bodies
     stl = _three_parts(tmp_path / 'three.stl')
     keys = [tuple(b['key']) for b in body_list(stl)['bodies']]
     want = [keys[0], keys[2]]

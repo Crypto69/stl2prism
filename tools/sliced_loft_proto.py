@@ -4,7 +4,7 @@ import numpy as np, trimesh, cadquery as cq
 from shapely.geometry import Polygon
 from OCP.BRepCheck import BRepCheck_Analyzer
 sys.path.insert(0, os.getcwd())
-from stl2prism.pipeline import validate
+from stl_to_solid.pipeline import validate
 
 EPS = 1e-3
 
@@ -238,6 +238,6 @@ if __name__ == '__main__':
     print(f"  built in {t1-t0:.1f}s: {len(shape.Faces())} faces, {len(shape.Solids())} solids, valid={ok}, vol {shape.Volume():.0f} vs mesh {mesh.volume:.0f}")
     m = validate(cq.Workplane('XY').add(shape), mesh)
     print(f"  dev p95 {m['dev_p95']:.3f} max {m['dev_max']:.3f} rev p95 {m['rev_dev_p95']:.3f} rev max {m['rev_dev_max']:.3f} vol err {m['vol_err_pct']:.2f}%  ({time.time()-t1:.1f}s check)")
-    out = f"/private/tmp/claude-501/-Volumes-ExternalHD-code-stl2prism/20dedaa7-5571-4a38-bf8c-ea28d88801c1/scratchpad/{os.path.splitext(os.path.basename(path))[0]}_loft.step"
+    out = f"/private/tmp/claude-501/-Volumes-ExternalHD-code-STLTOSOLIDKEEP/20dedaa7-5571-4a38-bf8c-ea28d88801c1/scratchpad/{os.path.splitext(os.path.basename(path))[0]}_loft.step"
     cq.exporters.export(cq.Workplane('XY').add(shape), out)
     print(f"  -> {out}")

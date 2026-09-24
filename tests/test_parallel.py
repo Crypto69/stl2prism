@@ -4,7 +4,7 @@ import os
 import time
 import pytest
 
-from stl2prism.parallel import run_tasks
+from stl_to_solid.parallel import run_tasks
 
 
 # task functions must be importable by a spawned interpreter, so they live
@@ -110,7 +110,7 @@ def test_zero_timeout_means_no_limit():
 
 
 def test_one_pool_serves_several_runs_and_reports_starts():
-    from stl2prism.parallel import Pool
+    from stl_to_solid.parallel import Pool
     starts = []
     with Pool(2) as pool:
         a = pool.run(_double, [1, 2, 3], on_start=starts.append)
@@ -140,7 +140,7 @@ def _who(x):
 
 
 def test_a_dead_pool_worker_is_replaced_between_runs():
-    from stl2prism.parallel import Pool
+    from stl_to_solid.parallel import Pool
     with Pool(1) as pool:
         pool.run(_crash, ['crash'])
         out = pool.run(_who, [1])

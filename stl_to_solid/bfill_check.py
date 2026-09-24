@@ -302,7 +302,7 @@ def check_script(text, budget_s=None, pool=None, workers=2, progress=None):
     bodies = ns['BODIES']
     if pool is not None and len(bodies) > 1:
         import tempfile
-        with tempfile.TemporaryDirectory(prefix='stl2prism-bfill-') as td:
+        with tempfile.TemporaryDirectory(prefix='stltosolid-bfill-') as td:
             path = os.path.join(td, 'script.py')
             with open(path, 'w') as f:
                 f.write(text)

@@ -6,5 +6,5 @@ import pytest
 
 @pytest.fixture(autouse=True)
 def _in_process_by_default(monkeypatch):
-    from stl2prism import pipeline
+    from stl_to_solid import pipeline
     monkeypatch.setattr(pipeline, 'WORKERS', 0)

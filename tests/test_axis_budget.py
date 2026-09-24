@@ -11,7 +11,7 @@ import trimesh
 import cadquery as cq
 
 from . import synth
-from stl2prism import extrusion as ex
+from stl_to_solid import extrusion as ex
 
 
 def _mesh(wp, tmp_path, name='part'):
@@ -72,7 +72,7 @@ def test_deadline_stops_refinement_gracefully(tmp_path, monkeypatch):
 def test_spent_budget_falls_through_to_the_next_route(tmp_path, monkeypatch):
     """With no time for any candidate the prismatic rung fails and the
     ladder continues; the file still gets a valid solid."""
-    from stl2prism import pipeline
+    from stl_to_solid import pipeline
     monkeypatch.setattr(pipeline, 'AXIS_SEARCH_BUDGET_S', 1e-9)
     p = synth.export(synth.plate_holes(), tmp_path / 'plate.stl')
     out = str(tmp_path / 'plate.step')
@@ -85,7 +85,7 @@ def test_spent_budget_falls_through_to_the_next_route(tmp_path, monkeypatch):
 def test_budget_keeps_the_best_candidate_so_far(tmp_path, monkeypatch, capsys):
     """When the budget runs out after the first candidate, that candidate
     is used rather than the search abandoned."""
-    from stl2prism import pipeline
+    from stl_to_solid import pipeline
     real = ex.score_axis
     calls = []
 
