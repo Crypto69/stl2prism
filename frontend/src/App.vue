@@ -62,9 +62,9 @@ const canConvert = computed(
   <div class="shell">
     <header class="topbar">
       <div class="wordmark">
-        <span class="stl">STL</span><span class="arrow">▸</span><span class="prism">PRISM</span>
+        <span class="stl">STL</span><span class="arrow">▸</span><span class="solid">SOLID</span>
       </div>
-      <p class="tag micro">Mesh in · machined solid out</p>
+      <p class="tag micro">Mesh in · solid out</p>
       <p v-if="build" class="build micro" :title="'built ' + build.built">
         v{{ build.version }} · {{ build.commit }}
         <span v-if="build.built !== 'unknown'" class="when">· {{ build.built }}</span>
@@ -172,7 +172,7 @@ const canConvert = computed(
 }
 .build .when { opacity: 0.7; }
 .wordmark .arrow { color: var(--edge); margin: 0 4px; }
-.wordmark .prism { color: var(--edge); }
+.wordmark .solid { color: var(--edge); }
 
 .grid {
   flex: 1;
