@@ -347,6 +347,41 @@ def test_loft_goes_ruled_directly_when_rings_do_not_fit(monkeypatch):
     assert info['n_ruled_runs'] == 1
 
 
+def test_loft_pairs_extrudes_a_pair_whose_rings_do_not_correspond(monkeypatch):
+    """The pair chain: with the per-pair volume check made impossible to
+    pass, every pair is replaced by an extrusion of its lower ring, the
+    pieces fuse to one solid and the volume is the prism's. (ThruSections
+    itself picks compatible origins on closed wires, so a rolled or
+    turned ring alone does not make a bad pair.)"""
+    from stl_to_solid import sliced_loft as sl
+    monkeypatch.setattr(sl, 'RULED_VOL_PCT', 0.0)
+    rc = np.array([[10, 5], [-10, 5], [-10, -5], [10, -5]], float)
+    ring = sl.resample(rc, 160)
+    zs = [0.0, 10.0, 20.0, 30.0]
+    rings3d = [np.c_[ring, np.full(len(ring), z)] for z in zs]
+    wires, _, _ = sl._ring_wires(rings3d)
+    solid, ext = sl._loft_pairs(wires, rings3d, [200.0] * 4, zs, 'test', False)
+    assert ext == [[0.0, 10.0], [10.0, 20.0], [20.0, 30.0]], ext
+    assert len(solid.Solids()) == 1
+    assert abs(sl._volume(solid) - 6000.0) / 6000.0 < 0.01
+
+
+def test_loft_never_drops_a_run(tmp_path, monkeypatch):
+    """With the run-level volume check made impossible to pass, every run
+    falls back to the pair chain instead of vanishing: nothing skipped,
+    the material all there."""
+    from stl_to_solid import sliced_loft as sl
+    monkeypatch.setattr(sl, 'RULED_VOL_PCT', 0.0)
+    p = synth.export(synth.stepped_shaft(), tmp_path / 'shaft.stl')
+    m = trimesh.load(p, force='mesh')
+    shape, info = sl.loft_body(m, 2, 0.5, verbose=False)
+    assert info['skipped'] == [], info['skipped']
+    assert info['n_extruded_pairs'] > 0
+    from stl_to_solid.pipeline import validate
+    mt = validate(shape, m)
+    assert mt['vol_err_pct'] < 1.0, mt
+
+
 def test_loft_stepped_shaft_breaks_at_levels(tmp_path):
     from stl_to_solid.sliced_loft import loft_body
     p = synth.export(synth.stepped_shaft(), tmp_path / 'shaft.stl')
