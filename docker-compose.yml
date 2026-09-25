@@ -32,6 +32,9 @@ services:
       # seconds one shell's extrusion-axis search may take before the best
       # candidate so far is used (default 120; 0 means no limit)
       # STLTOSOLID_AXIS_BUDGET: "120"
+      # seconds an X-Ray script download may spend fitting its slices
+      # before it gives up (default 240; under a browser's 300 s limit)
+      # STLTOSOLID_XRAY_BUDGET: "240"
     # keep a runaway conversion from starving the NAS's other services
     mem_limit: 12g
     restart: unless-stopped

@@ -54,8 +54,9 @@ fitter (lines and arcs where they hold the tolerance, fitted splines where
 they do not) — numpy only, so the same file can run inside Fusion.
 `tools/trace_section.py` draws one section the way the fitter sees it.
 
-**Single slice from the web app.** With the sliced loft chosen, the 3D
-view shows a labelled XYZ triad (X red, Y green, Z blue, as in Fusion) and
+**Single slice from the web app.** With Sliced Loft chosen in the top
+toolbar (v0.4.4: one button per tool — Mesh → Solid, Sliced Loft, X-Ray —
+and the rail shows only that tool's controls), the 3D view shows a labelled XYZ triad (X red, Y green, Z blue, as in Fusion) and
 a translucent plane across the chosen axis; a slider moves the plane by
 an offset from the part's centre, the traced outline is drawn on it, and
 "Download Fusion sketch of this slice" gives a script that draws that one
@@ -71,6 +72,25 @@ leaving the open pieces and every inner loop out, for one clean profile
 to extrude; "Trim slivers up to"
 (`trim=`) cuts hairpins and thin twists narrower than that out of the
 loops, where the mesh has a double skin.
+
+**X-Ray (v0.4.5).** The X-Ray tool draws a whole stack of those sketches
+at once: pick the axis, a start plane, an end plane and a spacing, and
+the 3D view shows both planes (the end one dashed) with their traces and
+the slice count; "Download Fusion sketches" gives one script with a fully
+enclosed sketch per slice on its own construction plane, named
+`xray Z=12.34 mm (k/N)` (`GET /api/jobs/{id}/xray-script?axis&from&to&
+step&tol&units&scale&join&outline&trim`, and `/xray` for the count). The
+planes sit at start + k·spacing and the end plane is always the last one;
+both ends are kept 0.001 mm inside the part; start = end is the single
+slice. The script embeds the slice data once and draws it in a loop with
+the sketch's compute deferred, behind a progress dialog with Cancel, the
+way the private add-in does. "Extrude each slice to the next" (`extrude=
+true`) also extrudes every sketch to the next plane and joins it to the
+slab before it, for a stepped solid where a Loft would fold over. One
+download fits at most 500 slices and spends at most 240 s fitting
+(`STLTOSOLID_XRAY_BUDGET`); the panel estimates the time from the traces
+and suggests Outline only, which is about five times faster on organic
+sections.
 
 The sliced loft's cutter uses the same join and trim settings
 (`--slice-join`, `--slice-trim`), so a leaky shell lofts from the same
@@ -171,11 +191,12 @@ frame — see Roadmap). Bodies with more than 200 regions get no script;
 
 ## Web app
 
-A browser UI for the same pipeline: drag a mesh in, inspect it in 3D, set
-the acceptance tolerances, convert, and download the STEP (and, for
-prismatic results, the CadQuery and Fusion 360 scripts) with a fidelity
-report (route, surface deviation vs. your limits, volume error, face counts
-and surface types, regions kept as facets).
+A browser UI for the same pipeline: drag a mesh in, inspect it in 3D, pick
+a tool in the top toolbar (Mesh → Solid, Sliced Loft or X-Ray), set the
+tolerances, convert, and download the STEP (and, for prismatic results, the
+CadQuery and Fusion 360 scripts) with a fidelity report (route, surface
+deviation vs. your limits, volume error, face counts and surface types,
+regions kept as facets).
 
 ### Run locally (dev)
 

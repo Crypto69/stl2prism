@@ -39,6 +39,23 @@ button {
   cursor: pointer;
 }
 
+/* Every press is visible: buttons and download links sink and brighten
+   for the moment the mouse is down; text-style buttons (links, the "i"
+   marks) dip instead. Disabled ones stay still. */
+button, a[download], .params .dl {
+  transition: transform 0.08s ease, background 0.12s ease, filter 0.12s ease, opacity 0.12s ease;
+}
+button:not(:disabled):active, a[download]:active, .params .dl:not(.off):active {
+  transform: scale(0.96);
+  filter: brightness(1.15);
+}
+button.link:not(:disabled):active, button.reset:not(:disabled):active,
+button.info:not(:disabled):active {
+  transform: translateY(1px);
+  filter: none;
+  opacity: 0.6;
+}
+
 input[type='number'],
 select {
   font-family: var(--font-data);
@@ -61,9 +78,110 @@ summary:focus-visible {
   outline-offset: 2px;
 }
 
+/* a small rotating ring for "working" states; .edge is the cyan outline
+   variant for buttons drawn in the edge colour */
+.spin {
+  width: 13px;
+  height: 13px;
+  border: 2px solid rgba(20, 23, 28, 0.3);
+  border-top-color: var(--ink);
+  border-radius: 50%;
+  animation: spin 0.8s linear infinite;
+  flex: 0 0 auto;
+}
+.spin.edge { border-color: rgba(90, 210, 234, 0.25); border-top-color: var(--edge); }
+@keyframes spin { to { transform: rotate(360deg); } }
+
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after {
     animation-duration: 0.01ms !important;
     transition-duration: 0.01ms !important;
   }
 }
+
+/* ---- the rail's parameter panels (SetupPanel, SolidPanel, LoftPanel,
+   XRayPanel and the pieces they share). One set of rules, so a control
+   looks the same whichever tool it sits in. ---- */
+.params { display: flex; flex-direction: column; gap: 10px; }
+.params .warn {
+  font-size: 12px;
+  line-height: 1.5;
+  color: var(--text);
+  background: rgba(240, 173, 78, 0.10);
+  border: 1px solid rgba(240, 173, 78, 0.45);
+  border-left-width: 3px;
+  border-radius: 4px;
+  padding: 8px 10px;
+  margin-top: 8px;
+}
+.params .warn .link { color: var(--edge); }
+.params .hint { font-size: 12px; opacity: 0.85; }
+.params .hint.warn { color: var(--warn, #b26a00); opacity: 1; }
+.params .link {
+  background: none; border: none; color: var(--accent, #5ad2ea); cursor: pointer;
+  text-decoration: underline; padding: 0; font: inherit;
+}
+.params .head { display: flex; justify-content: space-between; align-items: baseline; }
+.params .head.gate { border-top: 1px solid var(--line); padding-top: 12px; margin-top: 4px; }
+.params .reset { background: none; border: none; color: var(--edge); font-size: 12px; padding: 0; }
+.params .reset:hover { text-decoration: underline; }
+.params .intro, .params .help { color: var(--muted); font-size: 12px; }
+.params .field { border-top: 1px solid var(--line); padding-top: 8px; }
+.params .row { display: flex; justify-content: space-between; align-items: center; gap: 12px; }
+.params label { font-weight: 500; }
+.params .unit { color: var(--muted); font-size: 12px; margin-left: 2px; }
+.params input.touched, .params select.touched { border-color: var(--edge); }
+.params .info {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 16px;
+  height: 16px;
+  margin-left: 6px;
+  border-radius: 50%;
+  border: 1px solid var(--muted);
+  background: none;
+  color: var(--muted);
+  font-size: 11px;
+  font-style: italic;
+  line-height: 1;
+  vertical-align: 1px;
+}
+.params .info:hover, .params .info[aria-expanded='true'] { border-color: var(--edge); color: var(--edge); }
+.params .explain {
+  margin-top: 8px;
+  padding: 8px 10px;
+  border-left: 2px solid var(--edge);
+  background: var(--panel-2);
+  border-radius: 0 4px 4px 0;
+  font-size: 12px;
+  color: var(--text);
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.params .explain .dir { color: var(--edge); font-weight: 600; }
+.params .check {
+  display: flex;
+  gap: 8px;
+  border-top: 1px solid var(--line);
+  padding-top: 10px;
+  align-items: flex-start;
+}
+.params .check input { margin-top: 3px; accent-color: var(--edge); }
+.params .check .help { display: block; font-weight: 400; }
+.params .check.loft, .params .check.flat { border-top: none; padding-top: 4px; }
+.params .ax { font-weight: 700; }
+.params .ax.x { color: #e5484d; }
+.params .ax.y { color: #46b95a; }
+.params .ax.z { color: #4c8dff; }
+.params .slice { border-top: 1px solid var(--line); padding-top: 8px; display: flex; flex-direction: column; gap: 6px; }
+.params .slider { width: 100%; accent-color: var(--edge); }
+.params .dl {
+  display: block; text-align: center; padding: 7px; border-radius: 6px;
+  border: 1px solid var(--edge); color: var(--edge); text-decoration: none; font-size: 12px;
+  background: none; font-family: var(--font-ui); cursor: pointer; width: 100%;
+}
+.params .dl:hover { background: var(--panel-2); }
+.params .dl.off { border-color: var(--line); color: var(--muted); cursor: default; }
+.params .dl.off:hover { background: none; }

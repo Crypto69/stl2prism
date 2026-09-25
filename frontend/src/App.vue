@@ -2,7 +2,11 @@
 import { computed, markRaw, onMounted, ref, shallowRef } from 'vue'
 import MeshViewer from './components/MeshViewer.vue'
 import BodyPicker from './components/BodyPicker.vue'
-import ParamsPanel from './components/ParamsPanel.vue'
+import ToolBar from './components/ToolBar.vue'
+import SetupPanel from './components/SetupPanel.vue'
+import SolidPanel from './components/SolidPanel.vue'
+import LoftPanel from './components/LoftPanel.vue'
+import XRayPanel from './components/XRayPanel.vue'
 import ReportPanel from './components/ReportPanel.vue'
 import { useConvertStore } from './store'
 
@@ -12,6 +16,10 @@ const dragOver = ref(false)
 const fileInput = ref(null)
 
 const ACCEPT = ['stl', 'obj', 'ply', 'off', '3mf', 'glb', 'gltf']
+// a file is being read (the browser parses STL/OBJ itself; other formats
+// wait for the server's preview): the drop zone says so meanwhile
+const loading = ref(false)
+const loadingName = ref('')
 
 // Which build is running: package version + git commit + build time from
 // /api/version, so a tester can match the browser to a commit at a glance.
@@ -32,19 +40,25 @@ async function takeFile(file) {
     })
     return
   }
-  if (kind === 'stl' || kind === 'obj') {
-    buffer.value = markRaw({ data: await file.arrayBuffer(), kind })
-    store.upload(file)
-    return
-  }
-  // other formats: the server converts them to an STL preview on upload
-  buffer.value = null
-  await store.upload(file)
-  if (store.jobId) {
-    try {
-      const res = await fetch(`/api/jobs/${store.jobId}/preview`)
-      if (res.ok) buffer.value = markRaw({ data: await res.arrayBuffer(), kind: 'stl' })
-    } catch (e) { /* preview is optional */ }
+  loading.value = true
+  loadingName.value = file.name
+  try {
+    if (kind === 'stl' || kind === 'obj') {
+      buffer.value = markRaw({ data: await file.arrayBuffer(), kind })
+      store.upload(file)
+      return
+    }
+    // other formats: the server converts them to an STL preview on upload
+    buffer.value = null
+    await store.upload(file)
+    if (store.jobId) {
+      try {
+        const res = await fetch(`/api/jobs/${store.jobId}/preview`)
+        if (res.ok) buffer.value = markRaw({ data: await res.arrayBuffer(), kind: 'stl' })
+      } catch (e) { /* preview is optional */ }
+    }
+  } finally {
+    loading.value = false
   }
 }
 
@@ -52,6 +66,14 @@ function onDrop(e) {
   dragOver.value = false
   takeFile(e.dataTransfer?.files?.[0])
 }
+
+// The rail's heading: which tool the controls below belong to
+const TOOL_HEAD = {
+  solid: { title: 'Mesh → Solid', blurb: 'Find the design intent and write a clean STEP solid.' },
+  loft: { title: 'Sliced Loft', blurb: 'Slice along an axis and loft the outlines into a smooth solid.' },
+  xray: { title: 'X-Ray', blurb: 'Section sketches between two planes, as a Fusion script.' },
+}
+const toolHead = computed(() => TOOL_HEAD[store.tool] || TOOL_HEAD.solid)
 
 const canConvert = computed(
   () => store.jobId && !store.busy && store.status !== 'uploading',
@@ -65,6 +87,7 @@ const canConvert = computed(
         <span class="stl">STL</span><span class="arrow">▸</span><span class="solid">SOLID</span>
       </div>
       <p class="tag micro">Mesh in · solid out</p>
+      <ToolBar @new="fileInput.click()" />
       <p v-if="build" class="build micro" :title="'built ' + build.built">
         v{{ build.version }} · {{ build.commit }}
         <span v-if="build.built !== 'unknown'" class="when">· {{ build.built }}</span>
@@ -86,9 +109,8 @@ const canConvert = computed(
           :triangle-body="store.triangleBody"
           :selected="store.selected"
           :hovered="store.hovered"
-          :slice-axis="store.resolvedSliceAxis"
-          :slice-offset="store.sliceOffset"
-          :section="store.section"
+          :planes="store.viewPlanes"
+          :sections="store.viewSections"
           @pick="store.toggleBody($event)"
           @hover="store.hovered = $event"
         />
@@ -101,15 +123,15 @@ const canConvert = computed(
                     stroke="var(--line)" stroke-width="1" />
             </svg>
           </div>
-          <p class="big">Drop an STL, OBJ, PLY, OFF, 3MF or GLB here</p>
-          <p class="sub">or</p>
-          <button class="browse" @click="fileInput.click()">Choose a file</button>
+          <template v-if="loading">
+            <p class="big working"><span class="spin edge" aria-hidden="true"></span> Working… reading {{ loadingName }}</p>
+          </template>
+          <template v-else>
+            <p class="big">Drop an STL, OBJ, PLY, OFF, 3MF or GLB here</p>
+            <p class="sub">or</p>
+            <button class="browse" @click="fileInput.click()">Choose a file</button>
+          </template>
         </div>
-        <button
-          v-if="buffer"
-          class="replace micro"
-          @click="fileInput.click()"
-        >Replace file</button>
         <input
           ref="fileInput" type="file" accept=".stl,.obj,.ply,.off,.3mf,.glb,.gltf" hidden
           @change="takeFile($event.target.files[0]); $event.target.value = ''"
@@ -117,29 +139,39 @@ const canConvert = computed(
       </div>
 
       <aside class="rail">
+        <header class="toolhead">
+          <h1>{{ toolHead.title }}</h1>
+          <p class="micro">{{ toolHead.blurb }}</p>
+        </header>
         <BodyPicker />
-        <ParamsPanel />
-        <button
-          class="convert"
-          :disabled="!canConvert"
-          @click="store.convert()"
-        >
-          <span v-if="store.status === 'running'" class="spin" aria-hidden="true"></span>
-          {{ store.status === 'running'
-             ? (store.serverStatus === 'queued' ? 'Waiting in queue…' : 'Converting…')
-             : store.status === 'uploading' ? 'Uploading…'
-             : 'Convert to STEP' }}
-        </button>
-        <button
-          v-if="store.status === 'running'"
-          class="cancel"
-          :disabled="store.cancelling"
-          @click="store.cancel()"
-        >{{ store.cancelling ? 'Stopping…' : 'Cancel' }}</button>
-        <p v-if="store.cancelled" class="cancelled micro">
-          Conversion cancelled. Your selection is still here — convert again
-          when you are ready.
-        </p>
+        <SetupPanel />
+        <SolidPanel v-if="store.tool === 'solid'" />
+        <LoftPanel v-else-if="store.tool === 'loft'" />
+        <XRayPanel v-else />
+        <!-- x-ray never converts: no Convert button, its download is in its panel -->
+        <template v-if="store.tool !== 'xray'">
+          <button
+            class="convert"
+            :disabled="!canConvert"
+            @click="store.convert()"
+          >
+            <span v-if="store.status === 'running'" class="spin" aria-hidden="true"></span>
+            {{ store.status === 'running'
+               ? (store.serverStatus === 'queued' ? 'Waiting in queue…' : 'Converting…')
+               : store.status === 'uploading' ? 'Uploading…'
+               : 'Convert to STEP' }}
+          </button>
+          <button
+            v-if="store.status === 'running'"
+            class="cancel"
+            :disabled="store.cancelling"
+            @click="store.cancel()"
+          >{{ store.cancelling ? 'Stopping…' : 'Cancel' }}</button>
+          <p v-if="store.cancelled" class="cancelled micro">
+            Conversion cancelled. Your selection is still here — convert again
+            when you are ready.
+          </p>
+        </template>
         <ReportPanel />
       </aside>
     </main>
@@ -157,6 +189,7 @@ const canConvert = computed(
   border-bottom: 1px solid var(--line);
   background: var(--panel);
 }
+.topbar > nav { align-self: center; margin-left: 8px; }
 .wordmark {
   font-weight: 800;
   font-size: 17px;
@@ -213,6 +246,8 @@ const canConvert = computed(
   gap: 8px;
 }
 .big { font-size: 22px; font-weight: 700; }
+.big.working { display: flex; align-items: center; gap: 12px; color: var(--edge); }
+.big.working .spin { width: 20px; height: 20px; border-width: 3px; }
 .sub { color: var(--muted); font-size: 12px; }
 .browse {
   background: none;
@@ -224,17 +259,6 @@ const canConvert = computed(
 }
 .browse:hover { background: rgba(90, 210, 234, 0.1); }
 
-.replace {
-  position: absolute;
-  top: 12px;
-  right: 14px;
-  background: rgba(20, 23, 28, 0.75);
-  border: 1px solid var(--line);
-  border-radius: 4px;
-  color: var(--muted);
-  padding: 4px 10px;
-}
-.replace:hover { color: var(--text); border-color: var(--muted); }
 
 .rail {
   padding: 16px;
@@ -249,6 +273,20 @@ const canConvert = computed(
    body list to nothing and overlapped the panel headings. The rail scrolls
    instead: every child keeps the height its content needs. */
 .rail > * { flex: 0 0 auto; }
+
+/* the tool's name over its controls, in the edge cyan so it reads first */
+.toolhead {
+  padding-bottom: 12px;
+  border-bottom: 2px solid var(--edge);
+}
+.toolhead h1 {
+  font-size: 20px;
+  font-weight: 800;
+  letter-spacing: 0.04em;
+  color: var(--edge);
+  line-height: 1.2;
+}
+.toolhead .micro { margin-top: 4px; text-transform: none; letter-spacing: 0; font-size: 12px; }
 
 .convert {
   padding: 12px;
@@ -280,15 +318,6 @@ const canConvert = computed(
 .cancelled { color: var(--muted); line-height: 1.45; }
 .convert:not(:disabled):hover { filter: brightness(1.1); }
 
-.spin {
-  width: 13px;
-  height: 13px;
-  border: 2px solid rgba(20, 23, 28, 0.3);
-  border-top-color: var(--ink);
-  border-radius: 50%;
-  animation: spin 0.8s linear infinite;
-}
-@keyframes spin { to { transform: rotate(360deg); } }
 
 /* Narrow: stack, and let the viewer shrink rather than the controls. The
    stage takes a share of the height with a floor; the rail keeps its own

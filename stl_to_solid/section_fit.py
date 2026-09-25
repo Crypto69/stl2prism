@@ -24,6 +24,8 @@ broken by hairline cracks between patches comes back closed. `section_loops`
 (the loft's cutter) keeps its older behaviour of closing every chain by its
 chord.
 """
+import math
+
 import numpy as np
 
 from .profile_fit import (_arc_mid, segment_polyline, snap_profile, solve_junctions,
@@ -924,3 +926,30 @@ def section_preview(V, F, origin, normal, tol=0.08, join_mm=0.0, closed_only=Fal
             polys.append(to_3d(prim_points(prims, closed=False), frame).tolist())
     return {'origin': np.asarray(sec['origin']).tolist(), 'normal': np.asarray(sec['normal']).tolist(),
             'loops': loops, 'open': opens, 'polylines': polys, 'stats': sec['stats']}
+
+
+# ---------------------------------------------------------------------------
+# a stack of planes (x-ray)
+
+# a plane is never put exactly on a flat end face of the part: the cut
+# there is degenerate (every triangle of the face lies in the plane)
+STACK_EDGE_MM = 1e-3
+
+
+def stack_offsets(frm, to, step, half_extent, edge=STACK_EDGE_MM, tol=1e-9):
+    """Plane offsets (mm from the bounding-box centre) of a stack from
+    `frm` to `to` every `step`: frm + k*step for every k that stays at or
+    under `to`, and `to` itself as the last plane when the last multiple
+    falls short, so the end plane the user chose is always cut. Both ends
+    are clamped to +-(half_extent - edge); frm > to is swapped; step <= 0
+    or frm == to gives just the one plane."""
+    lo, hi = sorted((float(frm), float(to)))
+    lim = max(0.0, float(half_extent) - edge)
+    lo, hi = min(max(lo, -lim), lim), min(max(hi, -lim), lim)
+    if step <= 0 or hi - lo <= tol:
+        return [lo]
+    n = int(math.floor((hi - lo) / step + tol))
+    out = [lo + k * step for k in range(n + 1)]     # k*step, never accumulated
+    if hi - out[-1] > tol:
+        out.append(hi)
+    return out

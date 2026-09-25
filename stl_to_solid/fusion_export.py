@@ -480,3 +480,203 @@ def emit_fusion_sections_script(sections):
         '',
     ]
     return '\n'.join(L) + '\n'
+
+
+# ---------------------------------------------------------------------------
+# x-ray: a stack of section sketches, data + a drawing loop
+
+_XRAY_RUNTIME = """
+
+def draw_prims(sketch, prims):
+    \"\"\"Draw one fitted loop or open chain (3-D mm primitives) into `sketch`:
+    real lines, three-point arcs, a circle for a whole-circle loop, fitted
+    splines for spline stretches. Nothing here closes a chain: a loop
+    closes because its primitives share end points, an open chain stays
+    open. Returns the curve count.\"\"\"
+    curves = sketch.sketchCurves
+
+    def P(p):
+        return sketch.modelToSketchSpace(
+            adsk.core.Point3D.create(p[0] / 10.0, p[1] / 10.0, p[2] / 10.0))
+
+    if isinstance(prims, dict):                      # full circle
+        curves.sketchCircles.addByCenterRadius(P(prims['center3']), float(prims['r']) / 10.0)
+        return 1
+    n = 0
+    for p in prims:
+        if p['type'] == 'line':
+            curves.sketchLines.addByTwoPoints(P(p['p0']), P(p['p1']))
+        elif p['type'] == 'arc':
+            curves.sketchArcs.addByThreePoints(P(p['p0']), P(p['mid']), P(p['p1']))
+        else:
+            pc = adsk.core.ObjectCollection.create()
+            for q in p['pts']:
+                pc.add(P(q))
+            curves.sketchFittedSplines.add(pc)
+        n += 1
+    return n
+
+
+def draw_section(sketch, sec):
+    \"\"\"All loops (outer + holes) and open chains of one section. Returns
+    the curve count.\"\"\"
+    n = 0
+    for outer, holes in sec['loops']:
+        n += draw_prims(sketch, outer)
+        for h in holes:
+            n += draw_prims(sketch, h)
+    for chain in sec.get('open', []):
+        n += draw_prims(sketch, chain)
+    return n
+
+
+def _extrude_slice(root, sketch, dist_cm, bodies):
+    \"\"\"Extrude every profile of `sketch` by `dist_cm` (signed, along the
+    sketch normal), one profile at a time: joined to the bodies made so
+    far when it touches one of them, a new body otherwise (a feature that
+    appears mid-stack starts its own body; Fusion refuses a Join that
+    touches nothing, and one such profile must not cost the slice).
+    `bodies` is extended in place. Returns the number of profiles
+    extruded. With Outline only the profiles are just the outer regions;
+    otherwise inner loops are filled too.\"\"\"
+    if sketch.profiles.count == 0:
+        raise RuntimeError('no closed profile to extrude')
+    ops = adsk.fusion.FeatureOperations
+    ext = root.features.extrudeFeatures
+    made = 0
+    for i in range(sketch.profiles.count):
+        prof = sketch.profiles.item(i)
+        feat = None
+        if bodies:
+            try:
+                inp = ext.createInput(prof, ops.JoinFeatureOperation)
+                inp.setDistanceExtent(False, adsk.core.ValueInput.createByReal(dist_cm))
+                inp.participantBodies = [b for b in bodies if b.isValid]
+                feat = ext.add(inp)
+            except Exception:
+                feat = None
+        if feat is None:
+            inp = ext.createInput(prof, ops.NewBodyFeatureOperation)
+            inp.setDistanceExtent(False, adsk.core.ValueInput.createByReal(dist_cm))
+            feat = ext.add(inp)
+            for k in range(feat.bodies.count):
+                bodies.append(feat.bodies.item(k))
+        made += 1
+    return made
+
+
+def run(context):
+    ui = None
+    prog = None
+    try:
+        app = adsk.core.Application.get()
+        ui = app.userInterface
+        design = adsk.fusion.Design.cast(app.activeProduct)
+        root = design.rootComponent
+        n = len(SECTIONS)
+        prog = ui.createProgressDialog()
+        prog.isCancelButtonShown = True
+        prog.show(TITLE, 'Sketch %v of %m', 0, n, 0)
+        made, n_ext, cancelled, bodies, notes = 0, 0, False, [], []
+        for i, sec in enumerate(SECTIONS):
+            prog.progressValue = i
+            adsk.doEvents()
+            if prog.wasCancelled:
+                cancelled = True
+                break
+            if not sec['loops'] and not sec.get('open'):
+                continue                              # the plane misses the part
+            origin_cm = tuple(c / 10.0 for c in sec['origin'])
+            pl, sgn = _plane(root, origin_cm, tuple(sec['normal']))
+            pl.name = 'plane ' + sec['name']
+            sk = root.sketches.add(pl)
+            sk.name = sec['name']
+            sk.isComputeDeferred = True               # hundreds of curves, one recompute
+            try:
+                draw_section(sk, sec)
+            finally:
+                sk.isComputeDeferred = False
+            made += 1
+            if sec.get('extrude_mm'):
+                try:
+                    _extrude_slice(root, sk, sgn * sec['extrude_mm'] / 10.0, bodies)
+                    n_ext += 1
+                except Exception:
+                    why = traceback.format_exc().strip().splitlines()[-1]
+                    notes.append('%s: extrude failed: %s' % (sk.name, why))
+        prog.hide()
+        msg = 'stlToSolid %s: drew %d of %d section sketch(es)' % (TITLE, made, n)
+        if cancelled:
+            msg += ' (stopped)'
+        if n_ext:
+            msg += ', extruded %d' % n_ext
+        if notes:
+            msg += '\\n' + '\\n'.join(notes[:10])
+        ui.messageBox(msg)
+    except:
+        if prog is not None:
+            try:
+                prog.hide()
+            except Exception:
+                pass
+        if ui:
+            ui.messageBox('stlToSolid X-Ray script failed:\\n{}'.format(traceback.format_exc()))
+"""
+
+
+def _xray_round(x, nd=4):
+    """Plain lists / dicts of rounded floats for embedding in the script."""
+    if isinstance(x, dict):
+        return {k: _xray_round(v, nd) for k, v in x.items()}
+    if isinstance(x, (list, tuple)):
+        return [_xray_round(v, nd) for v in x]
+    if isinstance(x, np.ndarray):
+        return _xray_round(x.tolist(), nd)
+    if isinstance(x, (float, np.floating)):
+        return round(float(x), nd)
+    if isinstance(x, (int, np.integer, str)) or x is None:
+        return x
+    return x
+
+
+def emit_fusion_xray_script(sections, title='X-Ray'):
+    """Fusion script for a stack of section sketches, the way the add-in
+    does it: the sections are embedded once as data and a small loop draws
+    them (one construction plane + one sketch each, curves drawn with
+    compute deferred), with a progress dialog that can be cancelled.
+    `sections` is a list of {'origin' (mm), 'normal', 'name', 'loops':
+    [(outer_prims3d, [hole_prims3d...])], 'open': [prims3d...],
+    'extrude_mm': None | signed mm} with the primitives' points already
+    in 3-D mm (section_fit.lift_prims). A section with 'extrude_mm' set
+    is extruded that far along its normal after drawing (every profile,
+    joined to the slabs so far), so the stack comes out as solid slices."""
+    data = []
+    for i, sec in enumerate(sections):
+        data.append(_xray_round({
+            'name': sec.get('name', f'section {i + 1}'),
+            'origin': list(sec['origin']), 'normal': list(sec['normal']),
+            'loops': [[outer, list(holes)] for outer, holes in sec['loops']],
+            'open': list(sec.get('open', [])),
+            'extrude_mm': sec.get('extrude_mm'),
+        }))
+    L = [
+        '"""Generated by stlToSolid — X-Ray: a stack of mesh section sketches (like',
+        'Create Mesh Section Sketch + Fit Curves to Mesh Section for every slice at',
+        'once): one construction plane and one sketch per section, lines / arcs /',
+        'circles where the outline is clean, fitted splines where it is not.',
+        'Fusion API units are centimetres; the data below is mm and is divided by',
+        '10 when drawn."""',
+        'import adsk.core, adsk.fusion, traceback',
+        '',
+        f'TITLE = {title!r}',
+        '',
+        '# one entry per section: name, origin (mm), normal, loops [[outer, [holes]]],',
+        '# open chains, extrude_mm (None, or how far to extrude towards the next plane)',
+        'SECTIONS = [',
+    ]
+    L += [f'    {e!r},' for e in data]
+    L += [']', '', '']
+    base = emit_fusion_script([])
+    L.append(base[base.index('def _plane('):base.index('def _pick(')].rstrip('\n'))
+    L.append(_XRAY_RUNTIME)
+    return '\n'.join(L)

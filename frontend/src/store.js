@@ -41,11 +41,21 @@ export const DEFAULT_PARAMS = {
   slice_range_dir: '-',
 }
 
+// the most sketches one x-ray script may hold (backend/sections.XRAY_MAX)
+export const XRAY_MAX = 500
+// planes are kept this far inside the part's ends (section_fit.STACK_EDGE_MM)
+const XRAY_EDGE = 1e-3
+
 let pollTimer = null
 let traceSeq = 0
+let xraySeq = 0
 
 export const useConvertStore = defineStore('convert', {
   state: () => ({
+    // which tool the top toolbar has picked: 'solid' (Mesh -> Solid, the
+    // auto ladder), 'loft' (Sliced Loft) or 'xray' (section sketches). It
+    // decides what the rail shows; params.method follows it for the API.
+    tool: 'solid',
     // idle -> uploading -> ready -> running -> done | error
     status: 'idle',
     jobId: null,
@@ -80,6 +90,21 @@ export const useConvertStore = defineStore('convert', {
     section: null,
     sectionBusy: false,
     sectionError: null,
+    // x-ray: a stack of slices from the start plane to the end plane every
+    // xraySpacing mm (all mm from the centre along the resolved axis). The
+    // slices are traced one after another and every trace stays in the 3D
+    // view (xrayTraces, in plane order, of xrayTotal), so the stack shows
+    // up slice by slice like an x-ray; xrayTraceMs is the mean time per
+    // slice (the estimate); xrayExtrude also extrudes each slice to the next
+    xrayFrom: 0,
+    xrayTo: 0,
+    xraySpacing: 0.2,
+    xrayExtrude: false,
+    xrayTraces: [],
+    xrayTotal: 0,
+    xrayBusy: false,
+    xrayError: null,
+    xrayTraceMs: null,
   }),
 
   getters: {
@@ -119,17 +144,13 @@ export const useConvertStore = defineStore('convert', {
     sectionScriptUrl: (s) => {
       const a = s.resolvedSliceAxis
       if (!s.jobId || !a) return null
-      const q = new URLSearchParams({ axis: a, offset: String(s.sliceOffset), tol: String(s.params.tol),
-                                      units: s.params.units, scale: String(s.params.scale),
-                                      join: String(s.params.slice_join), outline: s.sliceOutline ? 'true' : 'false',
-                                      trim: String(s.params.slice_trim || 0) })
-      return `/api/jobs/${s.jobId}/section-script?${q}`
+      return `/api/jobs/${s.jobId}/section-script?${sectionQuery(s, s.sliceOffset)}`
     },
-    // The axis the sliced loft will cut along, with 'auto' resolved to the
-    // file's longest side the way sliced_loft.axis_index does; null when
-    // the loft is not the chosen method. Drives the plane in the 3D view.
+    // The axis the slices are cut across, with 'auto' resolved to the
+    // file's longest side the way sliced_loft.axis_index does; null unless
+    // a slicing tool (loft, x-ray) is up. Drives the plane in the 3D view.
     resolvedSliceAxis: (s) => {
-      if (s.params.method !== 'loft') return null
+      if (s.tool !== 'loft' && s.tool !== 'xray') return null
       const a = s.params.slice_axis
       if (a === 'x' || a === 'y' || a === 'z') return a
       const bb = s.inputStats?.bbox_mm
@@ -140,6 +161,69 @@ export const useConvertStore = defineStore('convert', {
       s.status === 'done' && s.result?.ok && s.result?.has_bfill_script
         ? `/api/jobs/${s.jobId}/fusion-bfill-script`
         : null,
+    // What the 3D view draws for the current tool: the slicing planes
+    // [{ axis, offset (mm from centre), kind: 'single' | 'start' | 'end' }]
+    // and the traced sections that sit on them, in the same order.
+    viewPlanes: (s) => {
+      const a = s.resolvedSliceAxis
+      if (!a) return []
+      if (s.tool === 'loft') return [{ axis: a, offset: s.sliceOffset, kind: 'single' }]
+      if (s.tool === 'xray') {
+        if (s.xrayFrom === s.xrayTo) return [{ axis: a, offset: s.xrayFrom, kind: 'single' }]
+        return [{ axis: a, offset: s.xrayFrom, kind: 'start' }, { axis: a, offset: s.xrayTo, kind: 'end' }]
+      }
+      return []
+    },
+    viewSections: (s) => {
+      if (!s.resolvedSliceAxis) return []
+      if (s.tool === 'loft') return s.section ? [s.section] : []
+      if (s.tool === 'xray') {
+        const n = s.xrayTotal
+        return s.xrayTraces.map((sec, i) => ({
+          ...sec,
+          kind: n === 1 ? 'single' : i === 0 ? 'start' : i === n - 1 ? 'end' : 'mid',
+        }))
+      }
+      return []
+    },
+    // the traced start plane (the first slice) and end plane (the last,
+    // once the whole stack is traced)
+    xrayStartSection: (s) => s.xrayTraces[0] || null,
+    xrayEndSection: (s) =>
+      (s.xrayTotal > 0 && s.xrayTraces.length === s.xrayTotal ? s.xrayTraces[s.xrayTotal - 1] : null),
+    // Where the x-ray's planes go: the JS mirror of section_fit.stack_offsets
+    // (swap, clamp just inside the part, from + k*step, the end plane always
+    // included), so the count is live without a server round trip.
+    xrayOffsets: (s) => {
+      const h = s.sliceHalfExtent
+      if (!(h > 0)) return []
+      const lim = Math.max(0, h - XRAY_EDGE)
+      let [lo, hi] = [Number(s.xrayFrom) || 0, Number(s.xrayTo) || 0].sort((a, b) => a - b)
+      lo = Math.min(Math.max(lo, -lim), lim)
+      hi = Math.min(Math.max(hi, -lim), lim)
+      const step = Number(s.xraySpacing)
+      if (!(step > 0) || hi - lo <= 1e-9) return [lo]
+      const n = Math.floor((hi - lo) / step + 1e-9)
+      const out = []
+      for (let k = 0; k <= n; k++) out.push(lo + k * step)
+      if (hi - out[out.length - 1] > 1e-9) out.push(hi)
+      return out
+    },
+    xrayCount: (s) => s.xrayOffsets.length,
+    xrayOverCap: (s) => s.xrayCount > XRAY_MAX,
+    // seconds the script will take to build, from the last trace's time
+    xrayEstimateS: (s) => (s.xrayTraceMs ? (s.xrayCount * s.xrayTraceMs) / 1000 : null),
+    xrayScriptUrl: (s) => {
+      const a = s.resolvedSliceAxis
+      if (!s.jobId || !a || s.xrayCount < 1 || s.xrayOverCap) return null
+      const q = sectionQuery(s, 0)
+      q.delete('offset')
+      q.set('from', String(s.xrayFrom))
+      q.set('to', String(s.xrayTo))
+      q.set('step', String(s.xraySpacing))
+      if (s.xrayExtrude && s.xrayCount > 1) q.set('extrude', 'true')
+      return `/api/jobs/${s.jobId}/xray-script?${q}`
+    },
   },
 
   actions: {
@@ -159,6 +243,8 @@ export const useConvertStore = defineStore('convert', {
           status: 'ready', jobId: data.id, inputStats: data.input_stats,
           bodies: [], triangleBody: null, selected: [], hovered: -1,
           sliceOffset: 0, sliceOutline: false, section: null, sectionError: null,
+          xrayFrom: 0, xrayTo: 0, xrayExtrude: false, xrayTraces: [], xrayTotal: 0,
+          xrayError: null, xrayTraceMs: null,
         })
         this.loadBodies()
       } catch (e) {
@@ -274,25 +360,75 @@ export const useConvertStore = defineStore('convert', {
       pollTimer = null
     },
 
+    // The toolbar's choice. The only place params.method is set: the
+    // sliced loft is a conversion method, the other two tools use the
+    // auto ladder (x-ray never converts at all).
+    setTool(t) {
+      this.tool = t
+      this.params.method = t === 'loft' ? 'loft' : 'auto'
+    },
+
     resetParams() {
-      this.params = { ...DEFAULT_PARAMS }
+      this.params = { ...DEFAULT_PARAMS, method: this.tool === 'loft' ? 'loft' : 'auto' }
+    },
+
+    // One traced section at `offset` mm from the centre on the resolved
+    // axis, as /section returns it. Throws on any failure.
+    async fetchSection(offset) {
+      const res = await fetch(`/api/jobs/${this.jobId}/section?${sectionQuery(this, offset)}`)
+      if (!res.ok) throw new Error(await errText(res))
+      return res.json()
+    },
+
+    // Trace the x-ray's slices one after another, first to last, keeping
+    // every trace so the stack appears slice by slice in the 3D view. Over
+    // the script's limit only the two end planes are traced. Debounced by
+    // the caller; any change (or stopXray) makes the loop stop at once.
+    async traceXray() {
+      if (!this.jobId || !this.resolvedSliceAxis) return
+      const mine = ++xraySeq
+      const all = this.xrayOffsets
+      const offs = this.xrayOverCap ? [all[0], all[all.length - 1]] : all
+      this.$patch({ xrayTraces: [], xrayTotal: offs.length, xrayBusy: true, xrayError: null })
+      const t0 = performance.now()
+      try {
+        for (let i = 0; i < offs.length; i++) {
+          const sec = await this.fetchSection(offs[i])
+          if (mine !== xraySeq) return
+          // a new array each time, so the viewer's watcher sees the change
+          this.xrayTraces = [...this.xrayTraces, sec]
+          this.xrayTraceMs = (performance.now() - t0) / (i + 1)
+        }
+      } catch (e) {
+        if (mine === xraySeq) this.xrayError = e.message
+      } finally {
+        if (mine === xraySeq) this.xrayBusy = false
+      }
+    },
+
+    // stop the slice-by-slice trace where it is (the traces so far stay)
+    stopXray() {
+      xraySeq++
+      this.xrayBusy = false
+    },
+
+    // the whole part, end to end (the clamp keeps the planes just inside)
+    xrayWholePart() {
+      const h = this.sliceHalfExtent
+      if (!(h > 0)) return
+      const lim = Math.max(0, h - XRAY_EDGE)
+      this.xrayFrom = -lim
+      this.xrayTo = lim
     },
 
     // Trace the slice at the current offset. Debounced by the caller (the
     // slider fires continuously); a stale answer is dropped.
     async traceSection() {
-      const a = this.resolvedSliceAxis
-      if (!this.jobId || !a) return
-      const q = new URLSearchParams({ axis: a, offset: String(this.sliceOffset), tol: String(this.params.tol),
-                                      units: this.params.units, scale: String(this.params.scale),
-                                      join: String(this.params.slice_join), outline: this.sliceOutline ? 'true' : 'false',
-                                      trim: String(this.params.slice_trim || 0) })
+      if (!this.jobId || !this.resolvedSliceAxis) return
       const mine = ++traceSeq
       this.sectionBusy = true
       try {
-        const res = await fetch(`/api/jobs/${this.jobId}/section?${q}`)
-        if (!res.ok) throw new Error(await errText(res))
-        const sec = await res.json()
+        const sec = await this.fetchSection(this.sliceOffset)
         if (mine !== traceSeq) return
         this.section = sec
         this.sectionError = null
@@ -304,6 +440,17 @@ export const useConvertStore = defineStore('convert', {
     },
   },
 })
+
+// The query every section trace and sketch download shares: the plane
+// (axis + offset from centre) and the fit settings.
+function sectionQuery(s, offset) {
+  return new URLSearchParams({
+    axis: s.resolvedSliceAxis, offset: String(offset), tol: String(s.params.tol),
+    units: s.params.units, scale: String(s.params.scale),
+    join: String(s.params.slice_join), outline: s.sliceOutline ? 'true' : 'false',
+    trim: String(s.params.slice_trim || 0),
+  })
+}
 
 async function errText(res) {
   try {

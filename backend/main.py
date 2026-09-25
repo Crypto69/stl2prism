@@ -5,7 +5,7 @@ from typing import Optional, Literal
 
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, HTTPException, UploadFile
+from fastapi import FastAPI, HTTPException, Query, UploadFile
 from fastapi.concurrency import run_in_threadpool
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
@@ -50,6 +50,10 @@ app.add_middleware(CORSMiddleware, allow_origins=['*'],
                    allow_methods=['*'], allow_headers=['*'])
 
 MAX_UPLOAD = int(os.environ.get('STLTOSOLID_MAX_UPLOAD', 200 * 1024 * 1024))
+# seconds an x-ray script may spend fitting its slices before it gives up
+# (the download is one synchronous request; Firefox drops a response after
+# 300 s)
+XRAY_BUDGET_S = float(os.environ.get('STLTOSOLID_XRAY_BUDGET', 240))
 
 
 class ConvertParams(BaseModel):
@@ -192,6 +196,30 @@ def _input_path(job_id):
 _AXES = ('x', 'y', 'z')
 
 
+def _check_slice_params(axis, tol, join, trim, step=None):
+    if axis not in _AXES:
+        raise HTTPException(400, 'axis must be x, y or z')
+    if not (0 < tol <= 5):
+        raise HTTPException(400, 'tol must be in (0, 5] mm')
+    if not (0 <= join <= 20):
+        raise HTTPException(400, 'join must be in [0, 20] mm')
+    if not (0 <= trim <= 5):
+        raise HTTPException(400, 'trim must be in [0, 5] mm')
+    if step is not None and not (0 < step <= 50):
+        raise HTTPException(400, 'step must be in (0, 50] mm')
+
+
+def _safe_stem(job):
+    stem = _EXT_RE.sub('', job.get('filename') or 'part')
+    return re.sub(r'[^\w.-]+', '_', stem) or 'part'
+
+
+def _py_attachment(text, filename):
+    from fastapi.responses import Response
+    return Response(text, media_type='text/x-python',
+                    headers={'Content-Disposition': f'attachment; filename="{filename}"'})
+
+
 @app.get('/api/jobs/{job_id}/section')
 async def section(job_id: str, axis: str = 'z', offset: float = 0.0, tol: float = 0.08,
                   units: str = 'mm', scale: float = 1.0, join: float = 2.5,
@@ -205,14 +233,7 @@ async def section(job_id: str, axis: str = 'z', offset: float = 0.0, tol: float 
     slivers thinner than that many mm out of the closed loops (0 = off).
     Returns the curves as 3-D polylines (mm, converted frame) for the
     viewer plus the fit statistics."""
-    if axis not in _AXES:
-        raise HTTPException(400, 'axis must be x, y or z')
-    if not (0 < tol <= 5):
-        raise HTTPException(400, 'tol must be in (0, 5] mm')
-    if not (0 <= join <= 20):
-        raise HTTPException(400, 'join must be in [0, 20] mm')
-    if not (0 <= trim <= 5):
-        raise HTTPException(400, 'trim must be in [0, 5] mm')
+    _check_slice_params(axis, tol, join, trim)
     _, src = _input_path(job_id)
     from .sections import trace
     try:
@@ -229,12 +250,7 @@ async def section_script(job_id: str, axis: str = 'z', offset: float = 0.0, tol:
     """The same section as a Fusion 360 script: one construction plane
     and one sketch of lines, arcs, circles and fitted splines (Create Mesh
     Section Sketch + Fit Curves to Mesh Section, in one go)."""
-    if axis not in _AXES:
-        raise HTTPException(400, 'axis must be x, y or z')
-    if not (0 <= join <= 20):
-        raise HTTPException(400, 'join must be in [0, 20] mm')
-    if not (0 <= trim <= 5):
-        raise HTTPException(400, 'trim must be in [0, 5] mm')
+    _check_slice_params(axis, tol, join, trim)
     job, src = _input_path(job_id)
     from .sections import trace
     from stl_to_solid.fusion_export import emit_fusion_sections_script
@@ -247,12 +263,76 @@ async def section_script(job_id: str, axis: str = 'z', offset: float = 0.0, tol:
     text = emit_fusion_sections_script([{'origin': sec['origin'], 'normal': sec['normal'],
                                          'name': name, 'loops': sec['loops'],
                                          'open': sec['open']}])
-    stem = _EXT_RE.sub('', job.get('filename') or 'part')
-    safe = re.sub(r'[^\w.-]+', '_', stem) or 'part'
-    from fastapi.responses import Response
-    return Response(text, media_type='text/x-python',
-                    headers={'Content-Disposition':
-                             f'attachment; filename="{safe}_section_{axis}{offset:+.1f}.py"'})
+    return _py_attachment(text, f'{_safe_stem(job)}_section_{axis}{offset:+.1f}.py')
+
+
+@app.get('/api/jobs/{job_id}/xray')
+async def xray(job_id: str, axis: str = 'z', frm: float = Query(0.0, alias='from'),
+               to: float = 0.0, step: float = 0.2, units: str = 'mm', scale: float = 1.0):
+    """Where an x-ray's planes would go: the offsets (mm from the centre)
+    of a stack from `from` to `to` every `step`, the end plane always
+    included, both ends kept just inside the part. Cheap (no cut, no
+    fit): the count and whether it is over the script's limit."""
+    _check_slice_params(axis, 0.08, 0, 0, step)
+    _, src = _input_path(job_id)
+    from .sections import half_extent, XRAY_MAX
+    from stl_to_solid.section_fit import stack_offsets
+    try:
+        h = await run_in_threadpool(half_extent, src, axis, units, scale)
+    except Exception as e:
+        raise HTTPException(400, f'could not read the mesh: {e}')
+    offs = stack_offsets(frm, to, step, h)
+    return {'axis': axis, 'from': frm, 'to': to, 'step': step, 'half_extent': h,
+            'offsets': offs, 'count': len(offs), 'max': XRAY_MAX, 'over_cap': len(offs) > XRAY_MAX}
+
+
+@app.get('/api/jobs/{job_id}/xray-script')
+async def xray_script(job_id: str, axis: str = 'z', frm: float = Query(0.0, alias='from'),
+                      to: float = 0.0, step: float = 0.2, tol: float = 0.08,
+                      units: str = 'mm', scale: float = 1.0, join: float = 2.5,
+                      outline: bool = False, trim: float = 0.0, extrude: bool = False):
+    """A stack of section sketches from `from` to `to` every `step` mm as
+    one Fusion 360 script: a construction plane and a fully enclosed
+    sketch per slice (lines, arcs, circles, fitted splines), drawn by the
+    script with a progress dialog. `extrude` also extrudes every slice to
+    the next plane, so the stack comes out as solid slabs. At most
+    XRAY_MAX slices and XRAY_BUDGET_S seconds of fitting."""
+    _check_slice_params(axis, tol, join, trim, step)
+    job, src = _input_path(job_id)
+    from .sections import half_extent, trace_stack, XRAY_MAX
+    from stl_to_solid.section_fit import stack_offsets
+    from stl_to_solid.fusion_export import emit_fusion_xray_script
+    try:
+        h = await run_in_threadpool(half_extent, src, axis, units, scale)
+    except Exception as e:
+        raise HTTPException(400, f'could not read the mesh: {e}')
+    offs = stack_offsets(frm, to, step, h)
+    if len(offs) > XRAY_MAX:
+        raise HTTPException(400, f'{len(offs)} slices is over the limit of {XRAY_MAX}; raise the '
+                                 'spacing or narrow the range')
+    try:
+        secs = await run_in_threadpool(trace_stack, src, axis, offs, tol, units, scale, join,
+                                       outline, trim, XRAY_BUDGET_S)
+    except TimeoutError as e:
+        raise HTTPException(400, str(e))
+    except Exception as e:
+        raise HTTPException(400, f'could not trace the sections: {e}')
+    n = len(secs)
+    sections = []
+    for i, sec in enumerate(secs):
+        ext = None
+        if extrude and n > 1:
+            # to the next plane; the last slice goes one spacing further,
+            # like the add-in, so the stack ends flush with a full slab
+            ext = (secs[i + 1]['at'] - sec['at']) if i + 1 < n else step
+        sections.append({'origin': sec['origin'], 'normal': sec['normal'],
+                         'name': f"xray {axis.upper()}={sec['at']:.2f} mm ({i + 1}/{n})",
+                         'loops': sec['loops'], 'open': sec['open'], 'extrude_mm': ext})
+    lo, hi = sorted((frm, to))
+    title = f'X-Ray {axis.upper()} {lo:+.1f}..{hi:+.1f} mm every {step:g} mm'
+    text = emit_fusion_xray_script(sections, title=title)
+    suffix = '_solid' if extrude and n > 1 else ''
+    return _py_attachment(text, f'{_safe_stem(job)}_xray_{axis}{lo:+.1f}_{hi:+.1f}_s{step:g}{suffix}.py')
 
 
 @app.get('/api/jobs/{job_id}/preview')
@@ -275,8 +355,7 @@ def script(job_id: str):
     path = os.path.join(jobs.job_dir(job_id), 'output.py')
     if not os.path.exists(path):
         raise HTTPException(404, 'no script')
-    stem = _EXT_RE.sub('', job.get('filename') or 'part')
-    safe = re.sub(r'[^\w.-]+', '_', stem) or 'part'
+    safe = _safe_stem(job)
     return FileResponse(path, media_type='text/x-python', filename=f'{safe}.py')
 
 
@@ -288,8 +367,7 @@ def fusion_script(job_id: str):
     path = os.path.join(jobs.job_dir(job_id), 'output_fusion.py')
     if not os.path.exists(path):
         raise HTTPException(404, 'no script')
-    stem = _EXT_RE.sub('', job.get('filename') or 'part')
-    safe = re.sub(r'[^\w.-]+', '_', stem) or 'part'
+    safe = _safe_stem(job)
     return FileResponse(path, media_type='text/x-python', filename=f'{safe}_fusion.py')
 
 
@@ -302,8 +380,7 @@ def fusion_bfill_script(job_id: str):
     path = os.path.join(jobs.job_dir(job_id), 'output_fusion_bfill.py')
     if not os.path.exists(path):
         raise HTTPException(404, 'no script')
-    stem = _EXT_RE.sub('', job.get('filename') or 'part')
-    safe = re.sub(r'[^\w.-]+', '_', stem) or 'part'
+    safe = _safe_stem(job)
     return FileResponse(path, media_type='text/x-python', filename=f'{safe}_fusion_bfill.py')
 
 
@@ -315,8 +392,7 @@ def download(job_id: str):
     path = os.path.join(jobs.job_dir(job_id), 'output.step')
     if not os.path.exists(path):
         raise HTTPException(404, 'no output yet')
-    stem = _EXT_RE.sub('', job.get('filename') or 'part')
-    safe = re.sub(r'[^\w.-]+', '_', stem) or 'part'
+    safe = _safe_stem(job)
     return FileResponse(path, media_type='application/step',
                         filename=f'{safe}.step')
 

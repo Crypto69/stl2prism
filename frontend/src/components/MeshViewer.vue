@@ -19,15 +19,15 @@ const props = defineProps({
   selected: { type: Array, default: () => [] },
   // body index under the cursor in the list, highlighted in the scene
   hovered: { type: Number, default: -1 },
-  // 'x' | 'y' | 'z' when the sliced loft is chosen: the viewer draws a
-  // labelled XYZ triad (Fusion's colours) and a translucent slicing
-  // plane across that axis, so the dropdown's letter has a picture
-  sliceAxis: { type: String, default: null },
-  // where the single slice sits: mm (converted units) from the box centre
-  sliceOffset: { type: Number, default: 0 },
-  // the traced section from /section: { polylines: [[[x,y,z]...]...] } in
-  // converted mm, drawn as bright curves on the plane
-  section: { type: Object, default: null },
+  // slicing planes, when a slicing tool is up: [{ axis: 'x'|'y'|'z',
+  // offset: mm (converted units) from the box centre, kind: 'single' |
+  // 'start' | 'end' }]. The viewer draws a labelled XYZ triad (Fusion's
+  // colours) for the axis and one translucent plane per entry.
+  planes: { type: Array, default: () => [] },
+  // traced sections from /section, one per plane in the same order:
+  // { polylines: [[[x,y,z]...]...] } in converted mm, drawn as bright
+  // curves on the plane
+  sections: { type: Array, default: () => [] },
 })
 const emit = defineEmits(['pick', 'hover'])
 
@@ -35,6 +35,8 @@ const host = ref(null)
 const rawSize = ref(null)  // in file units
 const dims = computed(() =>
   rawSize.value && rawSize.value.map((v) => (v * props.unitScale).toFixed(1)))
+// the axis the planes cut across (all planes share it)
+const sliceAxis = computed(() => props.planes[0]?.axis || null)
 
 let renderer, scene, camera, controls, mesh, grid, frameId, resizeObs
 let raycaster, pointer, triToBody = null, faceStart = null
@@ -42,7 +44,7 @@ let raycaster, pointer, triToBody = null, faceStart = null
 // every helper hang off it, so the mesh can be hidden on its own
 let frame = null
 // helpers drawn in the part's frame: the triad, the slice plane, the trace
-let triad = null, slicePlane = null, localBox = null, sectionLines = null
+let triad = null, planeGroup = null, localBox = null, sectionLines = null
 // view tools (Fusion's bottom toolbar): which mouse tool the left button
 // drives, and whether the mesh is shown
 const tool = ref('orbit')          // 'orbit' | 'pan' | 'zoom'
@@ -53,6 +55,10 @@ const TOOL_CURSOR = { orbit: '', pan: 'grab', zoom: 'ns-resize' }
 // the ViewCube: its own little scene, drawn into a corner of the same canvas
 let cubeScene, cubeCamera, cube, cubeFaces = [], cubeHover = -1, snapAnim = null
 const CUBE_PX = 132, CUBE_MARGIN = 12
+// the ViewCube's corner in GL viewport coordinates (origin bottom-left):
+// top-right of the canvas, where Fusion and most CAD keep it
+const cubeOrigin = () => [renderer.domElement.clientWidth - CUBE_MARGIN - CUBE_PX,
+                          renderer.domElement.clientHeight - CUBE_MARGIN - CUBE_PX]
 let meshShift = null   // file-frame translation applied to the geometry
 
 // Fusion's axis colours: X red, Y green, Z blue
@@ -252,7 +258,7 @@ watch(() => [props.selected, props.hovered], paintBodies, { deep: true })
 function loadMesh({ data, kind }) {
   if (mesh) {
     if (triad) { frame.remove(triad); triad = null }
-    if (slicePlane) { frame.remove(slicePlane); slicePlane = null }
+    if (planeGroup) { frame.remove(planeGroup); planeGroup = null }
     if (sectionLines) { frame.remove(sectionLines); sectionLines = null }
     frame.remove(mesh)
     mesh.geometry.dispose()
@@ -297,8 +303,8 @@ function loadMesh({ data, kind }) {
   frame.add(mesh)
   paintBodies()
   drawTriad()
-  drawSlicePlane()
-  drawSection()
+  drawPlanes()
+  drawSections()
 
   const span = Math.max(size.x, size.y, size.z)
   grid = new THREE.GridHelper(span * 3, 30, 0x3a4350, 0x242a33)
@@ -369,10 +375,10 @@ function drawTriad() {
   triad = new THREE.Group()
   const dirs = { x: new THREE.Vector3(1, 0, 0), y: new THREE.Vector3(0, 1, 0), z: new THREE.Vector3(0, 0, 1) }
   for (const k of ['x', 'y', 'z']) {
-    const on = props.sliceAxis === k
+    const on = sliceAxis.value === k
     const arrow = new THREE.ArrowHelper(dirs[k], origin, L, AXIS_COLOR[k], L * 0.14, L * 0.07)
     arrow.line.material.linewidth = 2
-    if (props.sliceAxis && !on) {
+    if (sliceAxis.value && !on) {
       arrow.line.material.transparent = arrow.cone.material.transparent = true
       arrow.line.material.opacity = arrow.cone.material.opacity = 0.45
     }
@@ -386,71 +392,112 @@ function drawTriad() {
   frame.add(triad)
 }
 
-// One translucent slice across the chosen axis, in that axis's colour, at
-// the slider's position: the plane the single-slice trace is cut on.
-function drawSlicePlane() {
-  if (slicePlane) {
-    frame?.remove(slicePlane)
-    slicePlane.traverse((o) => { o.geometry?.dispose(); o.material?.dispose?.() })
-    slicePlane = null
+// One translucent slice per plane across the chosen axis, in that axis's
+// colour, at its offset: the planes the section traces are cut on. A
+// 'start' plane is drawn like a single one; an 'end' plane is fainter
+// with a dashed edge, so a pair reads as a range.
+function drawPlanes() {
+  if (planeGroup) {
+    frame?.remove(planeGroup)
+    planeGroup.traverse((o) => { o.geometry?.dispose(); o.material?.dispose?.() })
+    planeGroup = null
   }
-  if (!mesh || !localBox || !props.sliceAxis) return
-  const k = props.sliceAxis
+  const k = sliceAxis.value
+  if (!mesh || !localBox || !k || !props.planes.length) return
   const size = new THREE.Vector3()
   const center = new THREE.Vector3()
   localBox.getSize(size)
   localBox.getCenter(center)
+  const span = Math.max(size.x, size.y, size.z)
   const pad = 1.15
   // plane geometry lies in XY facing +Z; rotate it to face the axis
   const w = k === 'x' ? size.y : size.x
   const h = k === 'z' ? size.y : size.z
-  slicePlane = new THREE.Group()
-  // the plane sits at the slider's offset (converted mm -> file units),
-  // clamped to the box
-  const off = (props.sliceOffset || 0) / (props.unitScale || 1)
-  const f = Math.max(-0.5, Math.min(0.5, size[k] > 0 ? off / size[k] : 0))
-  const geo = new THREE.PlaneGeometry(w * pad, h * pad)
-  const mat = new THREE.MeshBasicMaterial({
-    color: AXIS_COLOR[k], transparent: true, opacity: 0.3,
-    side: THREE.DoubleSide, depthWrite: false,
-  })
-  const pl = new THREE.Mesh(geo, mat)
-  if (k === 'x') pl.rotation.y = Math.PI / 2
-  else if (k === 'y') pl.rotation.x = Math.PI / 2
-  pl.position.copy(center)
-  pl.position[k] = center[k] + f * size[k]
-  slicePlane.add(pl)
-  const edge = new THREE.LineSegments(new THREE.EdgesGeometry(geo),
-    new THREE.LineBasicMaterial({ color: AXIS_COLOR[k], transparent: true, opacity: 0.9 }))
-  edge.rotation.copy(pl.rotation)
-  edge.position.copy(pl.position)
-  slicePlane.add(edge)
-  frame.add(slicePlane)
+  planeGroup = new THREE.Group()
+  for (const plane of props.planes) {
+    const end = plane.kind === 'end'
+    // the plane sits at its offset (converted mm -> file units), clamped
+    // to the box
+    const off = (plane.offset || 0) / (props.unitScale || 1)
+    const f = Math.max(-0.5, Math.min(0.5, size[k] > 0 ? off / size[k] : 0))
+    const geo = new THREE.PlaneGeometry(w * pad, h * pad)
+    const mat = new THREE.MeshBasicMaterial({
+      color: AXIS_COLOR[k], transparent: true, opacity: end ? 0.15 : 0.3,
+      side: THREE.DoubleSide, depthWrite: false,
+    })
+    const pl = new THREE.Mesh(geo, mat)
+    if (k === 'x') pl.rotation.y = Math.PI / 2
+    else if (k === 'y') pl.rotation.x = Math.PI / 2
+    pl.position.copy(center)
+    pl.position[k] = center[k] + f * size[k]
+    planeGroup.add(pl)
+    const edgeMat = end
+      ? new THREE.LineDashedMaterial({ color: AXIS_COLOR[k], transparent: true, opacity: 0.9,
+                                       dashSize: span * 0.02, gapSize: span * 0.012 })
+      : new THREE.LineBasicMaterial({ color: AXIS_COLOR[k], transparent: true, opacity: 0.9 })
+    const edge = new THREE.LineSegments(new THREE.EdgesGeometry(geo), edgeMat)
+    edge.rotation.copy(pl.rotation)
+    edge.position.copy(pl.position)
+    if (end) edge.computeLineDistances()
+    planeGroup.add(edge)
+    if (plane.kind === 'start' || plane.kind === 'end') {
+      // an S / E tag at a corner of the plane
+      const tag = textSprite(end ? 'E' : 'S', AXIS_COLOR[k])
+      const corner = new THREE.Vector3(w * pad / 2, h * pad / 2, 0)
+      corner.applyEuler(pl.rotation).add(pl.position)
+      tag.position.copy(corner)
+      const ts = span * 0.06
+      tag.scale.set(ts, ts, 1)
+      planeGroup.add(tag)
+    }
+  }
+  frame.add(planeGroup)
 }
 
-// The traced outline: bright lines in the file frame (converted mm back
-// to file units, then the same shift the geometry got).
-function drawSection() {
-  if (sectionLines) {
-    frame?.remove(sectionLines)
-    sectionLines.traverse((o) => { o.geometry?.dispose(); o.material?.dispose?.() })
-    sectionLines = null
-  }
-  if (!mesh || !meshShift || !props.section?.polylines?.length || !props.sliceAxis) return
+// The traced outlines: bright lines in the file frame (converted mm back
+// to file units, then the same shift the geometry got). A single slice and
+// the x-ray's start and end planes are full yellow; the slices between
+// them (kind 'mid') a little fainter, so a stack reads as an x-ray with its
+// ends marked. The x-ray adds one section at a time, so a call that only
+// appends new sections draws just those.
+let drawnSections = []       // the section objects already in the scene
+function drawSections() {
+  const secs = props.sections
   const k = 1 / (props.unitScale || 1)
-  sectionLines = new THREE.Group()
-  const mat = new THREE.LineBasicMaterial({ color: 0xffd166, depthTest: false, transparent: true, opacity: 0.95 })
-  for (const poly of props.section.polylines) {
-    const pts = poly.map(([x, y, z]) => new THREE.Vector3(x * k + meshShift.x, y * k + meshShift.y, z * k + meshShift.z))
-    sectionLines.add(new THREE.Line(new THREE.BufferGeometry().setFromPoints(pts), mat))
+  const canDraw = mesh && meshShift && sliceAxis.value
+  // (the store wraps each section afresh, so compare the data, not the wrapper)
+  const same = (d, sec) => d && sec && d.polylines === sec.polylines && d.kind === sec.kind
+  const isAppend = sectionLines && canDraw && secs.length >= drawnSections.length
+    && drawnSections.every((d, i) => same(d, secs[i]))
+  if (!isAppend) {
+    if (sectionLines) {
+      frame?.remove(sectionLines)
+      sectionLines.traverse((o) => { o.geometry?.dispose(); o.material?.dispose?.() })
+      sectionLines = null
+    }
+    drawnSections = []
+    if (!canDraw || !secs.length) return
+    sectionLines = new THREE.Group()
+    sectionLines.renderOrder = 10
+    frame.add(sectionLines)
   }
-  sectionLines.renderOrder = 10
-  frame.add(sectionLines)
+  for (let i = drawnSections.length; i < secs.length; i++) {
+    const section = secs[i]
+    const mid = section?.kind === 'mid'
+    if (section?.polylines?.length) {
+      const mat = new THREE.LineBasicMaterial({ color: mid ? 0xe6b84f : 0xffd166, depthTest: false,
+                                                transparent: true, opacity: mid ? 0.7 : 0.95 })
+      for (const poly of section.polylines) {
+        const pts = poly.map(([x, y, z]) => new THREE.Vector3(x * k + meshShift.x, y * k + meshShift.y, z * k + meshShift.z))
+        sectionLines.add(new THREE.Line(new THREE.BufferGeometry().setFromPoints(pts), mat))
+      }
+    }
+    drawnSections.push(section)
+  }
 }
 
-watch(() => props.sliceAxis, () => { drawTriad(); drawSlicePlane(); drawSection() })
-watch(() => props.sliceOffset, drawSlicePlane)
-watch(() => props.section, drawSection)
+watch(() => props.planes, () => { drawTriad(); drawPlanes(); drawSections() })
+watch(() => props.sections, drawSections)
 
 function resize() {
   if (!host.value) return
@@ -546,8 +593,9 @@ function drawViewCube() {
   renderer.autoClear = false
   renderer.clearDepth()
   renderer.setScissorTest(true)
-  renderer.setViewport(CUBE_MARGIN, CUBE_MARGIN, CUBE_PX, CUBE_PX)
-  renderer.setScissor(CUBE_MARGIN, CUBE_MARGIN, CUBE_PX, CUBE_PX)
+  const [cx, cy] = cubeOrigin()
+  renderer.setViewport(cx, cy, CUBE_PX, CUBE_PX)
+  renderer.setScissor(cx, cy, CUBE_PX, CUBE_PX)
   renderer.render(cubeScene, cubeCamera)
   renderer.setScissorTest(false)
   renderer.setViewport(0, 0, renderer.domElement.clientWidth, h)
@@ -561,9 +609,10 @@ function cubeFaceAt(ev) {
   const r = renderer.domElement.getBoundingClientRect()
   const x = ev.clientX - r.left
   const y = r.height - (ev.clientY - r.top)          // from the bottom, like the viewport
-  if (x < CUBE_MARGIN || x > CUBE_MARGIN + CUBE_PX || y < CUBE_MARGIN || y > CUBE_MARGIN + CUBE_PX) return -1
-  const nx = ((x - CUBE_MARGIN) / CUBE_PX) * 2 - 1
-  const ny = ((y - CUBE_MARGIN) / CUBE_PX) * 2 - 1
+  const [cx, cy] = cubeOrigin()
+  if (x < cx || x > cx + CUBE_PX || y < cy || y > cy + CUBE_PX) return -1
+  const nx = ((x - cx) / CUBE_PX) * 2 - 1
+  const ny = ((y - cy) / CUBE_PX) * 2 - 1
   const rc = new THREE.Raycaster()
   rc.setFromCamera(new THREE.Vector2(nx, ny), cubeCamera)
   const hit = rc.intersectObject(cube, false)[0]
@@ -642,7 +691,7 @@ onBeforeUnmount(() => {
       </button>
     </div>
     <div class="hint micro">
-      scroll zooms at the cursor · cube snaps the view<span v-if="triangleBody"> · click a body to select it</span><span v-if="sliceAxis"> · plane = the slice across {{ sliceAxis.toUpperCase() }}<span v-if="section"> · yellow = its trace</span></span>
+      scroll zooms at the cursor · cube snaps the view<span v-if="triangleBody"> · click a body to select it</span><span v-if="sliceAxis"> · <template v-if="planes.length > 1">planes = start (solid) and end (dashed) across {{ sliceAxis.toUpperCase() }}<span v-if="sections.length"> · yellow = their traces</span></template><template v-else>plane = the slice across {{ sliceAxis.toUpperCase() }}<span v-if="sections.length"> · yellow = its trace</span></template></span>
     </div>
   </div>
 </template>
@@ -670,7 +719,7 @@ onBeforeUnmount(() => {
   position: absolute;
   bottom: 10px;
   right: 14px;
-  left: 160px;            /* clear of the ViewCube */
+  left: 14px;
   text-align: right;
   pointer-events: none;
 }

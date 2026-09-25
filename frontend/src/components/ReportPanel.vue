@@ -227,7 +227,7 @@ const reduction = computed(() => {
       </table>
     </section>
 
-    <section v-if="store.status === 'done' && store.result?.ok"
+    <section v-if="store.tool !== 'xray' && store.status === 'done' && store.result?.ok"
              ref="verdictEl" class="verdict">
       <div class="mode" :class="verdict.cls">{{ verdict.title }}</div>
       <p class="modenote">{{ verdict.note }}</p>
@@ -306,7 +306,7 @@ const reduction = computed(() => {
       </p>
     </section>
 
-    <section v-if="openResult" class="openbox">
+    <section v-if="store.tool !== 'xray' && openResult" class="openbox">
       <h3 class="micro">Surfaces, not solids</h3>
       <p>
         The STEP holds no closed solid, because the chosen bodies were not
@@ -314,7 +314,7 @@ const reduction = computed(() => {
         reference but not model against or cut.
       </p>
     </section>
-    <section v-if="store.error" ref="verdictEl" class="errorbox">
+    <section v-if="store.tool !== 'xray' && store.error" ref="verdictEl" class="errorbox">
       <h2 class="micro">Failed</h2>
       <p>{{ store.error }}</p>
       <p v-if="store.result?.failure === 'oom'" class="fix">
@@ -323,7 +323,7 @@ const reduction = computed(() => {
       </p>
     </section>
 
-    <details v-if="store.log" class="logbox" :open="store.status === 'running'">
+    <details v-if="store.tool !== 'xray' && store.log" class="logbox" :open="store.status === 'running'">
       <summary class="micro">Pipeline log</summary>
       <pre class="num">{{ store.log }}</pre>
     </details>
