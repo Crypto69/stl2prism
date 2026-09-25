@@ -9,8 +9,11 @@ import sys
 import traceback
 
 
-def main():
-    in_path, out_path, params_path, result_path = sys.argv[1:5]
+def main(argv=None):
+    # line-buffered, so the job log stays live when started without -u
+    sys.stdout.reconfigure(line_buffering=True)
+    in_path, out_path, params_path, result_path = (
+        argv[:4] if argv is not None else sys.argv[1:5])
     with open(params_path) as f:
         params = json.load(f)
 

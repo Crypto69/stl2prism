@@ -1,4 +1,5 @@
 """FastAPI app: upload an STL or OBJ, convert it to STEP, report fidelity."""
+import mimetypes
 import os
 import re
 from typing import Optional, Literal
@@ -402,5 +403,11 @@ _static = os.environ.get(
     'STLTOSOLID_STATIC',
     os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
                  'frontend', 'dist'))
+# The Windows registry can map .js to text/plain, which browsers refuse to
+# run as a module; pin the types the built frontend uses.
+for _ext, _type in (('.js', 'text/javascript'), ('.mjs', 'text/javascript'),
+                    ('.css', 'text/css'), ('.woff2', 'font/woff2'),
+                    ('.webp', 'image/webp')):
+    mimetypes.add_type(_type, _ext)
 if os.path.isdir(_static):
     app.mount('/', StaticFiles(directory=_static, html=True), name='static')

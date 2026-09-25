@@ -112,6 +112,51 @@ def start(job_id, filename, params):
     threading.Thread(target=_run, args=(job_id,), daemon=True).start()
 
 
+_FROZEN = getattr(sys, 'frozen', False)
+_WINDOWS = sys.platform == 'win32'
+
+
+def _worker_cmd():
+    """How to start backend.worker. A frozen (PyInstaller) interpreter
+    cannot run `-m`, so it is started with a `--worker` flag its entry point
+    dispatches. -u: unbuffered, so the log endpoint sees progress live."""
+    if _FROZEN:
+        return [sys.executable, '--worker']
+    return [sys.executable, '-u', '-m', 'backend.worker']
+
+
+def _own_group():
+    """Popen kwargs that give the worker its own process group: cancelling
+    stops the group, so the worker's shell pool goes with it instead of
+    being orphaned."""
+    if _WINDOWS:
+        return {'creationflags': subprocess.CREATE_NEW_PROCESS_GROUP}
+    return {'start_new_session': True}
+
+
+def _kill_tree(proc, hard):
+    """Stop the worker and its children. POSIX signals the process group
+    (SIGTERM, or SIGKILL when hard); Windows has no process groups to
+    signal, so taskkill /T takes the whole tree."""
+    if _WINDOWS:
+        r = subprocess.run(['taskkill', '/T', '/F', '/PID', str(proc.pid)],
+                           capture_output=True)
+        if r.returncode != 0:
+            proc.kill()
+        return
+    try:
+        os.killpg(os.getpgid(proc.pid),
+                  signal.SIGKILL if hard else signal.SIGTERM)
+    except (ProcessLookupError, PermissionError, OSError):
+        try:
+            if hard:
+                proc.kill()
+            else:
+                proc.terminate()
+        except Exception:
+            pass
+
+
 def _run(job_id):
     d = job_dir(job_id)
     with _run_slot:
@@ -119,16 +164,14 @@ def _run(job_id):
             _jobs[job_id]['status'] = 'running'
             input_name = _jobs[job_id].get('input', 'input.stl')
         log = open(os.path.join(d, 'log.txt'), 'wb')
-        # -u: unbuffered, so the log endpoint sees pipeline progress live.
         proc = subprocess.Popen(
-            [sys.executable, '-u', '-m', 'backend.worker',
-             os.path.join(d, input_name), os.path.join(d, 'output.step'),
-             os.path.join(d, 'params.json'), os.path.join(d, 'result.json')],
+            _worker_cmd() + [
+                os.path.join(d, input_name), os.path.join(d, 'output.step'),
+                os.path.join(d, 'params.json'), os.path.join(d, 'result.json')],
             stdout=log, stderr=subprocess.STDOUT,
-            cwd=os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-            # its own process group: cancelling signals the group, so the
-            # worker's shell pool goes with it instead of being orphaned
-            start_new_session=True)
+            cwd=None if _FROZEN else os.path.dirname(
+                os.path.dirname(os.path.abspath(__file__))),
+            **_own_group())
         log.close()
         with _lock:
             _jobs[job_id]['proc'] = proc
@@ -232,7 +275,8 @@ def cancel(job_id):
     The worker is asked to stop with SIGTERM and given a moment to go, then
     killed. Its own children (the shell pool) die with it: Popen puts the
     worker in its own process group, so the signal goes to the group and no
-    orphan is left converting in the background.
+    orphan is left converting in the background. Windows has no SIGTERM, so
+    there the whole tree is killed at once.
     """
     job = get(job_id)
     if job is None:
@@ -242,20 +286,11 @@ def cancel(job_id):
         if proc is None or job['status'] not in ('queued', 'running'):
             return 'not_running'
         job['cancelling'] = True
-    try:
-        os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
-    except (ProcessLookupError, PermissionError, OSError):
-        try:
-            proc.terminate()
-        except Exception:
-            pass
+    _kill_tree(proc, hard=False)
     try:
         proc.wait(timeout=CANCEL_GRACE_S)
     except subprocess.TimeoutExpired:
-        try:
-            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
-        except (ProcessLookupError, PermissionError, OSError):
-            proc.kill()
+        _kill_tree(proc, hard=True)
     return 'cancelled'
 
 
