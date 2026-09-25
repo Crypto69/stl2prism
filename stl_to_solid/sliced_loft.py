@@ -632,7 +632,7 @@ def _stretches(areas, max_change=None, forced=()):
     return out
 
 
-def _loft_rings(rings3d, areas, zs, ruled, tag, verbose, merge=None):
+def _loft_rings(rings3d, areas, zs, ruled, tag, verbose, merge=None, ax_vec=None, forced=()):
     """Solid through 3-D rings (each (N, 3), same N, aligned) on one shared
     spline basis. Smooth unless `ruled`, in stretches: where the section
     area jumps by more than SMOOTH_MAX_CHANGE between neighbours the pair
@@ -651,10 +651,16 @@ def _loft_rings(rings3d, areas, zs, ruled, tag, verbose, merge=None):
     extrusion each (the `forced` pairs). A smooth run keeps every ring:
     near a sphere's equator neighbours are also "identical" within tol,
     and a straight band there would cut the one smooth face in three.
-    Returns (solid, used_ruled, stats) with stats = {'ruled_direct':
-    bool, 'merged': sections dropped}."""
-    stats = {'ruled_direct': False, 'merged': 0}
-    forced = set()
+    `forced` pairs of the full ring list are ruled in a smooth run as
+    well (a bridge: the last ring repeated at the next run's plane).
+    `ax_vec` is the slicing axis, along which an extruded pair's top is
+    moved. Returns (solid, used_ruled, stats) with stats =
+    {'ruled_direct': bool, 'merged': sections dropped, 'extruded':
+    [[z0, z1], ...]}."""
+    stats = {'ruled_direct': False, 'merged': 0, 'extruded': []}
+    forced = set(forced)
+    if ax_vec is None:
+        ax_vec = _ring_axis(rings3d)
     _, K, dev = fit_ring_poles(rings3d)
     if dev > RING_FIT_TOL and not ruled:
         ruled = True
@@ -676,24 +682,28 @@ def _loft_rings(rings3d, areas, zs, ruled, tag, verbose, merge=None):
         # the run must not vanish: pair by pair, a bad pair extruded
         if verbose:
             print(f"[loft] {tag}: {ex}; lofting pair by pair instead")
-    solid, ext = _loft_pairs(wires, rings3d, areas, zs, tag, verbose)
+    solid, ext = _loft_pairs(wires, ax_vec, areas, zs, tag, verbose)
     stats['extruded'] = ext
     return solid, True, stats
 
 
 def _ring_axis(rings3d):
-    """Unit normal of the ring planes (the slicing axis), from the
-    direction between the first two ring centroids."""
-    c = [np.asarray(r, float).mean(0) for r in rings3d]
-    d = c[-1] - c[0]
-    for a, b in zip(c, c[1:]):
-        if np.linalg.norm(b - a) > 1e-9:
-            d = b - a
-            break
-    return d / max(np.linalg.norm(d), 1e-12)
+    """Unit normal of the ring planes (the slicing axis) by least squares
+    on the first ring. Only a fallback: the centroid-to-centroid
+    direction is tilted wherever the outline drifts sideways, and an
+    extrusion along it once stopped 0.02 mm short of the next piece."""
+    P = np.asarray(rings3d[0], float)
+    P = P - P.mean(0)
+    _, _, vt = np.linalg.svd(P, full_matrices=False)
+    n = vt[-1]
+    if len(rings3d) > 1:
+        d = np.asarray(rings3d[-1], float).mean(0) - np.asarray(rings3d[0], float).mean(0)
+        if d @ n < 0:
+            n = -n
+    return n / max(np.linalg.norm(n), 1e-12)
 
 
-def _loft_pairs(wires, rings3d, areas, zs, tag, verbose):
+def _loft_pairs(wires, ax, areas, zs, tag, verbose):
     """Fallback for a run whose rings do not correspond: one ruled loft
     per neighbouring pair, each checked against its own trapezoid volume;
     a pair that fails becomes an extrusion of its lower ring (the wire
@@ -702,7 +712,7 @@ def _loft_pairs(wires, rings3d, areas, zs, tag, verbose):
     interval where the real one changed. Returns (solid, extruded) with
     extruded = [[z0, z1], ...] of the pairs that were extruded."""
     import cadquery as cq
-    ax = _ring_axis(rings3d)
+    ax = np.asarray(ax, float)
     pieces, ext = [], []
     for i in range(len(wires) - 1):
         dz = float(zs[i + 1] - zs[i])
@@ -778,52 +788,83 @@ def _extrude(outer3d, holes3d, d):
     return body
 
 
+def _fuse_two(a, b, want, tol_pct):
+    """One valid solid from two touching pieces, or None: glued fuse (the
+    pieces share planar caps), then plain, then fuzzy; a result that is
+    one solid holding both volumes (within tol_pct) but reads invalid
+    gets one ShapeFix pass (two caps whose B-spline rings overlap along a
+    straight stretch come out with inflated tolerances). Returns (shape,
+    volume, how) or None."""
+    for how, kw in (('glue', dict(glue=True)), ('plain', {}), ('fuzzy', dict(tol=1e-3))):
+        try:
+            f = a.fuse(b, **kw)
+        except Exception:
+            continue
+        try:
+            if len(f.Solids()) != 1:
+                continue
+            v = _volume(f)
+            if abs(v - want) / want * 100 > tol_pct if want > 0 else False:
+                continue
+            if _valid(f):
+                return f, v, how
+            g = f.fix()
+            if len(g.Solids()) == 1 and _valid(g) and abs(_volume(g) - want) / want * 100 <= tol_pct:
+                return g, _volume(g), how + '+fix'
+        except Exception:
+            continue
+    return None
+
+
 def _fuse_all(solids, verbose, tol_pct=2.0):
     """One shape from the run solids, fused one at a time in the order
-    given (which is along the axis): each step tries a glued fuse (the
-    pieces share planar caps), then a plain one, then a fuzzy one, and
-    keeps the first whose result is one valid solid holding the two
-    volumes (within tol_pct). A fuse that looks valid but lost volume is
-    wrong however valid it looks: a glued fuse of 19 pieces of a block
-    once returned 533 mm^3 out of 24000, and of the bracket's 14 pieces
-    2153 out of 3675. Pieces no step could take go back in a second pass
-    and are otherwise left loose in a compound, with a warning. Returns
-    (shape, how) with how in 'single' | 'glue' | 'fused' | 'compound'."""
+    given (which is along the axis). Each piece joins the chain it
+    touches: the latest chain first, then any earlier one, else it starts
+    a chain of its own; the chains are joined at the end. A fuse that
+    looks valid but lost volume is wrong however valid it looks (a glued
+    fuse of 19 pieces of a block once returned 533 mm^3 out of 24000, and
+    of the bracket's 14 pieces 2153 out of 3675), so every step checks
+    the volume (_fuse_two). Chains that will not join stay loose in a
+    compound, with a warning. Returns (shape, how) with how in 'single'
+    | 'glue' | 'fused' | 'compound'."""
     import cadquery as cq
     if len(solids) == 1:
         return solids[0], 'single'
-    vols = [_volume(x) for x in solids]
-    acc, acc_vol, hows, loose = solids[0], vols[0], set(), []
-    order = list(zip(solids[1:], vols[1:]))
-    for attempt in range(2):
-        left = []
-        for piece, pv in order:
-            want = acc_vol + pv
-            got = None
-            for how, kw in (('glue', dict(glue=True)), ('plain', {}), ('fuzzy', dict(tol=1e-3))):
-                try:
-                    f = acc.fuse(piece, **kw)
-                    v = _volume(f)
-                    off = abs(v - want) / want * 100 if want > 0 else 0.0
-                    if _valid(f) and len(f.Solids()) == 1 and off <= tol_pct:
-                        got = (f, v, how)
-                        break
-                except Exception:
-                    continue
-            if got is None:
-                left.append((piece, pv))
-                continue
-            acc, acc_vol = got[0], got[1]
-            hows.add(got[2])
-        order = left
-        if not order:
-            break
-    loose = [p for p, _ in order]
-    if loose:
+    chains, hows = [], set()
+    for piece in solids:
+        pv = _volume(piece)
+        placed = False
+        for ci in range(len(chains) - 1, -1, -1):
+            acc, av = chains[ci]
+            got = _fuse_two(acc, piece, av + pv, tol_pct)
+            if got is not None:
+                chains[ci] = (got[0], got[1])
+                hows.add(got[2])
+                placed = True
+                break
+        if not placed:
+            chains.append((piece, pv))
+    # join the chains
+    changed = True
+    while changed and len(chains) > 1:
+        changed = False
+        for i in range(len(chains)):
+            for j in range(i + 1, len(chains)):
+                got = _fuse_two(chains[i][0], chains[j][0], chains[i][1] + chains[j][1], tol_pct)
+                if got is not None:
+                    chains[i] = (got[0], got[1])
+                    hows.add(got[2])
+                    del chains[j]
+                    changed = True
+                    break
+            if changed:
+                break
+    if len(chains) > 1:
         if verbose:
-            print(f"[loft] {len(loose)} of {len(solids)} piece(s) would not fuse; "
-                  f"left as separate solids in one compound")
-        return cq.Compound.makeCompound([acc] + loose), 'compound'
+            print(f"[loft] {len(solids)} piece(s) fused into {len(chains)} solids that would not "
+                  f"join; left as separate solids in one compound")
+        return cq.Compound.makeCompound([c for c, _ in chains]), 'compound'
+    acc, acc_vol = chains[0]
     try:
         c = acc.clean()
         if _valid(c) and len(c.Solids()) == 1 and abs(_volume(c) - acc_vol) / acc_vol * 100 <= tol_pct:
@@ -880,17 +921,33 @@ def loft_body(mesh, axis, interval=0.2, ruled=False, verbose=True, z_range=None,
         zs = [zs_all[k] for k in keep]
         rinfo = {'z0': zs[0], 'z1': zs[-1], 'n': len(zs), 'ruled': bool(ruled), 'sections': []}
         secs = [{'z': z, 'outer': None, 'holes': []} for z in zs]
+        # a gap to the next run (a topology change between two slices, not
+        # a flat step) is bridged inside this run: its last section is
+        # repeated at the next run's first plane, one straight stretch,
+        # so the two runs share that plane exactly and no sliver solid
+        # is needed
+        bridge_to = None
+        if ri + 1 < len(runs):
+            zb = slices[runs[ri + 1][0]][0]
+            if zb - zs[-1] > 1e-6:
+                bridge_to = float(zb)
+                zs = zs + [bridge_to]
+                rinfo['bridge_to'] = bridge_to
         distinct = abs(zs[-1] - zs[0]) > 1e-6 and len(zs) >= 2
         for ci, chain in enumerate(chains):
             chain = [chain[k] for k in keep]
+            if bridge_to is not None:
+                chain = chain + [chain[-1]]
             N = max(_ring_n(e) for e, _ in chain)
             rings, prev = [], None
             for (e, _) in chain:
                 Q = align(ccw(resample(e, N)), prev)
                 rings.append(Q)
                 prev = Q
+            if bridge_to is not None:
+                rings[-1] = rings[-2].copy()
             rings3d = [cutter.to_3d(Q, z) for Q, z in zip(rings, zs)]
-            for si, r3 in enumerate(rings3d):
+            for si, r3 in enumerate(rings3d[:len(secs)]):
                 pts = r3[douglas_peucker(np.vstack([r3, r3[:1]]), SPLINE_TOL)[:-1]]
                 secs[si]['outer'] = pts.tolist() if ci == 0 else secs[si].get('outer')
                 if ci > 0:
@@ -899,6 +956,7 @@ def loft_body(mesh, axis, interval=0.2, ruled=False, verbose=True, z_range=None,
                 continue
             tag = f"run {ri + 1} outline {ci + 1}"
             areas = [abs(signed_area(Q)) for Q in rings]
+            bridge_pairs = {len(rings) - 2} if bridge_to is not None else set()
             # identical sections (a prism) collapse to one straight
             # stretch each, if the run comes out ruled
             mrings, mkeep, forced = _merge_identical([e for e, _ in chain], rings)
@@ -906,7 +964,8 @@ def loft_body(mesh, axis, interval=0.2, ruled=False, verbose=True, z_range=None,
             merge = ([cutter.to_3d(Q, z) for Q, z in zip(mrings, mzs)],
                      [abs(signed_area(Q)) for Q in mrings], mzs, forced)
             try:
-                body, used_ruled, lstats = _loft_rings(rings3d, areas, zs, ruled, tag, verbose, merge)
+                body, used_ruled, lstats = _loft_rings(rings3d, areas, zs, ruled, tag, verbose, merge,
+                                                       ax_vec, bridge_pairs)
             except Exception as e:
                 # even the pair chain failed: the first outline extruded
                 # over the whole run keeps the material; only if that
@@ -933,38 +992,50 @@ def loft_body(mesh, axis, interval=0.2, ruled=False, verbose=True, z_range=None,
             # holes: chained by centroid, lofted the same way, cut
             nh = len(chain[0][1])
             for hi_ in range(nh):
-                hrings, hraw, prev, hidx = [], [], None, hi_
+                hraw, hidx = [], hi_
                 for k, (e, holes) in enumerate(chain):
                     if k > 0:
                         hidx = match_holes(chain[k - 1][1], holes)[hidx]
-                    hp = holes[hidx]
-                    Nh = _ring_n(hp) if k == 0 else len(hrings[0])
+                    hraw.append(holes[hidx])
+                Nh = max(_ring_n(hp) for hp in hraw)
+                hrings, prev = [], None
+                for hp in hraw:
                     Q = align(ccw(resample(hp, Nh)), prev)
                     hrings.append(Q)
-                    hraw.append(hp)
                     prev = Q
+                if bridge_to is not None:
+                    hrings[-1] = hrings[-2].copy()
                 h3d = [cutter.to_3d(Q, z) for Q, z in zip(hrings, zs)]
-                for si, r3 in enumerate(h3d):
+                for si, r3 in enumerate(h3d[:len(secs)]):
                     pts = r3[douglas_peucker(np.vstack([r3, r3[:1]]), SPLINE_TOL)[:-1]]
                     secs[si]['holes'].append(pts.tolist())
-                # the cutter runs a hair past both ends so the cut is clean
-                d = ax_vec * EPS
-                h3d[0] = h3d[0] - d
-                h3d[-1] = h3d[-1] + d
                 hareas = [abs(signed_area(Q)) for Q in hrings]
                 mh, mk, mf = _merge_identical(hraw, hrings)
                 mhz = [zs[k] for k in mk]
                 mh3 = [cutter.to_3d(Q, z) for Q, z in zip(mh, mhz)]
-                mh3[0] = mh3[0] - d
-                mh3[-1] = mh3[-1] + d
-                hmerge = (mh3, [abs(signed_area(Q)) for Q in mh], mhz, mf)
                 htag = tag + f" hole {hi_ + 1}"
+                d = ax_vec * EPS
                 try:
-                    tool, _, hstats = _loft_rings(h3d, hareas, zs, ruled or used_ruled, htag, verbose, hmerge)
-                    n_merged += hstats['merged']
-                    cut = body.cut(tool)
-                    if cut.wrapped.IsNull() or not _valid(cut):
+                    cut, tool = None, None
+                    # the tool's caps on the run's caps first (its cap edges
+                    # are then the rings, which the next run shares); a
+                    # hair of overshoot only if that cut comes out wrong
+                    for over in (0.0, 1.0):
+                        th = [r.copy() for r in h3d]
+                        tm = [r.copy() for r in mh3]
+                        for lst in (th, tm):
+                            lst[0] = lst[0] - d * over
+                            lst[-1] = lst[-1] + d * over
+                        tool, _, hstats = _loft_rings(th, hareas, zs, ruled or used_ruled, htag, verbose,
+                                                      (tm, [abs(signed_area(Q)) for Q in mh], mhz, mf),
+                                                      ax_vec, bridge_pairs)
+                        c = body.cut(tool)
+                        if not c.wrapped.IsNull() and _valid(c) and len(c.Solids()) >= 1:
+                            cut = c
+                            break
+                    if cut is None:
                         raise RuntimeError('cut gave an invalid solid')
+                    n_merged += hstats['merged']
                     body = cut
                     n_holes += 1
                 except Exception as e:
@@ -992,25 +1063,6 @@ def loft_body(mesh, axis, interval=0.2, ruled=False, verbose=True, z_range=None,
         rinfo['sections'] = secs
         run_infos.append(rinfo)
 
-    # bridges: a run's last outline extruded to the next run's first plane
-    for (a0, b0, ch0), (a1, b1, ch1) in zip(runs, runs[1:]):
-        za, zb = slices[b0][0], slices[a1][0]
-        gap = zb - za
-        if gap < 1e-6:
-            continue
-        for chain in ch0:
-            e, holes = chain[-1]
-            try:
-                o3 = cutter.to_3d(ccw(resample(e, _ring_n(e))), za)
-                h3 = [cutter.to_3d(ccw(resample(h, _ring_n(h))), za) for h in holes]
-                solids.append(_extrude(o3, h3, ax_vec * gap))
-            except Exception as e_:
-                skipped.append({'what': 'bridge', 'z0': float(za), 'z1': float(zb),
-                                'text': f"bridge {za:.2f}..{zb:.2f}: {type(e_).__name__}: {e_}"})
-                if verbose:
-                    print(f"[loft] bridge {za:.2f}..{zb:.2f} skipped ({type(e_).__name__}: {e_})")
-        if verbose:
-            print(f"[loft] bridged {za:.2f}..{zb:.2f} by extrusion")
     if not solids:
         raise RuntimeError('no run could be lofted')
     shape, how = _fuse_all(solids, verbose)

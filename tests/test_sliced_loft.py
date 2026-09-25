@@ -360,7 +360,7 @@ def test_loft_pairs_extrudes_a_pair_whose_rings_do_not_correspond(monkeypatch):
     zs = [0.0, 10.0, 20.0, 30.0]
     rings3d = [np.c_[ring, np.full(len(ring), z)] for z in zs]
     wires, _, _ = sl._ring_wires(rings3d)
-    solid, ext = sl._loft_pairs(wires, rings3d, [200.0] * 4, zs, 'test', False)
+    solid, ext = sl._loft_pairs(wires, np.array([0.0, 0.0, 1.0]), [200.0] * 4, zs, 'test', False)
     assert ext == [[0.0, 10.0], [10.0, 20.0], [20.0, 30.0]], ext
     assert len(solid.Solids()) == 1
     assert abs(sl._volume(solid) - 6000.0) / 6000.0 < 0.01
@@ -439,10 +439,24 @@ def test_pipeline_loft_gate_is_reported_not_enforced(tmp_path):
     r = run(p, out, method='loft', slice_mm=0.5, slice_axis='z', verbose=False)
     assert r['mode'] == 'loft'
     assert r['metrics']['gate_ok'] is False          # the smeared holes
-    # the run pieces do not always fuse across a sideways hole; a compound
-    # of a few solids is the honest result, never nothing
-    assert 1 <= _reimport(out)['solids'] <= 8
+    # the runs share their planes exactly (bridges are repeated rings
+    # inside a run), so the pieces fuse to one solid across the holes
+    assert _reimport(out)['solids'] == 1
     assert r['metrics']['vol_err_pct'] < 1.0
+
+
+def test_loft_side_boss_is_one_solid(tmp_path):
+    """A block with a cylinder boss across the axis: the boss changes the
+    outline between two slices (no flat step), which used to leave a
+    0.2 mm bridge sliver as its own solid. One solid, volume exact."""
+    from stl_to_solid.sliced_loft import loft_body
+    wp = cq.Workplane('XY').box(40, 30, 20).union(cq.Workplane('YZ').circle(5).extrude(30))
+    m = trimesh.load(synth.export(wp, tmp_path / 'boss.stl'), force='mesh')
+    shape, info = loft_body(m, 2, 0.5, verbose=False)
+    assert info['skipped'] == [] and info['n_solids'] == 1
+    m2, s = _check(shape, m, faces_max=40, dev_p95=0.05, vol_pct=0.5)
+    # no piece thinner than the interval survives as a run of its own
+    assert all(r['z1'] - r['z0'] >= 0.5 - 1e-6 or r['n'] == 1 for r in info['runs'])
 
 
 def test_cli_flags_parse(tmp_path):
