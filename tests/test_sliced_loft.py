@@ -547,6 +547,9 @@ def test_section_api_and_sketch_script(tmp_path, monkeypatch):
         assert r.status_code == 200, r.text
         job = r.json()['id']
         # the middle step is r=7 between z=20 and 35; the box centre is z=22.5
+        r = c.get(f'/api/jobs/{job}/loft-axis', params={'slice_mm': 0.5})
+        assert r.status_code == 200, r.text
+        assert r.json()['axis'] == 'z' and set(r.json()['scores']) == {'x', 'y', 'z'}
         r = c.get(f'/api/jobs/{job}/section', params={'axis': 'z', 'offset': 5.0, 'tol': 0.08})
         assert r.status_code == 200, r.text
         sec = r.json()

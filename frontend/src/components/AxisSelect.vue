@@ -12,11 +12,11 @@ const axisOptions = computed(() => {
   const k = store.unitScale
   const len = (i) => (bb ? `${(bb[i] * k).toFixed(1)} mm` : '')
   const longest = bb ? 'XYZ'[bb.indexOf(Math.max(...bb))] : null
-  const chosen = store.loftAxisChosen ? store.loftAxisChosen.toUpperCase() : null
+  const chosen = (store.loftAxisChosen || (store.tool === 'loft' ? store.loftAxisAuto : null) || '').toUpperCase() || null
   const auto = chosen
-    ? `auto · by shape (${chosen} chosen, ${len('XYZ'.indexOf(chosen))})`
+    ? `auto · by shape (${chosen}, ${len('XYZ'.indexOf(chosen))})`
     : store.tool === 'loft'
-      ? (longest ? `auto · by shape (plane shown on ${longest} until the run)` : 'auto · by shape')
+      ? (store.loftAxisBusy ? 'auto · by shape (working it out…)' : 'auto · by shape')
       : (longest ? `auto · longest side (${longest}, ${len('XYZ'.indexOf(longest))})` : 'auto · longest side')
   return [
     { key: 'auto', label: auto },

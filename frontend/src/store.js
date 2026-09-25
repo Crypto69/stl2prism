@@ -49,6 +49,7 @@ const XRAY_EDGE = 1e-3
 
 let pollTimer = null
 let traceSeq = 0
+let axisSeq = 0
 let xraySeq = 0
 // how many polls in a row may fail before the job is given up on: a
 // server busy for a second, or a laptop waking up, is not a lost job
@@ -96,6 +97,11 @@ export const useConvertStore = defineStore('convert', {
     section: null,
     sectionBusy: false,
     sectionError: null,
+    // the axis a whole-body loft will pick for 'auto' (from /loft-axis),
+    // so the plane shows on it before the run; null until known
+    loftAxisAuto: null,
+    loftAxisScores: null,
+    loftAxisBusy: false,
     // x-ray: a stack of slices from the start plane to the end plane every
     // xraySpacing mm (all mm from the centre along the resolved axis). The
     // slices are traced one after another and every trace stays in the 3D
@@ -159,10 +165,12 @@ export const useConvertStore = defineStore('convert', {
       if (s.tool !== 'loft' && s.tool !== 'xray') return null
       const a = s.params.slice_axis
       if (a === 'x' || a === 'y' || a === 'z') return a
-      // a finished whole-body loft chose its axis by slicing structure
-      // (sliced_loft.choose_axis); the plane follows that choice
+      // a whole-body loft picks its axis by slicing structure
+      // (sliced_loft.choose_axis): the finished run's choice first, else
+      // the one /loft-axis worked out for the preview
       const chosen = s.loftAxisChosen
       if (chosen) return chosen
+      if (s.tool === 'loft' && s.loftAxisAuto && !(s.params.slice_range_mm > 0)) return s.loftAxisAuto
       const bb = s.inputStats?.bbox_mm
       if (!bb) return null
       return 'xyz'[bb.indexOf(Math.max(...bb))]
@@ -253,6 +261,7 @@ export const useConvertStore = defineStore('convert', {
       this.$patch({
         status: 'uploading', jobId: null, inputStats: null,
         log: '', result: null, error: null, filename: file.name,
+        loftAxisAuto: null, loftAxisScores: null,
       })
       try {
         const body = new FormData()
@@ -422,6 +431,32 @@ export const useConvertStore = defineStore('convert', {
 
     resetParams() {
       this.params = { ...DEFAULT_PARAMS, method: this.tool === 'loft' ? 'loft' : 'auto' }
+    },
+
+    // Ask which axis a whole-body loft would pick for 'auto', so the plane
+    // in the 3D view sits on it before the run. Cheap; debounced by the
+    // caller. Any failure just leaves the longest-side plane.
+    async fetchLoftAxis() {
+      if (!this.jobId || this.tool !== 'loft' || this.params.slice_axis !== 'auto') return
+      const mine = ++axisSeq
+      this.loftAxisBusy = true
+      try {
+        const p = this.params
+        const q = new URLSearchParams({
+          units: p.units, scale: String(p.scale), slice_mm: String(p.slice_mm),
+          join: String(p.slice_join ?? 2.5), trim: String(p.slice_trim ?? 0),
+        })
+        const res = await fetch(`/api/jobs/${this.jobId}/loft-axis?${q}`)
+        if (!res.ok) throw new Error(await errText(res))
+        const got = await res.json()
+        if (mine !== axisSeq) return
+        this.loftAxisAuto = got.axis
+        this.loftAxisScores = got.scores
+      } catch (e) {
+        if (mine === axisSeq) { this.loftAxisAuto = null; this.loftAxisScores = null }
+      } finally {
+        if (mine === axisSeq) this.loftAxisBusy = false
+      }
     },
 
     // One traced section at `offset` mm from the centre on the resolved

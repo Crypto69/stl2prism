@@ -54,6 +54,16 @@ def _spans(m, k):
         return got
 
 
+def loft_axis(path, units='mm', scale=1.0, slice_mm=0.2, join=2.5, trim=0.0):
+    """The axis a whole-body sliced loft would pick for 'auto' (by slicing
+    structure, sliced_loft.choose_axis) and the per-axis scores, so the
+    3-D view can show the plane on that axis before the run."""
+    from stl_to_solid.sliced_loft import choose_axis
+    m = _mesh(path, units, scale)
+    ax, scores = choose_axis(m, slice_mm, join_mm=join, trim_mm=trim, verbose=False)
+    return {'axis': 'xyz'[ax], 'scores': scores}
+
+
 def half_extent(path, axis, units='mm', scale=1.0):
     """Half the part's side along `axis`, mm, in the converted frame."""
     m = _mesh(path, units, scale)

@@ -31,6 +31,19 @@ watch(() => [store.sliceOffset, store.resolvedSliceAxis, store.params.tol, store
       }, { immediate: true })
 onBeforeUnmount(() => clearTimeout(traceTimer))
 
+// The auto axis is worked out from the slicing structure as soon as the
+// tool is up (and again when the spacing, units, scale or gap joining
+// change), so the plane shows on the axis the run will use.
+let axisTimer = null
+watch(() => [store.jobId, store.params.slice_axis, store.params.units, store.params.scale,
+             store.params.slice_mm, store.params.slice_join, store.params.slice_trim],
+      ([job, axis]) => {
+        clearTimeout(axisTimer)
+        if (!job || axis !== 'auto') return
+        axisTimer = setTimeout(() => store.fetchLoftAxis(), 250)
+      }, { immediate: true })
+onBeforeUnmount(() => clearTimeout(axisTimer))
+
 const sectionSummary = computed(() => summarise(store.section?.stats, store.sliceOutline))
 </script>
 

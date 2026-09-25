@@ -275,6 +275,22 @@ def _py_attachment(text, filename):
                     headers={'Content-Disposition': f'attachment; filename="{filename}"'})
 
 
+@app.get('/api/jobs/{job_id}/loft-axis')
+async def loft_axis(job_id: str, units: str = 'mm', scale: float = 1.0, slice_mm: float = 0.2,
+                    join: float = 2.5, trim: float = 0.0):
+    """Which axis a whole-body sliced loft picks for 'auto' (by slicing
+    structure: fewest one-slice runs, then fewest runs plus steep pairs,
+    then the longest side), with the per-axis scores. Under a second per
+    axis; the view puts the slicing plane on it before the run."""
+    _check_slice_params('z', 0.08, join, trim, slice_mm)
+    _, src = _input_path(job_id)
+    from .sections import loft_axis as _loft_axis
+    try:
+        return sanitize(await run_in_threadpool(_loft_axis, src, units, scale, slice_mm, join, trim))
+    except Exception as e:
+        raise HTTPException(400, f'Could not choose the axis: {describe(e)}')
+
+
 @app.get('/api/jobs/{job_id}/section')
 async def section(job_id: str, axis: str = 'z', offset: float = 0.0, tol: float = 0.08,
                   units: str = 'mm', scale: float = 1.0, join: float = 2.5,
