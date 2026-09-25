@@ -12,8 +12,14 @@ const axisOptions = computed(() => {
   const k = store.unitScale
   const len = (i) => (bb ? `${(bb[i] * k).toFixed(1)} mm` : '')
   const longest = bb ? 'XYZ'[bb.indexOf(Math.max(...bb))] : null
+  const chosen = store.loftAxisChosen ? store.loftAxisChosen.toUpperCase() : null
+  const auto = chosen
+    ? `auto · by shape (${chosen} chosen, ${len('XYZ'.indexOf(chosen))})`
+    : store.tool === 'loft'
+      ? (longest ? `auto · by shape (plane shown on ${longest} until the run)` : 'auto · by shape')
+      : (longest ? `auto · longest side (${longest}, ${len('XYZ'.indexOf(longest))})` : 'auto · longest side')
   return [
-    { key: 'auto', label: longest ? `auto · longest side (${longest}, ${len('XYZ'.indexOf(longest))})` : 'auto · longest side' },
+    { key: 'auto', label: auto },
     { key: 'x', label: bb ? `X · ${len(0)}` : 'X' },
     { key: 'y', label: bb ? `Y · ${len(1)}` : 'Y' },
     { key: 'z', label: bb ? `Z · ${len(2)}` : 'Z' },
@@ -33,6 +39,8 @@ const axisOptions = computed(() => {
     The 3D view shows the chosen axis and the slicing plane:
     <span class="ax x">X</span> red, <span class="ax y">Y</span> green,
     <span class="ax z">Z</span> blue, as in Fusion. Slices are cut across
-    that axis, so a plane you see is one slice.
+    that axis, so a plane you see is one slice. With auto, the whole-body
+    loft picks the axis whose slices change the least (a round cap wants
+    its short axis, a plate its thin one); the report says which and why.
   </p>
 </template>

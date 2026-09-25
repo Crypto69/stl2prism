@@ -1341,12 +1341,24 @@ def _loft_body(mesh, verbose, slice_mm, slice_axis, ruled, gates, loft_opts=None
     across a sideways hole, a smoothed corner), not a fitting failure.
     With a z_range in `loft_opts` only that stretch is lofted, and the
     check measures against the mesh clipped to the same stretch."""
-    from .sliced_loft import loft_body, axis_index
+    from .sliced_loft import loft_body, axis_index, choose_axis
     opts = loft_opts or {}
-    axis = axis_index(mesh, slice_axis)
     z_range = opts.get('z_range')
+    auto = slice_axis in (None, 'auto')
+    scores = None
+    if auto and z_range is None:
+        # the whole body: pick the axis by how the section stack breaks
+        # into runs, not by the longest side (a round cap is longest
+        # across its face, and wants its short axis)
+        axis, scores = choose_axis(mesh, slice_mm, join_mm=opts.get('join_mm', 0.0),
+                                   trim_mm=opts.get('trim_mm', 0.0), verbose=verbose)
+    else:
+        # a partial loft follows the slider plane, which is on the longest side
+        axis = axis_index(mesh, slice_axis)
     shape, info = loft_body(mesh, axis, slice_mm, ruled=ruled, verbose=verbose, z_range=z_range,
                             join_mm=opts.get('join_mm', 0.0), trim_mm=opts.get('trim_mm', 0.0))
+    info['axis_auto'] = bool(auto)
+    info['axis_scores'] = scores
     ref = mesh
     if z_range is not None:
         n = np.zeros(3)

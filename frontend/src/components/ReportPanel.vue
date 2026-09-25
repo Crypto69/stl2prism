@@ -96,8 +96,12 @@ const verdict = computed(() => {
       const gate = r.metrics?.gate_ok === false
         ? ' The gate below did not pass; the loft is written anyway because you chose the method — the deviation is usually a sideways hole or a corner the smooth surface cannot follow.'
         : ' Every gate below passed.'
+      const sc = lf.axis_auto && lf.axis_scores ? lf.axis_scores : null
+      const axisWhy = sc
+        ? ` Axis chosen by shape: ${['x', 'y', 'z'].map((k) => `${k.toUpperCase()} ${sc[k]?.runs ?? '?'} run${sc[k]?.runs === 1 ? '' : 's'}${sc[k]?.single ? ` (${sc[k].single} of one slice)` : ''}${sc[k]?.steep ? ` + ${sc[k].steep} fast change${sc[k].steep === 1 ? '' : 's'}` : ''}`).join(', ')}.`
+        : ''
       return { title: 'Sliced loft solid', cls: 'loft',
-               note: `${lf.range ? `Only ${lf.range[0].toFixed(1)} to ${lf.range[1].toFixed(1)} mm along ${(lf.axis_name || '?').toUpperCase()}: ` : ''}${lf.n_sections} sections along ${(lf.axis_name || '?').toUpperCase()} at ${lf.interval} mm, ${runs}${lf.n_levels ? ` (split at ${lf.n_levels} flat step${lf.n_levels === 1 ? '' : 's'})` : ''}${lf.n_holes ? `, ${lf.n_holes} hole${lf.n_holes === 1 ? '' : 's'} cut` : ''}: one smooth face per run${lf.n_ruled_runs ? ` (${lf.n_ruled_runs} run${lf.n_ruled_runs === 1 ? '' : 's'} ruled)` : ''}, like Fusion's Mesh Section Sketch + Loft.${gate}` }
+               note: `${lf.range ? `Only ${lf.range[0].toFixed(1)} to ${lf.range[1].toFixed(1)} mm along ${(lf.axis_name || '?').toUpperCase()}: ` : ''}${lf.n_sections} sections along ${(lf.axis_name || '?').toUpperCase()} at ${lf.interval} mm, ${runs}${lf.n_levels ? ` (split at ${lf.n_levels} flat step${lf.n_levels === 1 ? '' : 's'})` : ''}${lf.n_holes ? `, ${lf.n_holes} hole${lf.n_holes === 1 ? '' : 's'} cut` : ''}: one smooth face per run${lf.n_ruled_runs ? ` (${lf.n_ruled_runs} run${lf.n_ruled_runs === 1 ? '' : 's'} ruled)` : ''}, like Fusion's Mesh Section Sketch + Loft.${axisWhy}${gate}` }
     }
     if (r.mode === 'facegroup') {
       const fg = r.metrics?.fgroup || {}

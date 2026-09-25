@@ -159,9 +159,24 @@ export const useConvertStore = defineStore('convert', {
       if (s.tool !== 'loft' && s.tool !== 'xray') return null
       const a = s.params.slice_axis
       if (a === 'x' || a === 'y' || a === 'z') return a
+      // a finished whole-body loft chose its axis by slicing structure
+      // (sliced_loft.choose_axis); the plane follows that choice
+      const chosen = s.loftAxisChosen
+      if (chosen) return chosen
       const bb = s.inputStats?.bbox_mm
       if (!bb) return null
       return 'xyz'[bb.indexOf(Math.max(...bb))]
+    },
+    // The axis a finished loft run picked for 'auto' (null before a run,
+    // for a partial loft, or when the user fixed the axis).
+    loftAxisChosen: (s) => {
+      if (s.status !== 'done' || !s.result?.ok || s.tool !== 'loft') return null
+      if (s.params.slice_axis !== 'auto') return null
+      const lf = s.result?.metrics?.loft
+        || (s.result?.bodies || []).find((b) => b.mode === 'loft' && b.metrics?.loft)?.metrics?.loft
+      if (!lf || !lf.axis_auto || lf.range) return null
+      const a = lf.axis_name
+      return a === 'x' || a === 'y' || a === 'z' ? a : null
     },
     fusionBfillScriptUrl: (s) =>
       s.status === 'done' && s.result?.ok && s.result?.has_bfill_script

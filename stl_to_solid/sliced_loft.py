@@ -53,10 +53,62 @@ SMOOTH_MAX_CHANGE = 0.15   # relative area jump between neighbours above which t
 
 
 def axis_index(mesh, slice_axis='auto'):
-    """'auto' -> longest extent; 'x'|'y'|'z' -> 0|1|2."""
+    """'x'|'y'|'z' -> 0|1|2; 'auto' -> the longest extent. The longest
+    side is the rule the web app's slice slider and the partial loft use
+    (it is known before anything is cut); the whole-body loft picks its
+    axis by slicing structure instead (choose_axis)."""
     if slice_axis in (None, 'auto'):
         return int(np.argmax(mesh.extents))
     return 'xyz'.index(slice_axis)
+
+
+def choose_axis(mesh, interval=0.2, join_mm=0.0, trim_mm=0.0, verbose=True):
+    """The axis a whole-body loft should slice along: the one whose
+    section stack has the fewest single-section runs, then the fewest
+    runs plus steep neighbour pairs (area jumping by more than
+    SMOOTH_MAX_CHANGE, which the loft can only do ruled), then the
+    longest extent. Measured on a round lens cap (60 x 60 x 12 mm, X and
+    Y a thousandth apart): the longest side gave 72 runs with 48 of one
+    section (10 minutes, 707 loose solids), Z gave 5 runs (32 s, one
+    solid). A 20 x 4 x 22 mm plate wants its 4 mm axis (one run); a disc
+    is one run across its face too, but with the width racing at both
+    ends, so the steep count sends it to its short axis. Scored on a
+    coarse stack (about 1 mm, at least four sections along the thinnest
+    side): under a second per axis. Returns (axis, scores) with
+    scores['x'|'y'|'z'] = {'runs', 'single', 'steep', 'extent',
+    'sections'}."""
+    ext = np.asarray(mesh.extents, float)
+    coarse = min(max(1.0, float(interval)), max(float(interval), float(ext.min()) / 4.0))
+    scores, best, best_key = {}, None, None
+    for ax in range(3):
+        try:
+            slices, _, _ = slice_mesh(mesh, ax, coarse, verbose=False, join_mm=join_mm, trim_mm=trim_mm)
+            slices, _, _ = drop_dome_ends(slices)
+            runs = build_runs(slices) if slices else []
+        except Exception:
+            slices, runs = [], []
+        single = sum(1 for a, b, _ in runs if b == a)
+        steep = 0
+        for a, b, _ in runs:
+            ar = [_total_area(slices[k][2]) for k in range(a, b + 1)]
+            steep += sum(1 for i0, i1, smooth in _stretches(ar) if not smooth)
+        sc = {'runs': len(runs), 'single': int(single), 'steep': int(steep),
+              'extent': float(ext[ax]), 'sections': len(slices)}
+        scores['xyz'[ax]] = sc
+        if len(slices) < 2:
+            continue
+        key = (single, len(runs) + steep, -float(ext[ax]))
+        if best_key is None or key < best_key:
+            best, best_key = ax, key
+    if best is None:
+        best = int(np.argmax(ext))
+    if verbose:
+        print("[loft] axis auto -> " + 'xyz'[best].upper() + " by slicing structure: "
+              + ", ".join(f"{k.upper()} {v['runs']} run(s)"
+                          + (f" ({v['single']} of one section)" if v['single'] else "")
+                          + (f" + {v['steep']} steep" if v['steep'] else "")
+                          for k, v in scores.items()))
+    return best, scores
 
 
 def _frame(axis):
@@ -231,13 +283,13 @@ def align(Q, prev):
     if prev is None:
         k = int(np.argmax(Q[:, 0] + 1e-3 * Q[:, 1]))
         return np.roll(Q, -k, 0)
-    # vectorised over all rotations via the circulant distance
-    n = len(Q)
-    best, bk = None, 0
-    for k in range(n):
-        d = float(np.sum((np.roll(Q, -k, 0) - prev) ** 2))
-        if best is None or d < best:
-            best, bk = d, k
+    # sum |roll(Q, -k) - prev|^2 = |Q|^2 + |prev|^2 - 2 c[k], with c the
+    # circular cross-correlation over both coordinates: all n rolls in
+    # one FFT instead of an n^2 Python loop (n up to 1200, 60 rings a run)
+    Q = np.asarray(Q, float)
+    prev = np.asarray(prev, float)
+    c = np.fft.ifft(np.fft.fft(Q, axis=0) * np.conj(np.fft.fft(prev, axis=0)), axis=0).real.sum(1)
+    bk = int(np.argmax(c))
     return np.roll(Q, -bk, 0)
 
 

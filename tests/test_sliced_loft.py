@@ -290,6 +290,29 @@ def test_loft_ellipsoid_along_x():
     _check(shape, m, faces_max=30, dev_p95=0.08, vol_pct=0.5)
 
 
+def test_choose_axis_by_slicing_structure(tmp_path):
+    """The whole-body loft picks the axis whose stack has the fewest
+    one-section runs, then the fewest runs, then the longest side: a
+    round cap wants its short axis, a thin plate its thin one, and an
+    ellipsoid (one run whichever way) its longest."""
+    from stl_to_solid.sliced_loft import choose_axis
+    cap = (cq.Workplane('XY').circle(30).extrude(12).faces('>Z').workplane()
+           .circle(30).circle(27).extrude(4))
+    m = trimesh.load(synth.export(cap, tmp_path / 'cap.stl'), force='mesh')
+    ax, sc = choose_axis(m, 0.2, verbose=False)
+    assert ax == 2, sc
+    assert sc['z']['runs'] + sc['z']['steep'] < sc['x']['runs'] + sc['x']['steep'], sc
+    plate = (cq.Workplane('XZ').box(20, 22, 4).faces('>Y').workplane()
+             .rect(10, 12, forConstruction=True).vertices().hole(3))
+    m = trimesh.load(synth.export(plate, tmp_path / 'plate.stl'), force='mesh')
+    assert abs(m.extents[1] - 4.0) < 0.1
+    ax, sc = choose_axis(m, 0.2, verbose=False)
+    assert ax == 1, sc
+    assert sc['y']['runs'] == 1 and sc['y']['single'] == 0
+    ax, sc = choose_axis(_ellipsoid(), 0.2, verbose=False)
+    assert ax == 0, sc
+
+
 def test_loft_stepped_shaft_breaks_at_levels(tmp_path):
     from stl_to_solid.sliced_loft import loft_body
     p = synth.export(synth.stepped_shaft(), tmp_path / 'shaft.stl')
