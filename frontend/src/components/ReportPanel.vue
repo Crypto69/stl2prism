@@ -210,14 +210,14 @@ function loftNotes(lf) {
   }
   const holes = sk.filter((x) => x.what === 'hole')
   if (holes.length) {
-    out.push(`${holes.length} hole${holes.length === 1 ? ' was' : 's were'} left filled (${holes.map((x) => `${ax} ${mm(x.z0)} to ${mm(x.z1)}`).join(', ')}).`)
+    out.push(`${holes.length} hole${holes.length === 1 ? ' was' : 's were'} left filled: ${holes.map((x) => `${x.width_mm != null ? `${Number(x.width_mm).toFixed(1)} mm wide at ` : ''}${ax} ${mm(x.z0)} to ${mm(x.z1)}`).join(', ')}. Material sits there that the mesh does not have; the solid → mesh row above measures it.`)
   }
   const other = sk.filter((x) => x.what !== 'run' && x.what !== 'hole')
   if (other.length) {
     out.push(`${other.length} small piece${other.length === 1 ? '' : 's'} (${other.map((x) => x.what).join(', ')}) could not be built.`)
   }
   if (lf.fuse === 'compound') {
-    out.push(`The pieces did not fuse: the STEP holds ${lf.n_solids || 'several'} loose solids that only touch. The solid → mesh deviation above counts their internal caps, which lie inside the part, so it reads high.`)
+    out.push(`The pieces did not fuse: the STEP holds ${lf.n_solids || 'several'} loose solids that only touch (their shared faces are not counted in the deviation above).`)
   }
   if (lf.n_extruded_pairs) {
     out.push(`${lf.n_extruded_pairs} slice pair${lf.n_extruded_pairs === 1 ? '' : 's'} could not be lofted (the outlines did not correspond) and ${lf.n_extruded_pairs === 1 ? 'was' : 'were'} extruded straight instead: the outline steps once there.`)

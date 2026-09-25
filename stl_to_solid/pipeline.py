@@ -43,6 +43,25 @@ def tessellate_solid(solid, tolerance=0.02, angular=0.1):
     return trimesh.Trimesh(V, F, process=False)
 
 
+def _on_brep(solid, pts, tol):
+    """Which of `pts` lie within `tol` of a face of the BREP solid (exact
+    distance, BRepExtrema), for checking that sample points taken from a
+    triangulation are real."""
+    import cadquery as cq
+    from OCP.BRepExtrema import BRepExtrema_DistShapeShape
+    from OCP.BRepBuilderAPI import BRepBuilderAPI_MakeVertex
+    from OCP.gp import gp_Pnt
+    shape = solid.val() if hasattr(solid, 'val') else solid
+    if isinstance(shape, cq.Shape):
+        shape = shape.wrapped
+    out = np.zeros(len(pts), bool)
+    for i, p in enumerate(np.asarray(pts, float)):
+        v = BRepBuilderAPI_MakeVertex(gp_Pnt(float(p[0]), float(p[1]), float(p[2]))).Vertex()
+        d = BRepExtrema_DistShapeShape(v, shape)
+        out[i] = d.IsDone() and d.Value() <= tol
+    return out
+
+
 def sample_points(mesh, n_samples=None, include_vertices=True, max_points=200000):
     """Points on `mesh` for deviation measurement.
 
@@ -132,15 +151,29 @@ def validate(solid, mesh, n_samples=None, cyls=None, hole_band=0.15,
         rpts, _ = sample_points(rb, max(2000, n_uni // 2), include_vertices=False)
         _, rdist, _ = trimesh.proximity.closest_point(mesh, rpts)
         out['rev_internal_pts'] = 0
+        out['rev_phantom_pts'] = 0
         if ignore_inside:
             from .mesh_prep import _contains
             try:
                 inner = _contains(mesh, rpts) & (rdist > tess[0])
             except Exception:
                 inner = np.zeros(len(rpts), bool)
-            if inner.any() and not inner.all():
+            # a triangulation can fill a planar face's inner wire (a
+            # 700-point toothed ring the mesher could not honour) with a
+            # membrane the BREP does not have: a far sample point is kept
+            # only if it really lies on a face of the solid
+            phantom = np.zeros(len(rpts), bool)
+            far = np.where((rdist > 4 * tess[0]) & ~inner)[0]
+            if len(far):
+                try:
+                    phantom[far] = ~_on_brep(solid, rpts[far], 4 * tess[0])
+                except Exception:
+                    pass
+            drop = inner | phantom
+            if drop.any() and not drop.all():
                 out['rev_internal_pts'] = int(inner.sum())
-                rdist = rdist[~inner]
+                out['rev_phantom_pts'] = int(phantom.sum())
+                rdist = rdist[~drop]
         out['rev_dev_max'] = float(rdist.max())
         out['rev_dev_p95'] = float(np.percentile(rdist, 95))
         out['symmetric'] = True
@@ -1397,6 +1430,9 @@ def _loft_body(mesh, verbose, slice_mm, slice_axis, ruled, gates, loft_opts=None
         if metrics.get('rev_internal_pts'):
             print(f"[loft] {metrics['rev_internal_pts']} reverse sample points lay inside the part "
                   f"(touching caps) and were left out of the solid -> mesh deviation")
+        if metrics.get('rev_phantom_pts'):
+            print(f"[loft] {metrics['rev_phantom_pts']} reverse sample points came from the check's "
+                  f"triangulation, not from the solid (a filled inner wire), and were left out")
         for sk in info.get('skipped') or []:
             print(f"[loft] could not build: {sk['text'] if isinstance(sk, dict) else sk}")
         if info.get('prismatic_hint'):

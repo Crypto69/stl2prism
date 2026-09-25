@@ -57,6 +57,7 @@ STEP_AREA_FRAC = 0.02      # a flat level holding this share of the bbox section
 END_AREA_FRAC = 0.5        # an end slice under this share of its neighbour is a dome tip
 PTS_PER_MM = 2.0           # ring resampling density before the spline approximation
 RING_MIN, RING_MAX = 32, 1200
+LOOP_MIN_AREA = 0.01       # mm^2: a section loop smaller than this is mesh dust, not a hole or an island
 SPLINE_TOL = 0.02          # mm: Douglas-Peucker thinning of the rings kept for the Fusion script
 RING_FIT_TOL = 0.05        # mm: ring samples to their shared-basis B-spline
 RING_POLES_MIN, RING_POLES_MAX = 16, 640   # poles per ring (doubling until RING_FIT_TOL holds)
@@ -233,14 +234,18 @@ class Cutter:
         o = self.n * z
         if self.join_mm <= 0 and self.trim_mm <= 0:
             loops, _ = section_loops(self.V, self.F[m], o, self.n, min_area=1e-4)
-            return loops
+            return [(o_, [h for h in h_ if abs(signed_area(h)) >= LOOP_MIN_AREA]) for o_, h_ in loops]
         loops, _, _, _ = section_curves(self.V, self.F[m], o, self.n, min_area=1e-4,
                                         join_mm=self.join_mm)
         if self.trim_mm > 0:
             loops = [(trim_slivers(outer, self.trim_mm)[0],
                       [trim_slivers(h, self.trim_mm)[0] for h in holes]) for outer, holes in loops]
             loops = [(o_, h_) for o_, h_ in loops if len(o_) >= 3]
-        return loops
+        # speck holes (a 0.0003 mm^2 "hole" from a double skin) are not
+        # features: lofting them fails and a failed hole is reported as
+        # left filled. Outers stay whatever their size: the end slice a
+        # hair under a dome tip is tiny, and it is what marks the apex
+        return [(o_, [h for h in h_ if abs(signed_area(h)) >= LOOP_MIN_AREA]) for o_, h_ in loops]
 
     def to_3d(self, xy, z):
         return to_3d(xy, (self.n * z, self.u, self.v, self.n))
@@ -560,6 +565,34 @@ def _valid(shape):
     return BRepCheck_Analyzer(shape.wrapped).IsValid()
 
 
+def _manifold(shape):
+    """Every edge of the shape borders exactly two faces (seam edges of a
+    periodic face count twice on their own). A fuse that leaves a
+    membrane across the part, or an open shell, fails this while
+    BRepCheck and the volume both pass; cheap (a topology map)."""
+    from OCP.TopExp import TopExp
+    from OCP.TopAbs import TopAbs_EDGE, TopAbs_FACE
+    from OCP.TopTools import TopTools_IndexedDataMapOfShapeListOfShape
+    from OCP.BRep import BRep_Tool
+    from OCP.TopoDS import TopoDS
+    m = TopTools_IndexedDataMapOfShapeListOfShape()
+    TopExp.MapShapesAndAncestors_s(shape.wrapped, TopAbs_EDGE, TopAbs_FACE, m)
+    for i in range(1, m.Extent() + 1):
+        e = TopoDS.Edge_s(m.FindKey(i))
+        if BRep_Tool.Degenerated_s(e):
+            continue
+        n = m.FindFromIndex(i).Extent()
+        if n == 2:
+            continue
+        if n == 1:
+            # a seam of a periodic face lists the face once; count it twice
+            f = TopoDS.Face_s(m.FindFromIndex(i).First())
+            if BRep_Tool.IsClosed_s(e, f):
+                continue
+        return False
+    return True
+
+
 def _volume(shape):
     """Adaptive volume: cq's Volume() is 1-2 % off on B-spline faces."""
     from .pipeline import accurate_volume
@@ -789,6 +822,25 @@ def _loft_stretches(wires, areas, zs, ruled, forced, est, tag, verbose):
     return solid, used_ruled
 
 
+def _extrude_polygon(xy, cutter, z0, z1, tol=RING_FIT_TOL):
+    """Prism of a raw section loop between two heights, as straight
+    lines: the loop thinned by Douglas-Peucker at `tol`, one planar face
+    per segment. The fallback when no spline ring of the outline is
+    valid (a knurled rim); valid by construction on a simple loop."""
+    import cadquery as cq
+    P = np.asarray(xy, float)
+    if len(P) > 1 and np.allclose(P[0], P[-1]):
+        P = P[:-1]
+    keep = douglas_peucker(np.vstack([P, P[:1]]), tol)[:-1]
+    P = P[keep] if len(keep) >= 3 else P
+    P = P if signed_area(P) > 0 else P[::-1].copy()
+    lo = cutter.to_3d(P, z0)
+    hi = cutter.to_3d(P, z1)
+    w0 = cq.Wire.makePolygon([cq.Vector(*p) for p in lo], close=True)
+    w1 = cq.Wire.makePolygon([cq.Vector(*p) for p in hi], close=True)
+    return _thru([w0, w1], True)
+
+
 def _extrude(outer3d, holes3d, d):
     """Prism of an outline (minus its holes) along d: a ruled loft between
     the ring and its translated copy. extrudeLinear refuses B-spline
@@ -801,20 +853,39 @@ def _extrude(outer3d, holes3d, d):
     return body
 
 
-def _fuse_two(a, b, want, tol_pct):
+FUSE_BUDGET_S = 120.0      # s: the whole fuse of a body; past it, what is left stays loose (honest, and bounded)
+
+
+def _fuse_two(a, b, want, tol_pct, fuzzy=True):
     """One valid solid from two touching pieces, or None: glued fuse (the
     pieces share planar caps), then plain, then fuzzy; a result that is
     one solid holding both volumes (within tol_pct) but reads invalid
     gets one ShapeFix pass (two caps whose B-spline rings overlap along a
-    straight stretch come out with inflated tolerances). Returns (shape,
-    volume, how) or None."""
-    for how, kw in (('glue', dict(glue=True)), ('plain', {}), ('fuzzy', dict(tol=1e-3))):
+    straight stretch come out with inflated tolerances). The fuzzy fuse
+    is what joins a pair-chain piece (a hundred thin slabs) to its
+    neighbour, so it stays; heavy rings are avoided upstream instead.
+    Returns (shape, volume, how) or None."""
+    tries = [('glue', dict(glue=True)), ('plain', {})]
+    if fuzzy:
+        tries.append(('fuzzy', dict(tol=1e-3)))
+    # a spline cap meeting a different ring is split into pieces by a
+    # good fuse (25 + 26 faces -> 234 on the body cap); a broken one
+    # multiplies them far more (28 -> 754, with a membrane), and that
+    # one the manifold check catches as well
+    cap_faces = 8 * (len(a.Faces()) + len(b.Faces())) + 20
+    for how, kw in tries:
         try:
             f = a.fuse(b, **kw)
         except Exception:
             continue
         try:
             if len(f.Solids()) != 1:
+                continue
+            if len(f.Faces()) > cap_faces or not _manifold(f):
+                # a fuse of touching pieces never multiplies faces, and
+                # never leaves an edge with one or three faces: 28 -> 754
+                # faces was a broken solid with a membrane across the part
+                # that BRepCheck and the volume both passed
                 continue
             v = _volume(f)
             if abs(v - want) / want * 100 > tol_pct if want > 0 else False:
@@ -841,41 +912,48 @@ def _fuse_all(solids, verbose, tol_pct=2.0):
     compound, with a warning. Returns (shape, how) with how in 'single'
     | 'glue' | 'fused' | 'compound'."""
     import cadquery as cq
+    import time
     if len(solids) == 1:
         return solids[0], 'single'
+    # wall time (OCC booleans run on several threads, so CPU time runs
+    # two to four times faster than the clock and cut a 20 s fuse short)
+    t0 = time.time()
+    over = lambda: time.time() - t0 > FUSE_BUDGET_S
     chains, hows = [], set()
     for piece in solids:
         pv = _volume(piece)
         placed = False
-        for ci in range(len(chains) - 1, -1, -1):
-            acc, av = chains[ci]
-            got = _fuse_two(acc, piece, av + pv, tol_pct)
-            if got is not None:
-                chains[ci] = (got[0], got[1])
-                hows.add(got[2])
-                placed = True
-                break
+        if not over():
+            for ci in range(len(chains) - 1, -1, -1):
+                acc, av = chains[ci]
+                got = _fuse_two(acc, piece, av + pv, tol_pct)
+                if got is not None:
+                    chains[ci] = (got[0], got[1])
+                    hows.add(got[2])
+                    placed = True
+                    break
+                if over():
+                    break
         if not placed:
             chains.append((piece, pv))
-    # join the chains
-    changed = True
-    while changed and len(chains) > 1:
-        changed = False
-        for i in range(len(chains)):
-            for j in range(i + 1, len(chains)):
-                got = _fuse_two(chains[i][0], chains[j][0], chains[i][1] + chains[j][1], tol_pct)
-                if got is not None:
-                    chains[i] = (got[0], got[1])
-                    hows.add(got[2])
-                    del chains[j]
-                    changed = True
-                    break
-            if changed:
-                break
+    # join the chains: each pair once, within the budget
+    i = 0
+    while i < len(chains) and not over():
+        j = i + 1
+        while j < len(chains) and not over():
+            got = _fuse_two(chains[i][0], chains[j][0], chains[i][1] + chains[j][1], tol_pct)
+            if got is not None:
+                chains[i] = (got[0], got[1])
+                hows.add(got[2])
+                del chains[j]
+            else:
+                j += 1
+        i += 1
     if len(chains) > 1:
         if verbose:
             print(f"[loft] {len(solids)} piece(s) fused into {len(chains)} solids that would not "
-                  f"join; left as separate solids in one compound")
+                  f"join{' within the time budget' if over() else ''} ({time.time() - t0:.0f} s); "
+                  f"left as separate solids in one compound")
         return cq.Compound.makeCompound([c for c, _ in chains]), 'compound'
     acc, acc_vol = chains[0]
     try:
@@ -958,6 +1036,10 @@ def loft_body(mesh, axis, interval=0.2, ruled=False, verbose=True, z_range=None,
                 Q = align(ccw(resample(e, N)), prev)
                 rings.append(Q)
                 prev = Q
+            # no denser sampling for a toothed outline: rings of 300-600
+            # poles made every fuse take minutes (the body cap: 20 s ->
+            # 640 s). Such a ring goes ruled, and if its spline crosses
+            # itself the run is extruded from the raw polygon instead
             if bridge_to is not None:
                 rings[-1] = rings[-2].copy()
             rings3d = [cutter.to_3d(Q, z) for Q, z in zip(rings, zs)]
@@ -983,16 +1065,40 @@ def loft_body(mesh, axis, interval=0.2, ruled=False, verbose=True, z_range=None,
             try:
                 body, used_ruled, lstats = _loft_rings(rings3d, areas, zs, ruled, tag, verbose, merge,
                                                        ax_vec, bridge_pairs)
+                if not _valid(body):
+                    # a fitted ring that crosses itself a hair (a cornered
+                    # outline at the pole cap) reads invalid; ShapeFix
+                    # usually settles it, and a body it cannot settle is
+                    # still kept: the fuse guards (_fuse_two) refuse a
+                    # broken result, and a loose valid-looking piece beats
+                    # a 100-face polygon prism that will not fuse at all
+                    fixed = body.fix()
+                    if _valid(fixed) and abs(_volume(fixed) - _volume(body)) < 0.02 * max(_volume(body), 1e-9):
+                        body = fixed
+                    else:
+                        rinfo['invalid'] = True
+                        if verbose:
+                            print(f"[loft] {tag}: the lofted solid reads invalid (a fitted ring crosses itself); kept")
             except Exception as e:
                 # even the pair chain failed: the first outline extruded
                 # over the whole run keeps the material; only if that
                 # fails too is the outline skipped (a hole in the part,
                 # reported)
                 try:
-                    body = _extrude(rings3d[0], [], ax_vec * (zs[-1] - zs[0]))
+                    body = _extrude_polygon(chain[0][0], cutter, zs[0], zs[-1])
+                    for hp in chain[0][1]:
+                        try:
+                            tool = _extrude_polygon(hp, cutter, zs[0] - EPS, zs[-1] + EPS)
+                            c = body.cut(tool)
+                            if not c.wrapped.IsNull() and _valid(c):
+                                body = c
+                                n_holes += 1
+                        except Exception:
+                            pass
                     used_ruled, lstats = True, {'merged': 0, 'extruded': [[zs[0], zs[-1]]]}
                     if verbose:
-                        print(f"[loft] {tag}: {type(e).__name__}: {e}; first section extruded over the run")
+                        print(f"[loft] {tag}: {type(e).__name__}: {e}; first section extruded over the run "
+                              f"as straight lines ({len(body.Faces())} faces)")
                 except Exception as e2:
                     skipped.append({'what': 'run', 'z0': float(zs[0]), 'z1': float(zs[-1]),
                                     'text': f"{tag}: {type(e).__name__}: {e}; extrusion failed too: {e2}"})
@@ -1057,8 +1163,10 @@ def loft_body(mesh, axis, interval=0.2, ruled=False, verbose=True, z_range=None,
                     body = cut
                     n_holes += 1
                 except Exception as e:
+                    hw = float(np.ptp(np.asarray(hraw[0], float), axis=0).max())
                     skipped.append({'what': 'hole', 'z0': float(zs[0]), 'z1': float(zs[-1]),
-                                    'text': f"{htag}: {type(e).__name__}: {e}"})
+                                    'width_mm': hw,
+                                    'text': f"{htag} ({hw:.1f} mm wide): {type(e).__name__}: {e}"})
                     if verbose:
                         print(f"[loft] {htag} left filled ({type(e).__name__}: {e})")
             # dome tips: a ruled cone from the end ring to the mesh apex
