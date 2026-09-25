@@ -313,6 +313,40 @@ def test_choose_axis_by_slicing_structure(tmp_path):
     assert ax == 0, sc
 
 
+def test_loft_merges_identical_rings_into_one_prism(tmp_path):
+    """A stack of equal sections is one straight stretch (3 faces), a
+    shallow draft is not merged away (it steps to a new group every
+    RING_FIT_TOL of drift and stays within tolerance)."""
+    from stl_to_solid.sliced_loft import loft_body
+    m = trimesh.creation.box([20.0, 20.0, 10.0])
+    shape, info = loft_body(m, 2, 0.2, verbose=False)
+    assert info['n_merged'] > 40, info
+    _check(shape, m, faces_max=3, dev_p95=0.05, vol_pct=0.5)
+    p = synth.export(synth.drafted_block(), tmp_path / 'draft.stl')
+    m = trimesh.load(p, force='mesh')
+    shape, info = loft_body(m, 2, 0.2, verbose=False)
+    m2, s = _check(shape, m, faces_max=40, dev_p95=0.05, vol_pct=0.5)
+    assert len(s.Faces()) > 3
+
+
+def test_loft_goes_ruled_directly_when_rings_do_not_fit(monkeypatch):
+    """With the pole cap too low for the rings to fit, the smooth loft is
+    not even tried (every such attempt blew up before falling back)."""
+    from stl_to_solid import sliced_loft as sl
+    calls = []
+    orig = sl._thru
+
+    def spy(wires, ruled, apex=None, apex_first=False):
+        calls.append(bool(ruled))
+        return orig(wires, ruled, apex, apex_first)
+    monkeypatch.setattr(sl, '_thru', spy)
+    monkeypatch.setattr(sl, 'RING_POLES_MIN', 4)
+    monkeypatch.setattr(sl, 'RING_POLES_MAX', 4)
+    shape, info = sl.loft_body(_sphere(), 2, 0.5, verbose=False)
+    assert calls and all(calls), calls
+    assert info['n_ruled_runs'] == 1
+
+
 def test_loft_stepped_shaft_breaks_at_levels(tmp_path):
     from stl_to_solid.sliced_loft import loft_body
     p = synth.export(synth.stepped_shaft(), tmp_path / 'shaft.stl')

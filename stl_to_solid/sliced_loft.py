@@ -460,7 +460,7 @@ def _ubs_design(N, K):
     return A
 
 
-def fit_ring_poles(rings, tol=RING_FIT_TOL, kmin=RING_POLES_MIN, kmax=RING_POLES_MAX):
+def fit_ring_poles(rings, tol=RING_FIT_TOL, kmin=None, kmax=None):
     """Least-squares poles of every ring on one shared basis.
 
     `rings`: (N, d) arrays with the same N (equal-arc-length samples,
@@ -469,6 +469,8 @@ def fit_ring_poles(rings, tol=RING_FIT_TOL, kmin=RING_POLES_MIN, kmax=RING_POLES
     Sharing the basis is what keeps the loft light and robust: the
     surface has K x M poles (a sphere: 16 x 60) and ThruSections has no
     knot vectors to unify. Returns (poles [(K, d)], K, worst_dev)."""
+    kmin = RING_POLES_MIN if kmin is None else kmin
+    kmax = RING_POLES_MAX if kmax is None else kmax
     N = len(rings[0])
     kmax = max(kmin, min(kmax, N // 2))
     K = min(kmin, kmax)
@@ -551,18 +553,74 @@ def _volume(shape):
     return accurate_volume(shape)
 
 
-def _stretches(areas, max_change=None):
+def _polyline_gap(P, Q, chunk=256):
+    """Largest distance from a point of closed polyline P to closed
+    polyline Q (point-to-segment, vectorised in chunks)."""
+    P = np.asarray(P, float)
+    Q = np.asarray(Q, float)
+    A = Q
+    B = np.roll(Q, -1, 0)
+    AB = B - A
+    L2 = np.maximum((AB * AB).sum(1), 1e-18)
+    worst = 0.0
+    for c in range(0, len(P), chunk):
+        p = P[c:c + chunk]
+        AP = p[:, None, :] - A[None, :, :]
+        t = np.clip((AP * AB[None, :, :]).sum(2) / L2[None, :], 0.0, 1.0)
+        D = AP - t[:, :, None] * AB[None, :, :]
+        worst = max(worst, float(np.sqrt((D * D).sum(2)).min(1).max()))
+    return worst
+
+
+def _merge_identical(raw2d, rings2d, tol=RING_FIT_TOL):
+    """Collapse runs of sections that are the same outline. A group of
+    sections whose raw cut loops all lie within `tol` of the group's
+    *first* loop (not of the previous one, so a shallow draft still steps
+    to a new group every `tol` of drift) keeps only its first ring and
+    repeats that ring at the last section's height, so the pair is an
+    exact extrusion: a stack of 60 equal rectangles becomes one prism
+    instead of 59 bands, with no twist from the sample phase drifting
+    slice to slice. The raw loops are compared (as polylines, both ways),
+    not the resampled rings: resampling rounds the corners by up to half
+    a sample spacing, which is more than `tol`. Returns (rings2d, keep,
+    forced): the new ring list, the source index of each ring, and, in
+    new-index space, the pairs (i, i+1) that were a group."""
+    n = len(rings2d)
+    out, keep, forced, i = [np.asarray(rings2d[0], float)], [0], set(), 0
+    while i < n - 1:
+        j = i
+        while j + 1 < n and _polyline_gap(raw2d[j + 1], raw2d[i]) <= tol \
+                and _polyline_gap(raw2d[i], raw2d[j + 1]) <= tol:
+            j += 1
+        if j > i:
+            forced.add(len(out) - 1)
+            out.append(np.asarray(rings2d[i], float).copy())
+            keep.append(j)
+            i = j
+        else:
+            out.append(np.asarray(rings2d[i + 1], float))
+            keep.append(i + 1)
+            i += 1
+    return out, keep, forced
+
+
+def _stretches(areas, max_change=None, forced=()):
     """Split a run's ring indices into stretches: consecutive rings whose
     material area changes by at most `max_change` (relative) stay in one
     smooth stretch; a jump bigger than that is lofted ruled between the
     two rings. A smooth B-spline through sections that shrink by half per
     step (a dome tip) overshoots by tenths of a millimetre; a ruled pair
-    there is exact within d^2/8R. Returns [(i0, i1, smooth)] covering
-    0..n-1 with shared ends."""
+    there is exact within d^2/8R. Pairs in `forced` (the collapsed
+    identical groups of _merge_identical) are ruled as well and never
+    join a smooth stretch: a smooth surface through a repeated ring is
+    the flare case. Returns [(i0, i1, smooth)] covering 0..n-1 with
+    shared ends."""
     if max_change is None:
         max_change = SMOOTH_MAX_CHANGE
     n = len(areas)
-    steep = [abs(areas[i + 1] - areas[i]) > max_change * max(min(areas[i], areas[i + 1]), 1e-12)
+    forced = set(forced)
+    steep = [i in forced or
+             abs(areas[i + 1] - areas[i]) > max_change * max(min(areas[i], areas[i + 1]), 1e-12)
              for i in range(n - 1)]
     out, i = [], 0
     while i < n - 1:
@@ -574,7 +632,7 @@ def _stretches(areas, max_change=None):
     return out
 
 
-def _loft_rings(rings3d, areas, zs, ruled, tag, verbose):
+def _loft_rings(rings3d, areas, zs, ruled, tag, verbose, merge=None):
     """Solid through 3-D rings (each (N, 3), same N, aligned) on one shared
     spline basis. Smooth unless `ruled`, in stretches: where the section
     area jumps by more than SMOOTH_MAX_CHANGE between neighbours the pair
@@ -582,14 +640,38 @@ def _loft_rings(rings3d, areas, zs, ruled, tag, verbose):
     or off the trapezoid integral of its areas by more than VOL_CHECK_PCT
     is rebuilt ruled. The stretch solids are glued into one. A result off
     the whole run's integral by more than RULED_VOL_PCT is refused
-    (raises): the rings do not correspond. Returns (solid, used_ruled)."""
+    (raises): the rings do not correspond.
+
+    Two short cuts, both measured. Rings the shared basis cannot fit
+    within RING_FIT_TOL (cornered outlines at the pole cap) go ruled
+    straight away, because every smooth loft through such rings came out
+    wrong by orders of magnitude before falling back anyway. And a ruled
+    run then takes `merge` = (rings3d, areas, zs, forced) from
+    _merge_identical: identical sections collapsed to one straight
+    extrusion each (the `forced` pairs). A smooth run keeps every ring:
+    near a sphere's equator neighbours are also "identical" within tol,
+    and a straight band there would cut the one smooth face in three.
+    Returns (solid, used_ruled, stats) with stats = {'ruled_direct':
+    bool, 'merged': sections dropped}."""
+    stats = {'ruled_direct': False, 'merged': 0}
+    forced = set()
+    _, K, dev = fit_ring_poles(rings3d)
+    if dev > RING_FIT_TOL and not ruled:
+        ruled = True
+        stats['ruled_direct'] = True
+        if verbose:
+            print(f"[loft] {tag}: rings fit to {dev:.3f} mm with {K} poles (cap); ruled directly")
+    if ruled and merge is not None and len(merge[0]) < len(rings3d):
+        stats['merged'] = len(rings3d) - len(merge[0])
+        rings3d, areas, zs, forced = merge
+        if verbose:
+            print(f"[loft] {tag}: {stats['merged']} repeated section(s) merged into "
+                  f"{len(forced)} straight stretch(es)")
     wires, K, dev = _ring_wires(rings3d)
-    if verbose and dev > RING_FIT_TOL:
-        print(f"[loft] {tag}: rings fit to {dev:.3f} mm with {K} poles (cap)")
     est = float(np.trapezoid(areas, zs)) if len(zs) > 1 else 0.0
     used_ruled = bool(ruled)
     pieces = []
-    for i0, i1, smooth in _stretches(areas):
+    for i0, i1, smooth in _stretches(areas, forced=forced):
         w = wires[i0:i1 + 1]
         e = float(np.trapezoid(areas[i0:i1 + 1], zs[i0:i1 + 1]))
         if smooth and not ruled and len(w) >= 2:
@@ -620,7 +702,7 @@ def _loft_rings(rings3d, areas, zs, ruled, tag, verbose):
     if off > RULED_VOL_PCT:
         raise RuntimeError(f'loft volume off the section integral by {off:.0f}%; '
                            f'the rings do not correspond')
-    return solid, used_ruled
+    return solid, used_ruled, stats
 
 
 def _extrude(outer3d, holes3d, d):
@@ -703,7 +785,7 @@ def loft_body(mesh, axis, interval=0.2, ruled=False, verbose=True, z_range=None,
     ax_vec = np.zeros(3)
     ax_vec[axis] = 1.0
 
-    solids, run_infos, n_holes, n_ruled, skipped = [], [], 0, 0, []
+    solids, run_infos, n_holes, n_ruled, n_merged, skipped = [], [], 0, 0, 0, []
     for ri, (a, b, chains) in enumerate(runs):
         zs_all = [slices[k][0] for k in range(a, b + 1)]
         keep = thin_indices(len(zs_all), areas=[_total_area(slices[k][2]) for k in range(a, b + 1)])
@@ -727,10 +809,16 @@ def loft_body(mesh, axis, interval=0.2, ruled=False, verbose=True, z_range=None,
                     secs[si].setdefault('more_outers', []).append(pts.tolist())
             if not distinct:
                 continue
-            areas = [abs(signed_area(Q)) for Q in rings]
             tag = f"run {ri + 1} outline {ci + 1}"
+            areas = [abs(signed_area(Q)) for Q in rings]
+            # identical sections (a prism) collapse to one straight
+            # stretch each, if the run comes out ruled
+            mrings, mkeep, forced = _merge_identical([e for e, _ in chain], rings)
+            mzs = [zs[k] for k in mkeep]
+            merge = ([cutter.to_3d(Q, z) for Q, z in zip(mrings, mzs)],
+                     [abs(signed_area(Q)) for Q in mrings], mzs, forced)
             try:
-                body, used_ruled = _loft_rings(rings3d, areas, zs, ruled, tag, verbose)
+                body, used_ruled, lstats = _loft_rings(rings3d, areas, zs, ruled, tag, verbose, merge)
             except Exception as e:
                 # one outline of one run must not cost the body: the gap it
                 # leaves shows up in the deviation check
@@ -739,11 +827,13 @@ def loft_body(mesh, axis, interval=0.2, ruled=False, verbose=True, z_range=None,
                     print(f"[loft] {tag} skipped ({type(e).__name__}: {e})")
                 continue
             n_ruled += used_ruled
+            n_merged += lstats['merged']
             rinfo['ruled'] = rinfo['ruled'] or used_ruled
+            rinfo['merged'] = rinfo.get('merged', 0) + lstats['merged']
             # holes: chained by centroid, lofted the same way, cut
             nh = len(chain[0][1])
             for hi_ in range(nh):
-                hrings, prev, hidx = [], None, hi_
+                hrings, hraw, prev, hidx = [], [], None, hi_
                 for k, (e, holes) in enumerate(chain):
                     if k > 0:
                         hidx = match_holes(chain[k - 1][1], holes)[hidx]
@@ -751,6 +841,7 @@ def loft_body(mesh, axis, interval=0.2, ruled=False, verbose=True, z_range=None,
                     Nh = _ring_n(hp) if k == 0 else len(hrings[0])
                     Q = align(ccw(resample(hp, Nh)), prev)
                     hrings.append(Q)
+                    hraw.append(hp)
                     prev = Q
                 h3d = [cutter.to_3d(Q, z) for Q, z in zip(hrings, zs)]
                 for si, r3 in enumerate(h3d):
@@ -761,9 +852,16 @@ def loft_body(mesh, axis, interval=0.2, ruled=False, verbose=True, z_range=None,
                 h3d[0] = h3d[0] - d
                 h3d[-1] = h3d[-1] + d
                 hareas = [abs(signed_area(Q)) for Q in hrings]
+                mh, mk, mf = _merge_identical(hraw, hrings)
+                mhz = [zs[k] for k in mk]
+                mh3 = [cutter.to_3d(Q, z) for Q, z in zip(mh, mhz)]
+                mh3[0] = mh3[0] - d
+                mh3[-1] = mh3[-1] + d
+                hmerge = (mh3, [abs(signed_area(Q)) for Q in mh], mhz, mf)
                 htag = tag + f" hole {hi_ + 1}"
                 try:
-                    tool, _ = _loft_rings(h3d, hareas, zs, ruled or used_ruled, htag, verbose)
+                    tool, _, hstats = _loft_rings(h3d, hareas, zs, ruled or used_ruled, htag, verbose, hmerge)
+                    n_merged += hstats['merged']
                     cut = body.cut(tool)
                     if cut.wrapped.IsNull() or not _valid(cut):
                         raise RuntimeError('cut gave an invalid solid')
@@ -821,6 +919,6 @@ def loft_body(mesh, axis, interval=0.2, ruled=False, verbose=True, z_range=None,
             'range': [lo, hi] if z_range is not None else None,
             'join_mm': float(join_mm or 0.0), 'trim_mm': float(trim_mm or 0.0),
             'n_sections': len(slices), 'n_runs': len(runs), 'n_levels': len(levels),
-            'n_holes': n_holes, 'n_ruled_runs': int(n_ruled), 'fuse': how,
+            'n_holes': n_holes, 'n_ruled_runs': int(n_ruled), 'n_merged': int(n_merged), 'fuse': how,
             'faces': len(shape.Faces()), 'skipped': skipped, 'runs': run_infos}
     return shape.wrapped, info
