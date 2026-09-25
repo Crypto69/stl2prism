@@ -401,13 +401,19 @@ def test_validate_can_ignore_internal_caps():
 
 
 def test_loft_prismatic_hint(tmp_path):
+    """Flat side walls square to the other axes mark a prismatic part; a
+    disc's flat top and bottom, or a plate across its thin axis, do not."""
     from stl_to_solid.sliced_loft import loft_body
-    p = synth.export(synth.plate_holes(), tmp_path / 'plate.stl')
+    p = synth.export(synth.cross_blind(), tmp_path / 'cb.stl')
     m = trimesh.load(p, force='mesh')
     _, info = loft_body(m, 2, 0.5, verbose=False)
-    assert info['prismatic_hint'] is True and info['planar_frac'] > 0.5
+    assert info['prismatic_hint'] is True and info['planar_frac'] > 0.3, info['planar_frac']
     _, info = loft_body(_sphere(), 2, 0.5, verbose=False)
     assert info['prismatic_hint'] is False
+    cap = cq.Workplane('XY').circle(30).extrude(12)
+    m = trimesh.load(synth.export(cap, tmp_path / 'cap.stl'), force='mesh')
+    _, info = loft_body(m, 2, 0.5, verbose=False)
+    assert info['prismatic_hint'] is False, info['planar_frac']
 
 
 def test_loft_stepped_shaft_breaks_at_levels(tmp_path):

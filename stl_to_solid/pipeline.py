@@ -1400,8 +1400,8 @@ def _loft_body(mesh, verbose, slice_mm, slice_axis, ruled, gates, loft_opts=None
         for sk in info.get('skipped') or []:
             print(f"[loft] could not build: {sk['text'] if isinstance(sk, dict) else sk}")
         if info.get('prismatic_hint'):
-            print(f"[loft] this part looks prismatic ({100 * info.get('planar_frac', 0):.0f}% flat faces "
-                  f"square to the axes); Mesh -> Solid will do better")
+            print(f"[loft] this part looks prismatic ({100 * info.get('planar_frac', 0):.0f}% of its surface "
+                  f"is flat side walls square to the other axes); Mesh -> Solid will do better")
     metrics['loft_compound'] = info.get('fuse') == 'compound'
     ok, why = _passes(metrics, **gates)
     if verbose:

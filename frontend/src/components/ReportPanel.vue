@@ -223,7 +223,7 @@ function loftNotes(lf) {
     out.push(`${lf.n_extruded_pairs} slice pair${lf.n_extruded_pairs === 1 ? '' : 's'} could not be lofted (the outlines did not correspond) and ${lf.n_extruded_pairs === 1 ? 'was' : 'were'} extruded straight instead: the outline steps once there.`)
   }
   if (lf.prismatic_hint) {
-    out.push(`This part looks prismatic (${Math.round(100 * (lf.planar_frac || 0))}% of its surface is flat faces square to the axes): Mesh → Solid will give a cleaner solid with true planes and cylinders. The loft is for shapes that change smoothly along one axis.`)
+    out.push(`This part looks prismatic (${Math.round(100 * (lf.planar_frac || 0))}% of its surface is flat side walls square to the other axes): Mesh → Solid will give a cleaner solid with true planes and cylinders. The loft is for shapes that change smoothly along one axis.`)
   }
   return out
 }

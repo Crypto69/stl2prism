@@ -1088,11 +1088,15 @@ def loft_body(mesh, axis, interval=0.2, ruled=False, verbose=True, z_range=None,
     if not solids:
         raise RuntimeError('no run could be lofted')
     shape, how = _fuse_all(solids, verbose)
-    # a part that is mostly flat faces square to the axes, with steps
-    # along this one, is a prismatic part: the other engine's job
-    planar = np.abs(mesh.face_normals).max(1) > 0.999
-    planar_frac = float(mesh.area_faces[planar].sum() / max(float(mesh.area), 1e-12))
-    prismatic_hint = bool(planar_frac > 0.5 and len(levels) >= 1)
+    # a part with much of its surface in flat faces square to the *other*
+    # two axes (flat side walls) is a prismatic part, the other engine's
+    # job. Flat faces across the slicing axis alone do not count: a turned
+    # cap is 59 % flat top and bottom and 2 % flat sides, the bracket
+    # 85 % and 70 %, the claw plate 50 % and 10 %.
+    others = [i for i in range(3) if i != axis]
+    side = np.abs(mesh.face_normals[:, others]).max(1) > 0.999
+    planar_frac = float(mesh.area_faces[side].sum() / max(float(mesh.area), 1e-12))
+    prismatic_hint = bool(planar_frac > 0.3)
     if verbose:
         print(f"[loft] {len(solids)} solid(s) -> {len(shape.Faces())} faces "
               f"({how} fuse), volume {_volume(shape):.0f} mm^3")
