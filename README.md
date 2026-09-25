@@ -54,14 +54,13 @@ fitter (lines and arcs where they hold the tolerance, fitted splines where
 they do not) — numpy only, so the same file can run inside Fusion.
 `tools/trace_section.py` draws one section the way the fitter sees it.
 
-**Single slice from the web app.** With Sliced Loft chosen in the top
-toolbar (v0.4.4: one button per tool — Mesh → Solid, Sliced Loft, X-Ray —
-and the rail shows only that tool's controls), the 3D view shows a labelled XYZ triad (X red, Y green, Z blue, as in Fusion) and
-a translucent plane across the chosen axis; a slider moves the plane by
-an offset from the part's centre, the traced outline is drawn on it, and
-"Download Fusion sketch of this slice" gives a script that draws that one
-sketch — lines, arcs, circles and fitted splines on a construction plane
-at that position (`GET /api/jobs/{id}/section` and `/section-script`).
+**Single slice from the web app.** With Sliced Loft or X-Ray chosen in
+the top toolbar, the 3D view shows a labelled XYZ triad (X red, Y green,
+Z blue, as in Fusion) and a translucent plane across the chosen axis; a
+slider moves the plane by an offset from the part's centre and the traced
+outline is drawn on it (`GET /api/jobs/{id}/section`; `/section-script`
+gives that one sketch as a Fusion script). In X-Ray, start = end is the
+single slice and its download.
 A leaky mesh (loose surface patches, a scan) cuts into open chains as well
 as closed loops; they are drawn open, exactly as Fusion's mesh section
 draws them, after loose ends closer than "Join gaps up to" (default
@@ -74,23 +73,29 @@ to extrude; "Trim slivers up to"
 loops, where the mesh has a double skin.
 
 **X-Ray (v0.4.5).** The X-Ray tool draws a whole stack of those sketches
-at once: pick the axis, a start plane, an end plane and a spacing, and
-the 3D view shows both planes (the end one dashed) with their traces and
-the slice count; "Download Fusion sketches" gives one script with a fully
-enclosed sketch per slice on its own construction plane, named
-`xray Z=12.34 mm (k/N)` (`GET /api/jobs/{id}/xray-script?axis&from&to&
-step&tol&units&scale&join&outline&trim`, and `/xray` for the count). The
+between two planes: pick the axis, a start plane, an end plane and a
+spacing, and the slices are traced one after another, each one staying in
+the 3D view as it appears, so the stack shows up slice by slice like an
+x-ray between the two planes (start solid, end dashed, marked S and E).
+"Download Fusion sketches" builds one script with a fully enclosed sketch
+per slice on its own construction plane, named `xray Z=12.34 mm (k/N)`
+(`GET /api/jobs/{id}/xray-script?axis&from&to&step&tol&units&scale&join&
+outline&trim&extrude`, and `/xray` for the count and plane positions). The
 planes sit at start + k·spacing and the end plane is always the last one;
-both ends are kept 0.001 mm inside the part; start = end is the single
-slice. The script embeds the slice data once and draws it in a loop with
-the sketch's compute deferred, behind a progress dialog with Cancel, the
-way the private add-in does. "Extrude each slice to the next" (`extrude=
-true`) also extrudes every sketch to the next plane and joins it to the
-slab before it, for a stepped solid where a Loft would fold over. One
-download fits at most 500 slices and spends at most 240 s fitting
-(`STLTOSOLID_XRAY_BUDGET`); the panel estimates the time from the traces
-and suggests Outline only, which is about five times faster on organic
-sections.
+both ends are kept 0.001 mm inside the part so no plane lands exactly on
+a flat end face. The script embeds the slice data once and draws it in a
+loop with each sketch's compute deferred, behind a progress dialog with
+Cancel — the same approach as the private Fusion add-in — so a
+hundred-sketch stack opens in seconds. "Extrude each slice to the next"
+(`extrude=true`) also extrudes every sketch up to the next plane and joins
+it to the slab before it (a new body where nothing touches), giving a
+stepped solid that Fusion builds without fail where a Loft between two
+complex profiles folds over. One download fits at most 500 slices and
+spends at most 240 s fitting (`STLTOSOLID_XRAY_BUDGET`); the panel
+estimates the build time from the traces so far and suggests Outline
+only, which is about five times faster on organic sections (the fit is
+the cost, not the cut: 8 ms a slice on a clean CAD bracket, 6 s on a
+158k-triangle controller scan).
 
 The sliced loft's cutter uses the same join and trim settings
 (`--slice-join`, `--slice-trim`), so a leaky shell lofts from the same
@@ -101,9 +106,10 @@ stretch of the mesh.
 
 ## Screenshots
 
-The web app: drop a mesh, inspect it, set the acceptance gate, convert, and
-read the fidelity report before downloading the STEP (and, for extrusions,
-the CadQuery / Fusion 360 scripts).
+The web app: drop a mesh, inspect it, pick a tool, set the acceptance gate,
+convert, and read the fidelity report before downloading the STEP (and, for
+extrusions, the CadQuery / Fusion 360 scripts). (Screenshots predate the
+v0.4.5 toolbar.)
 
 | | |
 |---|---|
@@ -192,11 +198,34 @@ frame — see Roadmap). Bodies with more than 200 regions get no script;
 ## Web app
 
 A browser UI for the same pipeline: drag a mesh in, inspect it in 3D, pick
-a tool in the top toolbar (Mesh → Solid, Sliced Loft or X-Ray), set the
-tolerances, convert, and download the STEP (and, for prismatic results, the
-CadQuery and Fusion 360 scripts) with a fidelity report (route, surface
-deviation vs. your limits, volume error, face counts and surface types,
-regions kept as facets).
+a tool in the top toolbar, set the tolerances, and download the result.
+The toolbar (v0.4.5) starts with **New project** (load another file) and
+then one button per tool; the panel on the right shows that tool's name
+as a cyan heading and only its controls, over the shared setup (which
+bodies to use, input units and scale, the mesh's stats).
+
+- **Mesh → Solid.** The auto ladder: prismatic fit, then face groups,
+  then faceted, held to the acceptance gate you set. Convert, read the
+  fidelity report (route, surface deviation vs. your limits, volume error,
+  face counts and surface types, regions kept as facets), download the
+  STEP and, for prismatic results, the CadQuery and Fusion 360 scripts.
+- **Sliced Loft.** Slice spacing and axis, a single-slice plane you can
+  drag through the part with its traced outline, gap joining, sliver
+  trimming, outline-only, a partial loft from that plane, ruled or smooth.
+  Convert gives the lofted STEP and the Fusion loft script.
+- **X-Ray.** Axis, start plane, end plane, spacing (or *Whole part*); the
+  slice count and a time estimate; the slices traced one by one and left
+  in the 3D view (a *stop* link halts the trace, *trace the rest* resumes
+  it); the same fit options as the single slice plus the fit tolerance;
+  *Extrude each slice to the next* for solid slabs; and **Download Fusion
+  sketches**, which shows *Working…* with a spinner while the server fits
+  every slice and hands you the .py when it is ready. To run it: put the
+  file in an empty folder, then in Fusion Utilities → Add-Ins → Scripts and
+  Add-Ins → + → choose that folder → Run.
+
+The ViewCube sits top-right as in Fusion; every button visibly presses;
+loading a file, converting and building a script all show a spinner with
+what is being waited for.
 
 ### Run locally (dev)
 
@@ -227,7 +256,9 @@ when the count is not set explicitly), `STLTOSOLID_SHELL_TIMEOUT` (seconds
 a shell may run in a worker before it is built faceted instead, default
 900; 0 means no limit), `STLTOSOLID_AXIS_BUDGET` (seconds one shell's extrusion-axis search may
 take before the best candidate so far is used, default 120; 0 means no
-limit). The budgets are backstops: a shell that reaches one is scored on
+limit), `STLTOSOLID_XRAY_BUDGET` (seconds one X-Ray script download may
+spend fitting its slices before it answers 400, default 240 — under a
+browser's 300 s response limit). The budgets are backstops: a shell that reaches one is scored on
 what was done by then, so its result can depend on machine load. The CLI
 takes the first two as `--workers` and `--shell-timeout`. The same workers
 score a big single shell's axis candidates side by side and run the
@@ -533,6 +564,11 @@ In rough priority order:
 - **Region growing for 3D scans** — real faces on scanned parts instead of a
   faceted solid.
 - **Faster conversions** — warm worker process, bodies converted in parallel.
+- **X-Ray as a job.** A 500-slice stack of a big organic scan does not fit
+  the 240 s download budget; running it as a job (like a conversion, with
+  progress and cancel) or streaming the script section by section would
+  lift the limit. A "Loft the stack" option in the X-Ray script is the
+  other half (the add-in has it).
 
 ## License
 
