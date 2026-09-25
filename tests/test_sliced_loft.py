@@ -455,8 +455,32 @@ def test_pipeline_loft_mode_writes_step_and_fusion_script(tmp_path):
     assert fs and os.path.exists(fs) and fs.endswith('_fusion.py')
     txt = open(fs).read()
     assert 'loftFeatures' in txt and 'sketchFittedSplines' in txt
-    assert txt.count('lofts.add(li)') == 3
+    assert txt.count('_loft(lofts, newBody if first else join') == 3
+    assert 'isTangentEdgesMerged' not in txt
     compile(txt, fs, 'exec')              # at least valid Python
+
+
+def test_fusion_loft_script_rebuilds_every_piece(tmp_path):
+    """The script draws what the STEP holds: every outline of a run (not
+    only the first), an Extrude where a run bridges to the next, and a
+    Loft to a sketch point for a dome tip."""
+    from stl_to_solid.sliced_loft import loft_body
+    from stl_to_solid.fusion_export import emit_fusion_loft_script
+    p = synth.export(synth.cross_blind(), tmp_path / 'cb.stl')
+    m = trimesh.load(p, force='mesh')
+    _, info = loft_body(m, 2, 0.5, verbose=False)
+    txt = emit_fusion_loft_script([info])
+    compile(txt, 'cb_fusion.py', 'exec')
+    assert '# bridge to the next run' in txt
+    assert 'outline 2' in txt                     # the run split by the sideways hole
+    assert 'isTangentEdgesMerged' not in txt
+    n_chains = sum(len(r['chains']) for r in info['runs'] if r['n'] >= 2 or r.get('bridge_to') is not None)
+    assert txt.count('_loft(lofts, newBody if first else join') + txt.count('# bridge to the next run') >= n_chains
+    _, info = loft_body(_sphere(), 2, 0.5, verbose=False)
+    assert len(info['cones']) == 2
+    txt = emit_fusion_loft_script([info])
+    compile(txt, 'sphere_fusion.py', 'exec')
+    assert txt.count('sketchPoints.add') == 2
 
 
 def test_pipeline_loft_gate_is_reported_not_enforced(tmp_path):

@@ -27,8 +27,21 @@ Phase 0 measurements (docs/SLICED-LOFT.md) behind the recipe:
     surface flare by centimetres. End slices are therefore dropped when
     they are tiny against their neighbour, and the tip is a ruled cone.
   * A ruled loft is exact within d^2/(8R) and never flares; it is the
-    per-run fallback when the smooth solid is invalid or its volume is off
-    the section-area integral by more than 2 %, and the user option.
+    per-stretch fallback when the smooth solid is invalid or its volume is
+    off the section-area integral by more than VOL_CHECK_PCT (1 %), the
+    first choice when the shared basis cannot fit the rings within
+    RING_FIT_TOL (cornered outlines: every smooth try there blew up), and
+    the user option.
+
+v0.4.6 (review of 2026-09-25, docs/SLICED-LOFT.md "What changed in 0.4.6"):
+  * `auto` picks the axis by slicing structure (choose_axis), not the
+    longest side.
+  * A ruled run collapses identical sections into straight stretches.
+  * A run whose rings do not correspond is lofted pair by pair (a bad pair
+    extruded) instead of being dropped; nothing is silently missing.
+  * A gap to the next run is bridged inside the run (last ring repeated
+    at the next plane), the pieces are fused in chains along the axis,
+    and info says what could not be built, merged, extruded or fused.
 
 `loft_body(mesh, axis, interval, ruled)` returns (TopoDS_Shape, build_info);
 build_info carries the thinned section outlines per run, which is what the
@@ -914,13 +927,14 @@ def loft_body(mesh, axis, interval=0.2, ruled=False, verbose=True, z_range=None,
     ax_vec = np.zeros(3)
     ax_vec[axis] = 1.0
 
-    solids, run_infos, n_holes, n_ruled, n_merged, n_extruded, skipped = [], [], 0, 0, 0, 0, []
+    solids, run_infos, n_holes, n_ruled, n_merged, n_extruded, skipped, cones = [], [], 0, 0, 0, 0, [], []
     for ri, (a, b, chains) in enumerate(runs):
         zs_all = [slices[k][0] for k in range(a, b + 1)]
         keep = thin_indices(len(zs_all), areas=[_total_area(slices[k][2]) for k in range(a, b + 1)])
         zs = [zs_all[k] for k in keep]
-        rinfo = {'z0': zs[0], 'z1': zs[-1], 'n': len(zs), 'ruled': bool(ruled), 'sections': []}
-        secs = [{'z': z, 'outer': None, 'holes': []} for z in zs]
+        rinfo = {'z0': zs[0], 'z1': zs[-1], 'n': len(zs), 'ruled': bool(ruled), 'sections': [],
+                 'chains': []}
+        n_real = len(zs)
         # a gap to the next run (a topology change between two slices, not
         # a flat step) is bridged inside this run: its last section is
         # repeated at the next run's first plane, one straight stretch,
@@ -947,11 +961,14 @@ def loft_body(mesh, axis, interval=0.2, ruled=False, verbose=True, z_range=None,
             if bridge_to is not None:
                 rings[-1] = rings[-2].copy()
             rings3d = [cutter.to_3d(Q, z) for Q, z in zip(rings, zs)]
-            for si, r3 in enumerate(rings3d[:len(secs)]):
+            # this outline's sections for the Fusion script: one record
+            # per outline (chain), holes with their own outline
+            secs = [{'z': z, 'outer': None, 'holes': []} for z in zs[:n_real]]
+            for si, r3 in enumerate(rings3d[:n_real]):
                 pts = r3[douglas_peucker(np.vstack([r3, r3[:1]]), SPLINE_TOL)[:-1]]
-                secs[si]['outer'] = pts.tolist() if ci == 0 else secs[si].get('outer')
-                if ci > 0:
-                    secs[si].setdefault('more_outers', []).append(pts.tolist())
+                secs[si]['outer'] = pts.tolist()
+            cinfo = {'sections': secs, 'extruded': []}
+            rinfo['chains'].append(cinfo)
             if not distinct:
                 continue
             tag = f"run {ri + 1} outline {ci + 1}"
@@ -988,6 +1005,7 @@ def loft_body(mesh, axis, interval=0.2, ruled=False, verbose=True, z_range=None,
             rinfo['merged'] = rinfo.get('merged', 0) + lstats['merged']
             if lstats.get('extruded'):
                 rinfo.setdefault('extruded', []).extend(lstats['extruded'])
+                cinfo['extruded'] = [list(map(float, e)) for e in lstats['extruded']]
                 n_extruded += len(lstats['extruded'])
             # holes: chained by centroid, lofted the same way, cut
             nh = len(chain[0][1])
@@ -1006,7 +1024,7 @@ def loft_body(mesh, axis, interval=0.2, ruled=False, verbose=True, z_range=None,
                 if bridge_to is not None:
                     hrings[-1] = hrings[-2].copy()
                 h3d = [cutter.to_3d(Q, z) for Q, z in zip(hrings, zs)]
-                for si, r3 in enumerate(h3d[:len(secs)]):
+                for si, r3 in enumerate(h3d[:n_real]):
                     pts = r3[douglas_peucker(np.vstack([r3, r3[:1]]), SPLINE_TOL)[:-1]]
                     secs[si]['holes'].append(pts.tolist())
                 hareas = [abs(signed_area(Q)) for Q in hrings]
@@ -1054,13 +1072,17 @@ def loft_body(mesh, axis, interval=0.2, ruled=False, verbose=True, z_range=None,
                 try:
                     apex = cutter.to_3d(ring.mean(0)[None, :], zend)[0]
                     solids.append(_thru([_ring_wire(r3)], True, apex, apex_first=(zend == lo)))
+                    pts = r3[douglas_peucker(np.vstack([r3, r3[:1]]), SPLINE_TOL)[:-1]]
+                    cones.append({'z': float(zs[0] if zend == lo else zs[-1]), 'apex': apex.tolist(),
+                                  'outer': pts.tolist(), 'run': ri, 'chain': ci})
                 except Exception as e:
                     skipped.append({'what': 'cone', 'z0': float(zend), 'z1': float(zend),
                                     'text': f"{tag} apex cone: {type(e).__name__}: {e}"})
                     if verbose:
                         print(f"[loft] {tag} apex cone skipped ({type(e).__name__}: {e})")
             solids.append(body)
-        rinfo['sections'] = secs
+        # the first outline's sections, for readers of the old shape
+        rinfo['sections'] = rinfo['chains'][0]['sections'] if rinfo['chains'] else []
         run_infos.append(rinfo)
 
     if not solids:
@@ -1081,6 +1103,6 @@ def loft_body(mesh, axis, interval=0.2, ruled=False, verbose=True, z_range=None,
             'n_sections': len(slices), 'n_runs': len(runs), 'n_levels': len(levels),
             'n_holes': n_holes, 'n_ruled_runs': int(n_ruled), 'n_merged': int(n_merged),
             'n_extruded_pairs': int(n_extruded), 'fuse': how, 'n_solids': len(shape.Solids()),
-            'planar_frac': planar_frac, 'prismatic_hint': prismatic_hint,
+            'planar_frac': planar_frac, 'prismatic_hint': prismatic_hint, 'cones': cones,
             'faces': len(shape.Faces()), 'skipped': skipped, 'runs': run_infos}
     return shape.wrapped, info
