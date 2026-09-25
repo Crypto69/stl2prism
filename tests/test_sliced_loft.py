@@ -290,6 +290,132 @@ def test_loft_ellipsoid_along_x():
     _check(shape, m, faces_max=30, dev_p95=0.08, vol_pct=0.5)
 
 
+def test_choose_axis_by_slicing_structure(tmp_path):
+    """The whole-body loft picks the axis whose stack has the fewest
+    one-section runs, then the fewest runs, then the longest side: a
+    round cap wants its short axis, a thin plate its thin one, and an
+    ellipsoid (one run whichever way) its longest."""
+    from stl_to_solid.sliced_loft import choose_axis
+    cap = (cq.Workplane('XY').circle(30).extrude(12).faces('>Z').workplane()
+           .circle(30).circle(27).extrude(4))
+    m = trimesh.load(synth.export(cap, tmp_path / 'cap.stl'), force='mesh')
+    ax, sc = choose_axis(m, 0.2, verbose=False)
+    assert ax == 2, sc
+    assert sc['z']['runs'] + sc['z']['steep'] < sc['x']['runs'] + sc['x']['steep'], sc
+    plate = (cq.Workplane('XZ').box(20, 22, 4).faces('>Y').workplane()
+             .rect(10, 12, forConstruction=True).vertices().hole(3))
+    m = trimesh.load(synth.export(plate, tmp_path / 'plate.stl'), force='mesh')
+    assert abs(m.extents[1] - 4.0) < 0.1
+    ax, sc = choose_axis(m, 0.2, verbose=False)
+    assert ax == 1, sc
+    assert sc['y']['runs'] == 1 and sc['y']['single'] == 0
+    ax, sc = choose_axis(_ellipsoid(), 0.2, verbose=False)
+    assert ax == 0, sc
+
+
+def test_loft_merges_identical_rings_into_one_prism(tmp_path):
+    """A stack of equal sections is one straight stretch (3 faces), a
+    shallow draft is not merged away (it steps to a new group every
+    RING_FIT_TOL of drift and stays within tolerance)."""
+    from stl_to_solid.sliced_loft import loft_body
+    m = trimesh.creation.box([20.0, 20.0, 10.0])
+    shape, info = loft_body(m, 2, 0.2, verbose=False)
+    assert info['n_merged'] > 40, info
+    _check(shape, m, faces_max=3, dev_p95=0.05, vol_pct=0.5)
+    p = synth.export(synth.drafted_block(), tmp_path / 'draft.stl')
+    m = trimesh.load(p, force='mesh')
+    shape, info = loft_body(m, 2, 0.2, verbose=False)
+    m2, s = _check(shape, m, faces_max=40, dev_p95=0.05, vol_pct=0.5)
+    assert len(s.Faces()) > 3
+
+
+def test_loft_goes_ruled_directly_when_rings_do_not_fit(monkeypatch):
+    """With the pole cap too low for the rings to fit, the smooth loft is
+    not even tried (every such attempt blew up before falling back)."""
+    from stl_to_solid import sliced_loft as sl
+    calls = []
+    orig = sl._thru
+
+    def spy(wires, ruled, apex=None, apex_first=False):
+        calls.append(bool(ruled))
+        return orig(wires, ruled, apex, apex_first)
+    monkeypatch.setattr(sl, '_thru', spy)
+    monkeypatch.setattr(sl, 'RING_POLES_MIN', 4)
+    monkeypatch.setattr(sl, 'RING_POLES_MAX', 4)
+    shape, info = sl.loft_body(_sphere(), 2, 0.5, verbose=False)
+    assert calls and all(calls), calls
+    assert info['n_ruled_runs'] == 1
+
+
+def test_loft_pairs_extrudes_a_pair_whose_rings_do_not_correspond(monkeypatch):
+    """The pair chain: with the per-pair volume check made impossible to
+    pass, every pair is replaced by an extrusion of its lower ring, the
+    pieces fuse to one solid and the volume is the prism's. (ThruSections
+    itself picks compatible origins on closed wires, so a rolled or
+    turned ring alone does not make a bad pair.)"""
+    from stl_to_solid import sliced_loft as sl
+    monkeypatch.setattr(sl, 'RULED_VOL_PCT', 0.0)
+    rc = np.array([[10, 5], [-10, 5], [-10, -5], [10, -5]], float)
+    ring = sl.resample(rc, 160)
+    zs = [0.0, 10.0, 20.0, 30.0]
+    rings3d = [np.c_[ring, np.full(len(ring), z)] for z in zs]
+    wires, _, _ = sl._ring_wires(rings3d)
+    solid, ext = sl._loft_pairs(wires, np.array([0.0, 0.0, 1.0]), [200.0] * 4, zs, 'test', False)
+    assert ext == [[0.0, 10.0], [10.0, 20.0], [20.0, 30.0]], ext
+    assert len(solid.Solids()) == 1
+    assert abs(sl._volume(solid) - 6000.0) / 6000.0 < 0.01
+
+
+def test_loft_never_drops_a_run(tmp_path, monkeypatch):
+    """With the run-level volume check made impossible to pass, every run
+    falls back to the pair chain instead of vanishing: nothing skipped,
+    the material all there."""
+    from stl_to_solid import sliced_loft as sl
+    monkeypatch.setattr(sl, 'RULED_VOL_PCT', 0.0)
+    p = synth.export(synth.stepped_shaft(), tmp_path / 'shaft.stl')
+    m = trimesh.load(p, force='mesh')
+    shape, info = sl.loft_body(m, 2, 0.5, verbose=False)
+    assert info['skipped'] == [], info['skipped']
+    assert info['n_extruded_pairs'] > 0
+    from stl_to_solid.pipeline import validate
+    mt = validate(shape, m)
+    assert mt['vol_err_pct'] < 1.0, mt
+
+
+def test_validate_can_ignore_internal_caps():
+    """Two abutting boxes as one compound against the mesh of their
+    union: the shared cap lies inside the part and must not count as a
+    solid -> mesh deviation when asked to ignore inside points."""
+    from stl_to_solid.pipeline import validate
+    a = cq.Workplane('XY').box(20, 20, 10, centered=(True, True, False))
+    b = cq.Workplane('XY').box(20, 20, 10, centered=(True, True, False)).translate((0, 0, 10))
+    comp = cq.Compound.makeCompound([a.val(), b.val()])
+    m = trimesh.creation.box([20, 20, 20])
+    m.apply_translation([0, 0, 10])
+    plain = validate(comp.wrapped, m)
+    assert plain['rev_dev_max'] > 1.0, plain
+    fixed = validate(comp.wrapped, m, ignore_inside=True)
+    assert fixed['rev_dev_p95'] < 0.05 and fixed['rev_dev_max'] < 0.05, fixed
+    assert fixed['rev_internal_pts'] > 0
+    assert fixed['dev_max'] < 0.05
+
+
+def test_loft_prismatic_hint(tmp_path):
+    """Flat side walls square to the other axes mark a prismatic part; a
+    disc's flat top and bottom, or a plate across its thin axis, do not."""
+    from stl_to_solid.sliced_loft import loft_body
+    p = synth.export(synth.cross_blind(), tmp_path / 'cb.stl')
+    m = trimesh.load(p, force='mesh')
+    _, info = loft_body(m, 2, 0.5, verbose=False)
+    assert info['prismatic_hint'] is True and info['planar_frac'] > 0.3, info['planar_frac']
+    _, info = loft_body(_sphere(), 2, 0.5, verbose=False)
+    assert info['prismatic_hint'] is False
+    cap = cq.Workplane('XY').circle(30).extrude(12)
+    m = trimesh.load(synth.export(cap, tmp_path / 'cap.stl'), force='mesh')
+    _, info = loft_body(m, 2, 0.5, verbose=False)
+    assert info['prismatic_hint'] is False, info['planar_frac']
+
+
 def test_loft_stepped_shaft_breaks_at_levels(tmp_path):
     from stl_to_solid.sliced_loft import loft_body
     p = synth.export(synth.stepped_shaft(), tmp_path / 'shaft.stl')
@@ -335,8 +461,32 @@ def test_pipeline_loft_mode_writes_step_and_fusion_script(tmp_path):
     assert fs and os.path.exists(fs) and fs.endswith('_fusion.py')
     txt = open(fs).read()
     assert 'loftFeatures' in txt and 'sketchFittedSplines' in txt
-    assert txt.count('lofts.add(li)') == 3
+    assert txt.count('_loft(lofts, newBody if first else join') == 3
+    assert 'isTangentEdgesMerged' not in txt
     compile(txt, fs, 'exec')              # at least valid Python
+
+
+def test_fusion_loft_script_rebuilds_every_piece(tmp_path):
+    """The script draws what the STEP holds: every outline of a run (not
+    only the first), an Extrude where a run bridges to the next, and a
+    Loft to a sketch point for a dome tip."""
+    from stl_to_solid.sliced_loft import loft_body
+    from stl_to_solid.fusion_export import emit_fusion_loft_script
+    p = synth.export(synth.cross_blind(), tmp_path / 'cb.stl')
+    m = trimesh.load(p, force='mesh')
+    _, info = loft_body(m, 2, 0.5, verbose=False)
+    txt = emit_fusion_loft_script([info])
+    compile(txt, 'cb_fusion.py', 'exec')
+    assert '# bridge to the next run' in txt
+    assert 'outline 2' in txt                     # the run split by the sideways hole
+    assert 'isTangentEdgesMerged' not in txt
+    n_chains = sum(len(r['chains']) for r in info['runs'] if r['n'] >= 2 or r.get('bridge_to') is not None)
+    assert txt.count('_loft(lofts, newBody if first else join') + txt.count('# bridge to the next run') >= n_chains
+    _, info = loft_body(_sphere(), 2, 0.5, verbose=False)
+    assert len(info['cones']) == 2
+    txt = emit_fusion_loft_script([info])
+    compile(txt, 'sphere_fusion.py', 'exec')
+    assert txt.count('sketchPoints.add') == 2
 
 
 def test_pipeline_loft_gate_is_reported_not_enforced(tmp_path):
@@ -347,10 +497,24 @@ def test_pipeline_loft_gate_is_reported_not_enforced(tmp_path):
     r = run(p, out, method='loft', slice_mm=0.5, slice_axis='z', verbose=False)
     assert r['mode'] == 'loft'
     assert r['metrics']['gate_ok'] is False          # the smeared holes
-    # the run pieces do not always fuse across a sideways hole; a compound
-    # of a few solids is the honest result, never nothing
-    assert 1 <= _reimport(out)['solids'] <= 8
+    # the runs share their planes exactly (bridges are repeated rings
+    # inside a run), so the pieces fuse to one solid across the holes
+    assert _reimport(out)['solids'] == 1
     assert r['metrics']['vol_err_pct'] < 1.0
+
+
+def test_loft_side_boss_is_one_solid(tmp_path):
+    """A block with a cylinder boss across the axis: the boss changes the
+    outline between two slices (no flat step), which used to leave a
+    0.2 mm bridge sliver as its own solid. One solid, volume exact."""
+    from stl_to_solid.sliced_loft import loft_body
+    wp = cq.Workplane('XY').box(40, 30, 20).union(cq.Workplane('YZ').circle(5).extrude(30))
+    m = trimesh.load(synth.export(wp, tmp_path / 'boss.stl'), force='mesh')
+    shape, info = loft_body(m, 2, 0.5, verbose=False)
+    assert info['skipped'] == [] and info['n_solids'] == 1
+    m2, s = _check(shape, m, faces_max=40, dev_p95=0.05, vol_pct=0.5)
+    # no piece thinner than the interval survives as a run of its own
+    assert all(r['z1'] - r['z0'] >= 0.5 - 1e-6 or r['n'] == 1 for r in info['runs'])
 
 
 def test_cli_flags_parse(tmp_path):
@@ -383,6 +547,9 @@ def test_section_api_and_sketch_script(tmp_path, monkeypatch):
         assert r.status_code == 200, r.text
         job = r.json()['id']
         # the middle step is r=7 between z=20 and 35; the box centre is z=22.5
+        r = c.get(f'/api/jobs/{job}/loft-axis', params={'slice_mm': 0.5})
+        assert r.status_code == 200, r.text
+        assert r.json()['axis'] == 'z' and set(r.json()['scores']) == {'x', 'y', 'z'}
         r = c.get(f'/api/jobs/{job}/section', params={'axis': 'z', 'offset': 5.0, 'tol': 0.08})
         assert r.status_code == 200, r.text
         sec = r.json()

@@ -1,6 +1,7 @@
 <script setup>
 import { computed, onBeforeUnmount, ref, watch } from 'vue'
 import { useConvertStore, XRAY_MAX } from '../store'
+import { errText, friendlyError } from '../errors'
 import { summarise } from '../sectionSummary'
 import AxisSelect from './AxisSelect.vue'
 import PlaneSlider from './PlaneSlider.vue'
@@ -60,11 +61,7 @@ async function download() {
   downloadError.value = null
   try {
     const res = await fetch(store.xrayScriptUrl)
-    if (!res.ok) {
-      let why = res.statusText
-      try { why = (await res.json()).detail || why } catch { /* not json */ }
-      throw new Error(why)
-    }
+    if (!res.ok) throw new Error(await errText(res))
     const blob = await res.blob()
     const cd = res.headers.get('content-disposition') || ''
     const name = (cd.match(/filename="?([^";]+)"?/) || [])[1] || 'xray.py'
@@ -77,7 +74,7 @@ async function download() {
     a.remove()
     setTimeout(() => URL.revokeObjectURL(url), 30000)
   } catch (e) {
-    downloadError.value = e.message
+    downloadError.value = friendlyError(e)
   } finally {
     downloading.value = false
   }

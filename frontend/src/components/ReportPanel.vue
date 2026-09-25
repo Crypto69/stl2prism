@@ -1,8 +1,32 @@
 <script setup>
 import { computed, nextTick, ref, watch } from 'vue'
-import { useConvertStore } from '../store'
+import { useConvertStore, checkDownload } from '../store'
 
 const store = useConvertStore()
+
+// The download links are plain <a download> so the desktop window can hand
+// the file to a native Save dialog. A link to a file the server no longer
+// has (cleared after a day, or a restart) would save a small JSON error
+// under the STEP's name; so the click first asks whether the file is there
+// and shows the answer here instead.
+const downloadError = ref(null)
+async function guardDownload(ev, url) {
+  if (!url) return
+  ev.preventDefault()
+  downloadError.value = null
+  const why = await checkDownload(url)
+  if (why) {
+    downloadError.value = `Could not download: ${why}`
+    return
+  }
+  const a = document.createElement('a')
+  a.href = url
+  a.download = ''
+  document.body.appendChild(a)
+  a.click()
+  a.remove()
+}
+watch(() => store.jobId, () => { downloadError.value = null })
 
 // The verdict is what the user waited for; bring it into view when it lands.
 const verdictEl = ref(null)
@@ -72,8 +96,12 @@ const verdict = computed(() => {
       const gate = r.metrics?.gate_ok === false
         ? ' The gate below did not pass; the loft is written anyway because you chose the method — the deviation is usually a sideways hole or a corner the smooth surface cannot follow.'
         : ' Every gate below passed.'
+      const sc = lf.axis_auto && lf.axis_scores ? lf.axis_scores : null
+      const axisWhy = sc
+        ? ` Axis chosen by shape: ${['x', 'y', 'z'].map((k) => `${k.toUpperCase()} ${sc[k]?.runs ?? '?'} run${sc[k]?.runs === 1 ? '' : 's'}${sc[k]?.single ? ` (${sc[k].single} of one slice)` : ''}${sc[k]?.steep ? ` + ${sc[k].steep} fast change${sc[k].steep === 1 ? '' : 's'}` : ''}`).join(', ')}.`
+        : ''
       return { title: 'Sliced loft solid', cls: 'loft',
-               note: `${lf.range ? `Only ${lf.range[0].toFixed(1)} to ${lf.range[1].toFixed(1)} mm along ${(lf.axis_name || '?').toUpperCase()}: ` : ''}${lf.n_sections} sections along ${(lf.axis_name || '?').toUpperCase()} at ${lf.interval} mm, ${runs}${lf.n_levels ? ` (split at ${lf.n_levels} flat step${lf.n_levels === 1 ? '' : 's'})` : ''}${lf.n_holes ? `, ${lf.n_holes} hole${lf.n_holes === 1 ? '' : 's'} cut` : ''}: one smooth face per run${lf.n_ruled_runs ? ` (${lf.n_ruled_runs} run${lf.n_ruled_runs === 1 ? '' : 's'} ruled)` : ''}, like Fusion's Mesh Section Sketch + Loft.${gate}` }
+               note: `${lf.range ? `Only ${lf.range[0].toFixed(1)} to ${lf.range[1].toFixed(1)} mm along ${(lf.axis_name || '?').toUpperCase()}: ` : ''}${lf.n_sections} sections along ${(lf.axis_name || '?').toUpperCase()} at ${lf.interval} mm, ${runs}${lf.n_levels ? ` (split at ${lf.n_levels} flat step${lf.n_levels === 1 ? '' : 's'})` : ''}${lf.n_holes ? `, ${lf.n_holes} hole${lf.n_holes === 1 ? '' : 's'} cut` : ''}: one smooth face per run${lf.n_ruled_runs ? ` (${lf.n_ruled_runs} run${lf.n_ruled_runs === 1 ? '' : 's'} ruled)` : ''}, like Fusion's Mesh Section Sketch + Loft.${axisWhy}${gate}` }
     }
     if (r.mode === 'facegroup') {
       const fg = r.metrics?.fgroup || {}
@@ -113,6 +141,7 @@ const bodyRows = computed(() =>
     detail: b.error ? b.error
       : (b.mode === 'prismatic' || b.mode === 'facegroup' || b.mode === 'loft')
         ? `p95 ${fmt(b.metrics.dev_p95)} · max ${fmt(b.metrics.dev_max)} mm`
+          + (b.mode === 'loft' ? loftNotes(b.metrics.loft || {}).map((t) => ` · ${t}`).join('') : '')
         : `${b.metrics.faces_out.toLocaleString()} faces`
           + (b.metrics.is_solid === false ? ' · open shell' : ''),
   })))
@@ -163,8 +192,41 @@ const notes = computed(() => {
   if (m.voids) {
     out.push(`${m.voids} internal cavit${m.voids === 1 ? 'y was' : 'ies were'} recognised and subtracted, so the solid is hollow like the mesh.`)
   }
+  if (r.mode === 'loft') out.push(...loftNotes(m.loft || {}))
   return out
 })
+
+// What a sliced loft could not do, in plain words: a run that is missing,
+// a hole left filled, pieces that would not fuse, pairs extruded straight.
+// Nothing here is hidden behind the gate rows.
+function loftNotes(lf) {
+  const out = []
+  const ax = (lf.axis_name || '?').toUpperCase()
+  const mm = (z) => `${Number(z).toFixed(1)} mm`
+  const sk = Array.isArray(lf.skipped) ? lf.skipped.filter((x) => x && typeof x === 'object') : []
+  const runs = sk.filter((x) => x.what === 'run')
+  if (runs.length) {
+    out.push(`${runs.length} run${runs.length === 1 ? '' : 's'} could not be built, so ${runs.length === 1 ? 'this stretch is' : 'these stretches are'} missing from the solid: ${runs.map((x) => `${ax} ${mm(x.z0)} to ${mm(x.z1)}`).join(', ')}.`)
+  }
+  const holes = sk.filter((x) => x.what === 'hole')
+  if (holes.length) {
+    out.push(`${holes.length} hole${holes.length === 1 ? ' was' : 's were'} left filled: ${holes.map((x) => `${x.width_mm != null ? `${Number(x.width_mm).toFixed(1)} mm wide at ` : ''}${ax} ${mm(x.z0)} to ${mm(x.z1)}`).join(', ')}. Material sits there that the mesh does not have; the solid → mesh row above measures it.`)
+  }
+  const other = sk.filter((x) => x.what !== 'run' && x.what !== 'hole')
+  if (other.length) {
+    out.push(`${other.length} small piece${other.length === 1 ? '' : 's'} (${other.map((x) => x.what).join(', ')}) could not be built.`)
+  }
+  if (lf.fuse === 'compound') {
+    out.push(`The pieces did not fuse: the STEP holds ${lf.n_solids || 'several'} loose solids that only touch (their shared faces are not counted in the deviation above).`)
+  }
+  if (lf.n_extruded_pairs) {
+    out.push(`${lf.n_extruded_pairs} slice pair${lf.n_extruded_pairs === 1 ? '' : 's'} could not be lofted (the outlines did not correspond) and ${lf.n_extruded_pairs === 1 ? 'was' : 'were'} extruded straight instead: the outline steps once there.`)
+  }
+  if (lf.prismatic_hint) {
+    out.push(`This part looks prismatic (${Math.round(100 * (lf.planar_frac || 0))}% of its surface is flat side walls square to the other axes): Mesh → Solid will give a cleaner solid with true planes and cylinders. The loft is for shapes that change smoothly along one axis.`)
+  }
+  return out
+}
 
 // A finished conversion whose STEP carries no solid: written from bodies
 // that were never closed, so it is surfaces only.
@@ -279,16 +341,21 @@ const reduction = computed(() => {
       <ul v-if="notes.length" class="notes">
         <li v-for="(n, i) in notes" :key="i">{{ n }}</li>
       </ul>
-      <a class="download" :href="store.downloadUrl" download>Download STEP</a>
-      <a v-if="store.scriptUrl" class="download secondary" :href="store.scriptUrl" download>
+      <a class="download" :href="store.downloadUrl" download
+         @click="guardDownload($event, store.downloadUrl)">Download STEP</a>
+      <a v-if="store.scriptUrl" class="download secondary" :href="store.scriptUrl" download
+         @click="guardDownload($event, store.scriptUrl)">
         Download CadQuery script (.py)
       </a>
-      <a v-if="store.fusionScriptUrl" class="download secondary" :href="store.fusionScriptUrl" download>
+      <a v-if="store.fusionScriptUrl" class="download secondary" :href="store.fusionScriptUrl" download
+         @click="guardDownload($event, store.fusionScriptUrl)">
         Download Fusion 360 script (.py) — experimental
       </a>
-      <a v-if="store.fusionBfillScriptUrl" class="download secondary" :class="{ risky: bfillState === 'fail' }" :href="store.fusionBfillScriptUrl" download>
+      <a v-if="store.fusionBfillScriptUrl" class="download secondary" :class="{ risky: bfillState === 'fail' }" :href="store.fusionBfillScriptUrl" download
+         @click="guardDownload($event, store.fusionBfillScriptUrl)">
         Download Fusion 360 script (Boundary Fill) — {{ bfillState === 'fail' ? 'likely to fail' : bfillState === 'unchecked' ? 'not checked' : 'experimental' }}
       </a>
+      <p v-if="downloadError" class="hint warn dlerror">{{ downloadError }}</p>
       <p v-if="bfillState === 'fail'" class="hint warn">
         This one will probably not build in Fusion: {{ store.bfillCheck.reason }}. The STEP is still fine.
       </p>
@@ -320,6 +387,15 @@ const reduction = computed(() => {
       <p v-if="store.result?.failure === 'oom'" class="fix">
         The most likely fix is to tick fewer bodies: each one converted at the
         same time can hold several gigabytes.
+      </p>
+      <p v-else-if="store.result?.failure === 'crashed'" class="fix">
+        A crash is the geometry kernel giving up on one face, not a problem with
+        your computer. Fewer bodies, a larger tolerance, or the Sliced Loft tool
+        usually gets past it.
+      </p>
+      <p v-else-if="store.status === 'error' && store.jobId && !store.result" class="fix">
+        Your file and settings are still here: fix what the message says and
+        convert again, or load another file.
       </p>
     </section>
 
@@ -413,6 +489,7 @@ th { text-align: left; font-weight: 600; }
 }
 .errorbox p { color: var(--fail); font-size: 13px; word-break: break-word; }
 .errorbox p.fix { color: var(--muted); margin-top: 6px; }
+.dlerror { color: var(--fail); font-size: 12px; }
 
 .logbox summary { cursor: pointer; }
 .logbox pre {

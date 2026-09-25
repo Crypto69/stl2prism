@@ -18,7 +18,7 @@ otherwise.
   surface could not be tessellated in minutes. The implementation fits
   every ring of a run by least squares onto **one shared uniform periodic
   cubic B-spline basis** (`fit_ring_poles`: K poles, doubling from 16
-  until the samples sit within 0.05 mm, cap 320 or N/2) and builds the
+  until the samples sit within 0.05 mm, cap 640 or N/2) and builds the
   OCC curves from those poles directly. Surface = K x M poles, no knot
   unification, and a sphere is 16 x 60.
 - **Smooth loft.** `BRepOffsetAPI_ThruSections(solid, ruled=False)` with
@@ -41,10 +41,12 @@ otherwise.
   loft check. The plan's "smooth loft volume 5 % off" was this artefact.
 - **Fallbacks.** A smooth stretch that is invalid or off the trapezoid
   integral of its section areas by > 1 % is rebuilt ruled; a run off by
-  > 5 % even ruled is refused (its rings do not correspond); every piece
-  (run, hole cut, cone, bridge) is fail-safe and listed in
-  `info['skipped']`. Bridges are ruled two-ring lofts, because
-  `extrudeLinear` refuses B-spline wires as "not planar".
+  > 5 % even ruled (its rings do not correspond) is lofted pair by pair
+  since 0.4.6, a pair that still fails extruded straight, and only a
+  chain that throws leaves a gap; every piece (run, hole cut, cone) is
+  fail-safe and listed in `info['skipped']` as `{what, z0, z1, text}`.
+  Extrusions are ruled two-ring lofts of a wire and its translated copy,
+  because `extrudeLinear` refuses B-spline wires as "not planar".
 - **Step levels** are clustered with a gap of max(0.05 mm, interval/2): a
   parting rim exported at three heights 0.01 mm apart is one step.
 - **Thinning** keeps ≤ 60 sections per run, crowding where the area
@@ -72,7 +74,10 @@ as Fusion's Create Mesh Section Sketch does, after joining loose ends
 closer than `join_mm` (2.5 mm by default in the app; `--join` in
 `tools/trace_section.py`): at Y = centre + 36 mm the controller's outline,
 in 15 pieces with 0.1–2.2 mm cracks, comes back as one closed loop. The
-loft's cutter, `section_loops`, still closes every chain by its chord.
+loft cuts the same way through the app and the CLI (`slice_join` is
+2.5 mm by default there, so open chains are joined or left out); only
+`loft_body(join_mm=0)` / `--slice-join 0` uses `section_loops`, which
+closes every chain by its chord.
 
 ## What one does by hand in Fusion
 
@@ -183,13 +188,19 @@ What failed, and what to try first in the implementation session:
 Decisions already made (do not re-open):
 
 - Name: **Sliced loft**; pipeline mode string `'loft'`.
-- Default slice spacing **0.2 mm**; axis `auto` = longest extent, or
-  `x`/`y`/`z`.
+- Default slice spacing **0.2 mm**; axis `auto` = the axis whose coarse
+  section stack has the fewest one-section runs, then the fewest runs
+  plus steep pairs, then the longest extent (`choose_axis`, 0.4.6; it
+  was the longest extent, which sent a round cap across its face: 72
+  runs, 10 minutes, 707 loose solids, against 5 runs and 20 s along its
+  short axis). The partial loft and the slider plane keep the longest
+  extent, because the slider's offsets are relative to it.
 - Smooth loft by default (fewest faces); `ruled` as an option.
 - Run breaks at flat-face levels and at topology changes (loop count or
-  hole count differs). Gaps between runs that are *not* at a level are
-  bridged by extruding the last outline of the earlier run to the next
-  run's first plane.
+  hole count differs). A gap between runs that is *not* at a level is
+  bridged inside the earlier run: its last section is repeated at the
+  next run's first plane as one straight stretch (0.4.6; a separate
+  0.2 mm bridge solid used to be left behind and rarely fused).
 - A loft result is **always written** when it builds (the user chose the
   method); the gate rows are shown as PASS / FAIL for information. The
   faceted fallback only applies when the loft cannot be built at all.
@@ -258,3 +269,25 @@ Decisions already made (do not re-open):
 5. README, version, then the samples: `Sony E-Mount Body Cap.stl`,
    `joystick_claw_1.stl`, `rc2-clean-controller-v2.stl` (largest body
    only) for numbers in the README.
+
+## What changed in 0.4.6 (review of 2026-09-25)
+
+Measured on `servo_bracket_1.stl` (a prismatic bracket: the wrong part
+for this tool, and now flagged as such), `Sony E-Mount Body Cap.stl` and
+`joystick_claw_1.stl`:
+
+| Fix | Before | After |
+|---|---|---|
+| `auto` axis by slicing structure (`choose_axis`) | cap along X: 594 s, 707 loose solids | cap along Z: 20 s, one solid, 274 faces |
+| ruled directly when the ring fit misses; identical sections merged | claw along Y: 82 faces | 22 faces, gate PASS, 2 s |
+| never drop a run (`_loft_pairs`) | bracket along Z: run 4 refused, 42 % of the volume missing | volume error 0.02 %, one solid |
+| bridges inside runs, chains in `_fuse_all`, ShapeFix pass | bracket along Y: 14 loose solids | 2 |
+| reverse deviation ignores points inside the part | false FAIL at 1.9 mm from internal caps | PASS |
+| report: skipped runs, loose solids, extruded pairs, prismatic hint | red gate rows only | plain sentences |
+| Fusion script: every outline, bridges, extruded pairs, dome tips | first outline only | parity with the STEP |
+
+Still open: the last join on the bracket along Y (an end-slice sliver
+whose ring overlaps the next ring along a straight stretch) fuses to an
+invalid solid even after ShapeFix; a smooth run through cornered
+outlines is many ruled bands (one per slice pair), which is honest but
+not few faces; the Fusion script is still unverified inside Fusion.

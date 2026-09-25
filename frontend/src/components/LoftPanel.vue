@@ -31,11 +31,32 @@ watch(() => [store.sliceOffset, store.resolvedSliceAxis, store.params.tol, store
       }, { immediate: true })
 onBeforeUnmount(() => clearTimeout(traceTimer))
 
+// The auto axis is worked out from the slicing structure as soon as the
+// tool is up (and again when the spacing, units, scale or gap joining
+// change), so the plane shows on the axis the run will use.
+let axisTimer = null
+watch(() => [store.jobId, store.params.slice_axis, store.params.units, store.params.scale,
+             store.params.slice_mm, store.params.slice_join, store.params.slice_trim],
+      ([job, axis]) => {
+        clearTimeout(axisTimer)
+        if (!job || axis !== 'auto') return
+        axisTimer = setTimeout(() => store.fetchLoftAxis(), 250)
+      }, { immediate: true })
+onBeforeUnmount(() => clearTimeout(axisTimer))
+
 const sectionSummary = computed(() => summarise(store.section?.stats, store.sliceOutline))
 </script>
 
 <template>
   <section class="params">
+    <p class="hint">
+      For shapes that change smoothly along one axis (caps, handles, shells,
+      bottles), for flat plates with a fancy outline sliced across their
+      thin side, and for one smooth stretch of a mixed part with “Loft
+      only”. Not for machined parts with slots, sideways holes and steps:
+      Mesh → Solid does those with true planes and cylinders. Every
+      section here becomes a spline, so a run is one B-spline face.
+    </p>
     <div class="row">
       <label for="slice_mm">
         Slice spacing

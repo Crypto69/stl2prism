@@ -42,10 +42,15 @@ def _worker_main(task_q, conn, parent_pid):
     import contextlib
     import sys
 
+    # Windows keeps a dead parent's pid as the ppid, so also ask the
+    # parent's process handle whether it is still alive
+    parent = mp.parent_process()
+
     def watchdog():
         while True:
             time.sleep(1.0)
-            if os.getppid() != parent_pid:
+            if os.getppid() != parent_pid or (
+                    parent is not None and not parent.is_alive()):
                 os._exit(0)
     threading.Thread(target=watchdog, daemon=True).start()
     try:                                  # the start-up every task would pay

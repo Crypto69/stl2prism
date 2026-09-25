@@ -43,6 +43,25 @@ def tessellate_solid(solid, tolerance=0.02, angular=0.1):
     return trimesh.Trimesh(V, F, process=False)
 
 
+def _on_brep(solid, pts, tol):
+    """Which of `pts` lie within `tol` of a face of the BREP solid (exact
+    distance, BRepExtrema), for checking that sample points taken from a
+    triangulation are real."""
+    import cadquery as cq
+    from OCP.BRepExtrema import BRepExtrema_DistShapeShape
+    from OCP.BRepBuilderAPI import BRepBuilderAPI_MakeVertex
+    from OCP.gp import gp_Pnt
+    shape = solid.val() if hasattr(solid, 'val') else solid
+    if isinstance(shape, cq.Shape):
+        shape = shape.wrapped
+    out = np.zeros(len(pts), bool)
+    for i, p in enumerate(np.asarray(pts, float)):
+        v = BRepBuilderAPI_MakeVertex(gp_Pnt(float(p[0]), float(p[1]), float(p[2]))).Vertex()
+        d = BRepExtrema_DistShapeShape(v, shape)
+        out[i] = d.IsDone() and d.Value() <= tol
+    return out
+
+
 def sample_points(mesh, n_samples=None, include_vertices=True, max_points=200000):
     """Points on `mesh` for deviation measurement.
 
@@ -66,8 +85,15 @@ def sample_points(mesh, n_samples=None, include_vertices=True, max_points=200000
 
 
 def validate(solid, mesh, n_samples=None, cyls=None, hole_band=0.15,
-             symmetric=True, tess=(0.02, 0.1)):
+             symmetric=True, tess=(0.02, 0.1), ignore_inside=False):
     """Measure the rebuilt solid against the source mesh.
+
+    With `ignore_inside`, reverse sample points that lie inside the mesh
+    farther than the tessellation tolerance are left out of the reverse
+    deviation: a solid written as several touching pieces has cap faces
+    inside the part, millimetres from any mesh surface, that are no
+    error. Material the rebuild lacks there is still caught by the
+    forward direction, so the gate stays honest. The loft route uses it.
 
     `tess` is the (linear mm, angular rad) deflection the solid is
     triangulated with for the measurement; the default is exact to 0.02
@@ -124,6 +150,30 @@ def validate(solid, mesh, n_samples=None, cyls=None, hole_band=0.15,
     if symmetric and closed:
         rpts, _ = sample_points(rb, max(2000, n_uni // 2), include_vertices=False)
         _, rdist, _ = trimesh.proximity.closest_point(mesh, rpts)
+        out['rev_internal_pts'] = 0
+        out['rev_phantom_pts'] = 0
+        if ignore_inside:
+            from .mesh_prep import _contains
+            try:
+                inner = _contains(mesh, rpts) & (rdist > tess[0])
+            except Exception:
+                inner = np.zeros(len(rpts), bool)
+            # a triangulation can fill a planar face's inner wire (a
+            # 700-point toothed ring the mesher could not honour) with a
+            # membrane the BREP does not have: a far sample point is kept
+            # only if it really lies on a face of the solid
+            phantom = np.zeros(len(rpts), bool)
+            far = np.where((rdist > 4 * tess[0]) & ~inner)[0]
+            if len(far):
+                try:
+                    phantom[far] = ~_on_brep(solid, rpts[far], 4 * tess[0])
+                except Exception:
+                    pass
+            drop = inner | phantom
+            if drop.any() and not drop.all():
+                out['rev_internal_pts'] = int(inner.sum())
+                out['rev_phantom_pts'] = int(phantom.sum())
+                rdist = rdist[~drop]
         out['rev_dev_max'] = float(rdist.max())
         out['rev_dev_p95'] = float(np.percentile(rdist, 95))
         out['symmetric'] = True
@@ -1341,12 +1391,24 @@ def _loft_body(mesh, verbose, slice_mm, slice_axis, ruled, gates, loft_opts=None
     across a sideways hole, a smoothed corner), not a fitting failure.
     With a z_range in `loft_opts` only that stretch is lofted, and the
     check measures against the mesh clipped to the same stretch."""
-    from .sliced_loft import loft_body, axis_index
+    from .sliced_loft import loft_body, axis_index, choose_axis
     opts = loft_opts or {}
-    axis = axis_index(mesh, slice_axis)
     z_range = opts.get('z_range')
+    auto = slice_axis in (None, 'auto')
+    scores = None
+    if auto and z_range is None:
+        # the whole body: pick the axis by how the section stack breaks
+        # into runs, not by the longest side (a round cap is longest
+        # across its face, and wants its short axis)
+        axis, scores = choose_axis(mesh, slice_mm, join_mm=opts.get('join_mm', 0.0),
+                                   trim_mm=opts.get('trim_mm', 0.0), verbose=verbose)
+    else:
+        # a partial loft follows the slider plane, which is on the longest side
+        axis = axis_index(mesh, slice_axis)
     shape, info = loft_body(mesh, axis, slice_mm, ruled=ruled, verbose=verbose, z_range=z_range,
                             join_mm=opts.get('join_mm', 0.0), trim_mm=opts.get('trim_mm', 0.0))
+    info['axis_auto'] = bool(auto)
+    info['axis_scores'] = scores
     ref = mesh
     if z_range is not None:
         n = np.zeros(3)
@@ -1359,11 +1421,23 @@ def _loft_body(mesh, verbose, slice_mm, slice_axis, ruled, gates, loft_opts=None
                 ref = mesh
         except Exception:
             ref = mesh
-    metrics = validate(shape, ref, tess=LOFT_TESS)
+    metrics = validate(shape, ref, tess=LOFT_TESS, ignore_inside=True)
     _log_check(metrics, verbose, tag='[loft]')
-    if info.get('fuse') == 'compound' and verbose:
-        print("[loft] the pieces did not fuse: the STEP holds them as separate solids, and "
-              "the reverse deviation above counts their touching caps, which lie inside the part")
+    if verbose:
+        if info.get('fuse') == 'compound':
+            print(f"[loft] the pieces did not fuse: the STEP holds {info.get('n_solids', '?')} separate "
+                  f"solids that only touch")
+        if metrics.get('rev_internal_pts'):
+            print(f"[loft] {metrics['rev_internal_pts']} reverse sample points lay inside the part "
+                  f"(touching caps) and were left out of the solid -> mesh deviation")
+        if metrics.get('rev_phantom_pts'):
+            print(f"[loft] {metrics['rev_phantom_pts']} reverse sample points came from the check's "
+                  f"triangulation, not from the solid (a filled inner wire), and were left out")
+        for sk in info.get('skipped') or []:
+            print(f"[loft] could not build: {sk['text'] if isinstance(sk, dict) else sk}")
+        if info.get('prismatic_hint'):
+            print(f"[loft] this part looks prismatic ({100 * info.get('planar_frac', 0):.0f}% of its surface "
+                  f"is flat side walls square to the other axes); Mesh -> Solid will do better")
     metrics['loft_compound'] = info.get('fuse') == 'compound'
     ok, why = _passes(metrics, **gates)
     if verbose:
