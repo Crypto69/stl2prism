@@ -382,6 +382,34 @@ def test_loft_never_drops_a_run(tmp_path, monkeypatch):
     assert mt['vol_err_pct'] < 1.0, mt
 
 
+def test_validate_can_ignore_internal_caps():
+    """Two abutting boxes as one compound against the mesh of their
+    union: the shared cap lies inside the part and must not count as a
+    solid -> mesh deviation when asked to ignore inside points."""
+    from stl_to_solid.pipeline import validate
+    a = cq.Workplane('XY').box(20, 20, 10, centered=(True, True, False))
+    b = cq.Workplane('XY').box(20, 20, 10, centered=(True, True, False)).translate((0, 0, 10))
+    comp = cq.Compound.makeCompound([a.val(), b.val()])
+    m = trimesh.creation.box([20, 20, 20])
+    m.apply_translation([0, 0, 10])
+    plain = validate(comp.wrapped, m)
+    assert plain['rev_dev_max'] > 1.0, plain
+    fixed = validate(comp.wrapped, m, ignore_inside=True)
+    assert fixed['rev_dev_p95'] < 0.05 and fixed['rev_dev_max'] < 0.05, fixed
+    assert fixed['rev_internal_pts'] > 0
+    assert fixed['dev_max'] < 0.05
+
+
+def test_loft_prismatic_hint(tmp_path):
+    from stl_to_solid.sliced_loft import loft_body
+    p = synth.export(synth.plate_holes(), tmp_path / 'plate.stl')
+    m = trimesh.load(p, force='mesh')
+    _, info = loft_body(m, 2, 0.5, verbose=False)
+    assert info['prismatic_hint'] is True and info['planar_frac'] > 0.5
+    _, info = loft_body(_sphere(), 2, 0.5, verbose=False)
+    assert info['prismatic_hint'] is False
+
+
 def test_loft_stepped_shaft_breaks_at_levels(tmp_path):
     from stl_to_solid.sliced_loft import loft_body
     p = synth.export(synth.stepped_shaft(), tmp_path / 'shaft.stl')

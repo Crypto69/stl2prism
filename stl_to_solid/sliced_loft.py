@@ -1066,6 +1066,11 @@ def loft_body(mesh, axis, interval=0.2, ruled=False, verbose=True, z_range=None,
     if not solids:
         raise RuntimeError('no run could be lofted')
     shape, how = _fuse_all(solids, verbose)
+    # a part that is mostly flat faces square to the axes, with steps
+    # along this one, is a prismatic part: the other engine's job
+    planar = np.abs(mesh.face_normals).max(1) > 0.999
+    planar_frac = float(mesh.area_faces[planar].sum() / max(float(mesh.area), 1e-12))
+    prismatic_hint = bool(planar_frac > 0.5 and len(levels) >= 1)
     if verbose:
         print(f"[loft] {len(solids)} solid(s) -> {len(shape.Faces())} faces "
               f"({how} fuse), volume {_volume(shape):.0f} mm^3")
@@ -1076,5 +1081,6 @@ def loft_body(mesh, axis, interval=0.2, ruled=False, verbose=True, z_range=None,
             'n_sections': len(slices), 'n_runs': len(runs), 'n_levels': len(levels),
             'n_holes': n_holes, 'n_ruled_runs': int(n_ruled), 'n_merged': int(n_merged),
             'n_extruded_pairs': int(n_extruded), 'fuse': how, 'n_solids': len(shape.Solids()),
+            'planar_frac': planar_frac, 'prismatic_hint': prismatic_hint,
             'faces': len(shape.Faces()), 'skipped': skipped, 'runs': run_infos}
     return shape.wrapped, info

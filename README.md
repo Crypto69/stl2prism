@@ -29,25 +29,40 @@ instead of failing.
 
 ### Sliced loft (v0.4)
 
-For organic shells — controller housings, handles, lens caps, scanned
-enclosures — where nothing is flat or round enough for the engines above,
-`--method loft` does what you would do by hand in Fusion with **Create
-Mesh Section Sketch → Fit Curves to Mesh Section → Loft**, automatically:
-the body is sliced along one axis every 0.2 mm (default), every section
-outline is redrawn as a closed B-spline, and the stack is lofted into
-**one smooth face per run of sections**. Runs break at flat faces across
-the axis (a shoulder stays a real planar face, not a smear) and where the
-outline count changes; holes along the axis are lofted and cut; a dome
-tip gets a short cone to the apex. The result is written whenever it can
-be built — you chose the method — and the acceptance gate is reported for
-information. Alongside the STEP comes `<out>_fusion.py`, which repeats
-the workflow as a Fusion timeline: one sketch per section (closed fitted
-splines on offset planes) and one Loft per run, holes as Loft cuts.
+For shapes that change smoothly along one axis — lens caps, handles,
+shells, bottles — and for flat plates with a fancy outline (sliced across
+their thin side), `--method loft` does what you would do by hand in Fusion
+with **Create Mesh Section Sketch → Fit Curves to Mesh Section → Loft**,
+automatically: the body is sliced along one axis every 0.2 mm (default),
+every section outline is redrawn as a closed B-spline, and the stack is
+lofted into **one smooth face per run of sections**. Runs break at flat
+faces across the axis (a shoulder stays a real planar face, not a smear)
+and where the outline count changes; holes along the axis are lofted and
+cut; a dome tip gets a short cone to the apex. The result is written
+whenever it can be built — you chose the method — and the acceptance gate
+is reported for information. Alongside the STEP comes `<out>_fusion.py`,
+which repeats the workflow as a Fusion timeline: one sketch per section
+(closed fitted splines on offset planes) and one Loft per run, holes as
+Loft cuts.
 
-Where it is bad by design: a hole drilled *across* the slicing axis
-becomes a trough, because no slice sees it as a circle (the prismatic
-engine handles those); sharp corners *around* an outline are followed
-within the spline tolerance (0.02 mm) but are not sharp edges.
+Not for machined parts with slots, sideways holes and steps: a hole
+drilled *across* the slicing axis becomes a trough, because no slice sees
+it as a circle, and sharp corners *around* an outline are followed within
+the spline tolerance (0.02 mm) but are not sharp edges. Mesh → Solid
+does those parts with true planes and cylinders (the servo bracket sample:
+2 s, one solid, 0.06 mm); the report says so when a part looks prismatic.
+
+What the loft does on its own (v0.4.6): `auto` picks the axis by slicing
+structure, not the longest side — a round cap is longest across its face
+but wants its short axis (the body-cap sample: 10 minutes and 707 loose
+solids along X, 22 s and one solid along Z), a 4 mm plate wants its thin
+axis; the report says which axis and why. Outlines the shared spline
+basis cannot fit (cornered sections) are lofted ruled straight away, and
+identical sections collapse to one straight stretch, so a prism is one
+face per side. A run whose rings do not correspond is lofted pair by pair
+instead of being dropped, a pair that still fails is extruded straight,
+and the report lists every run, hole or pair it had to give up on, and
+whether the pieces fused to one solid.
 
 `stl_to_solid/section_fit.py` holds the shared plane cutter and the curve
 fitter (lines and arcs where they hold the tolerance, fitted splines where

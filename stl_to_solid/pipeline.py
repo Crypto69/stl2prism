@@ -66,8 +66,15 @@ def sample_points(mesh, n_samples=None, include_vertices=True, max_points=200000
 
 
 def validate(solid, mesh, n_samples=None, cyls=None, hole_band=0.15,
-             symmetric=True, tess=(0.02, 0.1)):
+             symmetric=True, tess=(0.02, 0.1), ignore_inside=False):
     """Measure the rebuilt solid against the source mesh.
+
+    With `ignore_inside`, reverse sample points that lie inside the mesh
+    farther than the tessellation tolerance are left out of the reverse
+    deviation: a solid written as several touching pieces has cap faces
+    inside the part, millimetres from any mesh surface, that are no
+    error. Material the rebuild lacks there is still caught by the
+    forward direction, so the gate stays honest. The loft route uses it.
 
     `tess` is the (linear mm, angular rad) deflection the solid is
     triangulated with for the measurement; the default is exact to 0.02
@@ -124,6 +131,16 @@ def validate(solid, mesh, n_samples=None, cyls=None, hole_band=0.15,
     if symmetric and closed:
         rpts, _ = sample_points(rb, max(2000, n_uni // 2), include_vertices=False)
         _, rdist, _ = trimesh.proximity.closest_point(mesh, rpts)
+        out['rev_internal_pts'] = 0
+        if ignore_inside:
+            from .mesh_prep import _contains
+            try:
+                inner = _contains(mesh, rpts) & (rdist > tess[0])
+            except Exception:
+                inner = np.zeros(len(rpts), bool)
+            if inner.any() and not inner.all():
+                out['rev_internal_pts'] = int(inner.sum())
+                rdist = rdist[~inner]
         out['rev_dev_max'] = float(rdist.max())
         out['rev_dev_p95'] = float(np.percentile(rdist, 95))
         out['symmetric'] = True
@@ -1371,11 +1388,20 @@ def _loft_body(mesh, verbose, slice_mm, slice_axis, ruled, gates, loft_opts=None
                 ref = mesh
         except Exception:
             ref = mesh
-    metrics = validate(shape, ref, tess=LOFT_TESS)
+    metrics = validate(shape, ref, tess=LOFT_TESS, ignore_inside=True)
     _log_check(metrics, verbose, tag='[loft]')
-    if info.get('fuse') == 'compound' and verbose:
-        print("[loft] the pieces did not fuse: the STEP holds them as separate solids, and "
-              "the reverse deviation above counts their touching caps, which lie inside the part")
+    if verbose:
+        if info.get('fuse') == 'compound':
+            print(f"[loft] the pieces did not fuse: the STEP holds {info.get('n_solids', '?')} separate "
+                  f"solids that only touch")
+        if metrics.get('rev_internal_pts'):
+            print(f"[loft] {metrics['rev_internal_pts']} reverse sample points lay inside the part "
+                  f"(touching caps) and were left out of the solid -> mesh deviation")
+        for sk in info.get('skipped') or []:
+            print(f"[loft] could not build: {sk['text'] if isinstance(sk, dict) else sk}")
+        if info.get('prismatic_hint'):
+            print(f"[loft] this part looks prismatic ({100 * info.get('planar_frac', 0):.0f}% flat faces "
+                  f"square to the axes); Mesh -> Solid will do better")
     metrics['loft_compound'] = info.get('fuse') == 'compound'
     ok, why = _passes(metrics, **gates)
     if verbose:

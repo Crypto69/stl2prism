@@ -36,6 +36,14 @@ const sectionSummary = computed(() => summarise(store.section?.stats, store.slic
 
 <template>
   <section class="params">
+    <p class="hint">
+      For shapes that change smoothly along one axis (caps, handles, shells,
+      bottles), for flat plates with a fancy outline sliced across their
+      thin side, and for one smooth stretch of a mixed part with “Loft
+      only”. Not for machined parts with slots, sideways holes and steps:
+      Mesh → Solid does those with true planes and cylinders. Every
+      section here becomes a spline, so a run is one B-spline face.
+    </p>
     <div class="row">
       <label for="slice_mm">
         Slice spacing
