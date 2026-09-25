@@ -9,6 +9,7 @@ import LoftPanel from './components/LoftPanel.vue'
 import XRayPanel from './components/XRayPanel.vue'
 import ReportPanel from './components/ReportPanel.vue'
 import { useConvertStore } from './store'
+import { appError, clearAppError, friendlyError } from './errors'
 
 const store = useConvertStore()
 const buffer = shallowRef(null)
@@ -31,21 +32,37 @@ onMounted(async () => {
   } catch (e) { /* badge is optional */ }
 })
 
+// why the 3D preview is missing while the file itself is fine
+const previewError = ref(null)
+
 async function takeFile(file) {
-  const kind = file?.name.split('.').pop().toLowerCase()
-  if (!file || !ACCEPT.includes(kind)) {
+  if (!file) return
+  const kind = (file.name || '').split('.').pop().toLowerCase()
+  if (!ACCEPT.includes(kind)) {
     store.$patch({
       status: 'error',
-      error: `That is not one of ${ACCEPT.map((e) => '.' + e).join(', ')}.`,
+      error: `${file.name || 'That file'} is not one of ${ACCEPT.map((e) => '.' + e).join(', ')}.`,
     })
     return
   }
+  if (store.busy) store.stopPolling()
   loading.value = true
   loadingName.value = file.name
+  previewError.value = null
   try {
     if (kind === 'stl' || kind === 'obj') {
-      buffer.value = markRaw({ data: await file.arrayBuffer(), kind })
-      store.upload(file)
+      let data
+      try {
+        // reading can fail when the file moved, is locked, or is too big
+        // for the browser to hold at once
+        data = await file.arrayBuffer()
+      } catch (e) {
+        store.$patch({ status: 'error',
+                       error: `Could not read ${file.name}: ${friendlyError(e)}` })
+        return
+      }
+      buffer.value = markRaw({ data, kind })
+      await store.upload(file)
       return
     }
     // other formats: the server converts them to an STL preview on upload
@@ -54,9 +71,15 @@ async function takeFile(file) {
     if (store.jobId) {
       try {
         const res = await fetch(`/api/jobs/${store.jobId}/preview`)
-        if (res.ok) buffer.value = markRaw({ data: await res.arrayBuffer(), kind: 'stl' })
-      } catch (e) { /* preview is optional */ }
+        if (!res.ok) throw new Error(`the server sent no preview (${res.status})`)
+        buffer.value = markRaw({ data: await res.arrayBuffer(), kind: 'stl' })
+      } catch (e) {
+        // the preview is optional: the file still converts
+        previewError.value = `No 3D preview for this file (${friendlyError(e)}). It can still be converted.`
+      }
     }
+  } catch (e) {
+    store.$patch({ status: 'error', error: `Could not load ${file.name}: ${friendlyError(e)}` })
   } finally {
     loading.value = false
   }
@@ -94,6 +117,17 @@ const canConvert = computed(
       </p>
     </header>
 
+    <div v-if="appError.message" class="banner" role="alert">
+      <div class="text">
+        <p>{{ appError.message }}</p>
+        <details v-if="appError.detail">
+          <summary class="micro">details</summary>
+          <pre class="num">{{ appError.detail }}</pre>
+        </details>
+      </div>
+      <button class="close" title="Dismiss" @click="clearAppError()">×</button>
+    </div>
+
     <main class="grid">
       <div
         class="stage"
@@ -113,8 +147,12 @@ const canConvert = computed(
           :sections="store.viewSections"
           @pick="store.toggleBody($event)"
           @hover="store.hovered = $event"
+          @error="previewError = $event"
         />
-        <div v-else class="dropzone">
+        <p v-if="previewError && (buffer || store.jobId)" class="preview-note micro">
+          {{ previewError }}
+        </p>
+        <div v-if="!buffer" class="dropzone">
           <div class="prism-mark" aria-hidden="true">
             <svg viewBox="0 0 120 100" width="120" height="100">
               <path d="M60 8 L112 82 L8 82 Z" fill="none"
@@ -144,6 +182,10 @@ const canConvert = computed(
           <p class="micro">{{ toolHead.blurb }}</p>
         </header>
         <BodyPicker />
+        <p v-if="store.bodiesError" class="bodies-note micro">
+          The body list could not be built ({{ store.bodiesError }}), so the whole
+          file will be converted as one selection.
+        </p>
         <SetupPanel />
         <SolidPanel v-if="store.tool === 'solid'" />
         <LoftPanel v-else-if="store.tool === 'loft'" />
@@ -180,6 +222,67 @@ const canConvert = computed(
 
 <style scoped>
 .shell { height: 100%; display: flex; flex-direction: column; }
+
+/* the app-wide error banner: what the global handlers caught */
+.banner {
+  display: flex;
+  align-items: flex-start;
+  gap: 12px;
+  padding: 10px 20px;
+  background: rgba(255, 107, 94, 0.12);
+  border-bottom: 1px solid var(--fail);
+  color: var(--fail);
+  font-size: 13px;
+}
+.banner .text { flex: 1; min-width: 0; }
+.banner p { margin: 0; word-break: break-word; }
+.banner details { margin-top: 4px; }
+.banner summary { cursor: pointer; }
+.banner pre {
+  margin-top: 4px;
+  max-height: 160px;
+  overflow: auto;
+  font-size: 11px;
+  white-space: pre-wrap;
+  word-break: break-word;
+  color: var(--muted);
+}
+.banner .close {
+  background: none;
+  border: 1px solid var(--fail);
+  color: var(--fail);
+  border-radius: 4px;
+  width: 26px;
+  height: 26px;
+  font-size: 16px;
+  line-height: 1;
+  cursor: pointer;
+  flex: 0 0 auto;
+}
+
+.preview-note {
+  position: absolute;
+  top: 12px;
+  left: 14px;
+  right: 14px;
+  z-index: 2;
+  text-transform: none;
+  letter-spacing: 0;
+  font-size: 12px;
+  color: var(--warn, #f0ad4e);
+  background: rgba(20, 23, 28, 0.85);
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  padding: 6px 10px;
+  pointer-events: none;
+}
+.bodies-note {
+  text-transform: none;
+  letter-spacing: 0;
+  font-size: 12px;
+  color: var(--warn, #f0ad4e);
+  line-height: 1.45;
+}
 
 .topbar {
   display: flex;

@@ -3,35 +3,87 @@
 Runs in its own process so an OpenCascade crash or OOM kills the worker,
 not the API server, and so the pipeline's verbose stdout can be captured
 per-job by simple file redirection.
+
+Whatever goes wrong short of the process being killed, result.json is
+written with a readable 'error': the UI shows that sentence, and the
+traceback goes to the log for whoever wants it.
 """
 import json
 import sys
 import traceback
 
 
-def main(argv=None):
-    # line-buffered, so the job log stays live when started without -u
-    sys.stdout.reconfigure(line_buffering=True)
-    in_path, out_path, params_path, result_path = (
-        argv[:4] if argv is not None else sys.argv[1:5])
-    with open(params_path) as f:
-        params = json.load(f)
-
-    from stl_to_solid import run
-    from .analysis import sanitize, step_stats, body_list
-
-    # The UI picks shells by their index in /bodies (every connected shell
-    # of the raw mesh). Preparation folds cavities into their parent and
-    # drops slivers, so those indices do not address the prepared list:
-    # translate them to the shell keys pipeline._pick_bodies matches on.
-    picked = params.get('bodies')
-    if picked:
-        shells = body_list(in_path)['bodies']
-        picked = [tuple(shells[i]['key']) for i in picked if 0 <= i < len(shells)]
-
-    result = {'ok': False, 'error': None, 'mode': None,
-              'metrics': None, 'output_stats': None, 'params': params}
+def _prepare_streams():
+    """Line-buffered stdout, so the job log stays live when started
+    without -u. A worker without a stdout at all (a windowed Windows
+    build started by hand) gets one pointed at nowhere rather than
+    crashing on its first print."""
+    import io
+    import os
+    for name in ('stdout', 'stderr'):
+        if getattr(sys, name) is None:
+            setattr(sys, name, open(os.devnull, 'w', encoding='utf-8'))
     try:
+        sys.stdout.reconfigure(line_buffering=True)
+    except (AttributeError, ValueError, io.UnsupportedOperation):
+        pass
+
+
+def _write_result(result_path, result):
+    from .analysis import sanitize
+    try:
+        with open(result_path, 'w') as f:
+            json.dump(sanitize(result), f)
+    except Exception:
+        # the server then reports "no result"; this traceback says why
+        print('could not write the result file:', file=sys.stderr)
+        traceback.print_exc()
+        return False
+    return True
+
+
+def _pick_shells(in_path, picked):
+    """The UI picks shells by their index in /bodies (every connected
+    shell of the raw mesh). Preparation folds cavities into their parent
+    and drops slivers, so those indices do not address the prepared list:
+    translate them to the shell keys pipeline._pick_bodies matches on."""
+    from .analysis import body_list
+    shells = body_list(in_path)['bodies']
+    return [tuple(shells[i]['key']) for i in picked if 0 <= i < len(shells)]
+
+
+def main(argv=None):
+    _prepare_streams()
+    args = argv[:4] if argv is not None else sys.argv[1:5]
+    if len(args) != 4:
+        print(f'worker: expected 4 arguments (input, output, params, result), got {len(args)}',
+              file=sys.stderr)
+        sys.exit(2)
+    in_path, out_path, params_path, result_path = args
+
+    from .errors import describe
+
+    result = {'ok': False, 'error': None, 'failure': None, 'mode': None,
+              'metrics': None, 'output_stats': None, 'params': None}
+    try:
+        try:
+            with open(params_path) as f:
+                params = json.load(f)
+        except Exception as e:
+            raise RuntimeError(f'the conversion settings could not be read ({describe(e)})') from e
+        result['params'] = params
+
+        picked = params.get('bodies')
+        if picked:
+            try:
+                picked = _pick_shells(in_path, picked)
+            except Exception as e:
+                raise RuntimeError(
+                    f'the chosen bodies could not be found in the mesh ({describe(e)})') from e
+
+        from stl_to_solid import run
+        from .analysis import step_stats
+
         r = run(in_path, out_path,
                 tol=params['tol'],
                 accept_p95=params['accept_p95'],
@@ -56,7 +108,15 @@ def main(argv=None):
                 verbose=True)
         # Pass the whole pipeline result through (mode, metrics, and for
         # multi-body files the per-body list and counts).
-        result.update(r, ok=True, output_stats=step_stats(out_path))
+        try:
+            stats = step_stats(out_path)
+        except Exception as e:
+            # the STEP is written; a failed read-back is a note, not a failure
+            traceback.print_exc()
+            print(f'note: could not measure the written STEP ({describe(e)})')
+            stats = {'file_size': None, 'faces': 0, 'solids': None, 'solids_claimed': None,
+                     'closed': None, 'surface_types': {}, 'unmeasured': True}
+        result.update(r, ok=True, output_stats=stats)
         result['has_script'] = bool(r.get('script'))
         result.pop('script', None)     # server path; the API serves it by job id
         result['has_bfill_script'] = bool(r.get('bfill_script'))
@@ -65,13 +125,24 @@ def main(argv=None):
         # CadQuery script) and for sliced lofts (on its own)
         result['has_fusion_script'] = bool(r.get('fusion_script'))
         result.pop('fusion_script', None)
-    except Exception as e:
+    except MemoryError as e:
         traceback.print_exc()
-        result['error'] = f'{type(e).__name__}: {e}'
+        result['error'] = 'The conversion ' + describe(e) + '.'
+        result['failure'] = 'oom'
+    except KeyboardInterrupt:
+        result['error'] = 'Conversion cancelled.'
+        result['failure'] = 'cancelled'
+    except BaseException as e:            # noqa: BLE001 - every failure must leave a result
+        traceback.print_exc()
+        text = describe(e)
+        result['error'] = text if text[:1].isupper() else 'The conversion failed: ' + text
+        result['failure'] = type(e).__name__
     finally:
-        sys.stdout.flush()
-        with open(result_path, 'w') as f:
-            json.dump(sanitize(result), f)
+        try:
+            sys.stdout.flush()
+        except Exception:
+            pass
+        _write_result(result_path, result)
     sys.exit(0 if result['ok'] else 1)
 
 

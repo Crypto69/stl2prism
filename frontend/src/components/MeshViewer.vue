@@ -29,9 +29,13 @@ const props = defineProps({
   // curves on the plane
   sections: { type: Array, default: () => [] },
 })
-const emit = defineEmits(['pick', 'hover'])
+// 'error': a sentence for the parent when the preview cannot be drawn
+// (the file itself is fine and still converts)
+const emit = defineEmits(['pick', 'hover', 'error'])
 
 const host = ref(null)
+// why there is no picture: WebGL missing, the file not parseable, ...
+const failure = ref(null)
 const rawSize = ref(null)  // in file units
 const dims = computed(() =>
   rawSize.value && rawSize.value.map((v) => (v * props.unitScale).toFixed(1)))
@@ -76,6 +80,12 @@ function bodyColor(i, isSelected, isHovered) {
     : MUTED.setHSL(hue, 0.10, 0.30)
 }
 
+function fail(text, err) {
+  if (err) console.error('[viewer]', err)
+  failure.value = text
+  emit('error', text)
+}
+
 onMounted(() => {
   scene = new THREE.Scene()
   scene.background = new THREE.Color(0x14171c)
@@ -83,9 +93,30 @@ onMounted(() => {
   camera = new THREE.PerspectiveCamera(45, 1, 0.1, 5000)
   camera.position.set(80, 60, 80)
 
-  renderer = new THREE.WebGLRenderer({ antialias: true })
+  // No WebGL (a remote desktop, a very old GPU, hardware acceleration
+  // switched off) throws here. The rest of the app is unaffected: say so
+  // instead of dying in onMounted and leaving a blank stage.
+  try {
+    renderer = new THREE.WebGLRenderer({ antialias: true })
+  } catch (e) {
+    fail('The 3D preview needs WebGL, which this window does not have. '
+         + 'The file still loads and converts; only the picture is missing.', e)
+    return
+  }
   renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2))
   host.value.appendChild(renderer.domElement)
+  // the GPU can drop the context (a driver reset, too much memory); three
+  // restores the scene when it comes back, and a lost one stays black
+  // without a word unless we say something
+  renderer.domElement.addEventListener('webglcontextlost', (ev) => {
+    ev.preventDefault()
+    fail('The 3D preview stopped drawing (the graphics context was lost). '
+         + 'It comes back on its own once the GPU is free again; the file still converts.')
+  })
+  renderer.domElement.addEventListener('webglcontextrestored', () => {
+    failure.value = null
+    emit('error', null)
+  })
 
   controls = new OrbitControls(camera, renderer.domElement)
   controls.enableDamping = true
@@ -119,10 +150,29 @@ onMounted(() => {
   resizeObs.observe(host.value)
   resize()
   animate()
-  if (props.buffer) loadMesh(props.buffer)
+  if (props.buffer) safeLoad(props.buffer)
 })
 
-watch(() => props.buffer, (b) => { if (b) loadMesh(b) })
+watch(() => props.buffer, (b) => { if (b) safeLoad(b) })
+
+// loadMesh raises on a file the parsers cannot read and on a mesh too big
+// for the GPU; neither may take the component down
+function safeLoad(b) {
+  if (!renderer) return
+  try {
+    loadMesh(b)
+  } catch (e) {
+    rawSize.value = null
+    fail(`The 3D preview could not be drawn: ${previewReason(e)}. The file still converts.`, e)
+  }
+}
+
+function previewReason(e) {
+  const m = String(e?.message || e || '')
+  if (/out of memory|allocation|array buffer allocation/i.test(m)) return 'the file is too big for the browser to hold'
+  if (/no faces|Unexpected|invalid|malformed|NaN/i.test(m)) return 'the file could not be parsed as a mesh'
+  return m || 'unknown error'
+}
 
 // OBJLoader yields a Group of Meshes (one per object/material), each with
 // whatever attributes the file had (normal, uv, color). Reduce that to one
@@ -267,15 +317,16 @@ function loadMesh({ data, kind }) {
   }
   if (grid) { scene.remove(grid); grid.dispose(); grid = null }
 
-  let geo
-  try {
-    geo = kind === 'obj' ? parseObj(data) : new STLLoader().parse(data)
-  } catch {
-    rawSize.value = null
-    return
-  }
+  const geo = kind === 'obj' ? parseObj(data) : new STLLoader().parse(data)
+  const pos = geo.getAttribute('position')
+  if (!pos || !pos.count) throw new Error('the file holds no faces')
   geo.computeBoundingBox()
   const bb = geo.boundingBox
+  if (![bb.min.x, bb.min.y, bb.min.z, bb.max.x, bb.max.y, bb.max.z].every(Number.isFinite)) {
+    throw new Error('the file holds NaN or infinite coordinates')
+  }
+  failure.value = null
+  emit('error', null)
   const size = new THREE.Vector3()
   bb.getSize(size)
   rawSize.value = [size.x, size.y, size.z]
@@ -665,6 +716,9 @@ onBeforeUnmount(() => {
 
 <template>
   <div class="viewer" ref="host">
+    <div v-if="failure" class="failure">
+      <p>{{ failure }}</p>
+    </div>
     <div v-if="dims" class="callout num">
       {{ dims[0] }} × {{ dims[1] }} × {{ dims[2] }} mm
     </div>
@@ -704,6 +758,26 @@ onBeforeUnmount(() => {
   overflow: hidden;
 }
 .viewer :deep(canvas) { display: block; }
+.failure {
+  position: absolute;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  padding: 24px;
+  pointer-events: none;
+  z-index: 1;
+}
+.failure p {
+  max-width: 420px;
+  text-align: center;
+  font-size: 13px;
+  line-height: 1.5;
+  color: var(--warn, #f0ad4e);
+  background: rgba(20, 23, 28, 0.85);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  padding: 12px 16px;
+}
 .callout {
   position: absolute;
   top: 12px;

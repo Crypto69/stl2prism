@@ -1,4 +1,5 @@
 """FastAPI app: upload an STL or OBJ, convert it to STEP, report fidelity."""
+import logging
 import mimetypes
 import os
 import re
@@ -6,10 +7,11 @@ from typing import Optional, Literal
 
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, HTTPException, Query, UploadFile
+from fastapi import FastAPI, HTTPException, Query, Request, UploadFile
 from fastapi.concurrency import run_in_threadpool
+from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
@@ -17,6 +19,9 @@ from stl_to_solid.mesh_prep import SUPPORTED_EXTS
 
 from . import jobs
 from .analysis import sanitize, mesh_stats, body_list
+from .errors import describe
+
+log = logging.getLogger('stltosolid.api')
 
 _EXT_RE = re.compile(r'\.(' + '|'.join(e.lstrip('.') for e in SUPPORTED_EXTS)
                      + r')$', re.IGNORECASE)
@@ -29,6 +34,36 @@ async def _lifespan(app):
 
 
 app = FastAPI(title='stlToSolid', lifespan=_lifespan)
+
+
+# Every failure the browser sees is JSON with one readable 'detail' string:
+# the frontend shows that string as-is. Without these, a bug in a route
+# came back as a bare "Internal Server Error" and a bad parameter as a
+# list of pydantic records the UI printed as "[object Object]".
+@app.exception_handler(RequestValidationError)
+async def _bad_request(request: Request, exc: RequestValidationError):
+    return JSONResponse(status_code=422,
+                        content={'detail': _validation_text(exc)})
+
+
+@app.exception_handler(Exception)
+async def _unexpected(request: Request, exc: Exception):
+    log.exception('unhandled error in %s %s', request.method, request.url.path)
+    return JSONResponse(
+        status_code=500,
+        content={'detail': 'Something went wrong on the server: '
+                           f'{describe(exc)} (the server log has the details).'})
+
+
+def _validation_text(exc):
+    """'tol: must be greater than 0' rather than pydantic's record list."""
+    parts = []
+    for err in exc.errors():
+        loc = [str(x) for x in err.get('loc', ()) if x not in ('body', 'query', 'path')]
+        msg = err.get('msg', 'invalid value')
+        msg = re.sub(r'^(Value|Input|Assertion) error, ', '', msg)
+        parts.append(f"{'.'.join(loc) or 'request'}: {msg}")
+    return 'Invalid settings: ' + '; '.join(parts) if parts else 'Invalid request.'
 
 
 @app.get('/api/version')
@@ -102,44 +137,46 @@ async def create_job(file: UploadFile):
     m = _EXT_RE.search(file.filename or '')
     if not m:
         raise HTTPException(
-            400, f"expected a {' or '.join(SUPPORTED_EXTS)} file")
+            400, f"That is not a mesh file. Expected one of: {', '.join(SUPPORTED_EXTS)}.")
     # Keep the real extension: trimesh picks its reader from it.
     input_name = 'input.' + m.group(1).lower()
     job_id, d = jobs.new_job()
-    size = 0
-    with open(os.path.join(d, input_name), 'wb') as out:
-        while chunk := await file.read(1 << 20):
-            size += len(chunk)
-            if size > MAX_UPLOAD:
-                raise HTTPException(413, 'file too large')
-            out.write(chunk)
     try:
-        stats = await run_in_threadpool(mesh_stats, os.path.join(d, input_name))
-        if not input_name.endswith(('.stl', '.obj')):
-            # the browser viewer parses STL/OBJ itself; other formats get a
-            # server-side STL preview
-            await run_in_threadpool(_write_preview, os.path.join(d, input_name),
-                                    os.path.join(d, 'preview.stl'))
-    except Exception as e:
-        raise HTTPException(400, f'could not read mesh: {e}')
+        size = 0
+        with open(os.path.join(d, input_name), 'wb') as out:
+            while chunk := await file.read(1 << 20):
+                size += len(chunk)
+                if size > MAX_UPLOAD:
+                    raise HTTPException(
+                        413, f'The file is too large: the limit is {MAX_UPLOAD // (1 << 20)} MB.')
+                out.write(chunk)
+        if size == 0:
+            raise HTTPException(400, 'The file is empty.')
+        try:
+            stats = await run_in_threadpool(mesh_stats, os.path.join(d, input_name))
+            if not input_name.endswith(('.stl', '.obj')):
+                # the browser viewer parses STL/OBJ itself; other formats get a
+                # server-side STL preview
+                await run_in_threadpool(_write_preview, os.path.join(d, input_name),
+                                        os.path.join(d, 'preview.stl'))
+        except Exception as e:
+            log.warning('could not read upload %r: %s', file.filename, describe(e))
+            raise HTTPException(400, f'Could not read {file.filename or "the file"}: '
+                                     f'{describe(e)}')
+        if not stats.get('triangles'):
+            raise HTTPException(400, f'{file.filename or "The file"} holds no triangles, '
+                                     'so there is nothing to convert.')
+    except BaseException:
+        # a half-written upload or an unreadable mesh must not linger as a
+        # job the UI could be pointed at
+        jobs.discard(job_id)
+        raise
     with jobs._lock:
         jobs._jobs[job_id]['filename'] = file.filename
         jobs._jobs[job_id]['input'] = input_name
         jobs._jobs[job_id]['status'] = 'uploaded'
     return {'id': job_id, 'filename': file.filename,
             'input_stats': sanitize(stats)}
-
-
-@app.post('/api/jobs/{job_id}/convert')
-def convert(job_id: str, params: ConvertParams):
-    job = jobs.get(job_id)
-    if job is None:
-        raise HTTPException(404, 'unknown job')
-    if job['status'] in ('queued', 'running'):
-        raise HTTPException(409, 'job already running')
-    jobs.cleanup_old()
-    jobs.start(job_id, job.get('filename'), params.model_dump())
-    return {'id': job_id, 'status': 'running'}
 
 
 @app.get('/api/jobs/running')
@@ -156,7 +193,7 @@ def cancel(job_id: str):
     and until now the only way out was to wait or restart the server."""
     what = jobs.cancel(job_id)
     if what == 'unknown':
-        raise HTTPException(404, 'unknown job')
+        raise HTTPException(404, _UNKNOWN_JOB)
     return {'id': job_id, 'status': what}
 
 
@@ -164,7 +201,7 @@ def cancel(job_id: str):
 def job_state(job_id: str):
     state = jobs.public_state(job_id)
     if state is None:
-        raise HTTPException(404, 'unknown job')
+        raise HTTPException(404, _UNKNOWN_JOB)
     return state
 
 
@@ -172,26 +209,43 @@ def job_state(job_id: str):
 async def bodies(job_id: str):
     """Every connected shell of the uploaded mesh, largest first, with the
     triangle -> body map the viewer colours and picks with."""
-    job = jobs.get(job_id)
-    if job is None:
-        raise HTTPException(404, 'unknown job')
-    src = os.path.join(jobs.job_dir(job_id), job.get('input', ''))
-    if not job.get('input') or not os.path.exists(src):
-        raise HTTPException(404, 'no input file')
+    _, src = _input_path(job_id)
     try:
         return sanitize(await run_in_threadpool(body_list, src))
     except Exception as e:
-        raise HTTPException(400, f'could not split mesh: {e}')
+        log.warning('could not split %s into bodies: %s', src, describe(e))
+        raise HTTPException(400, f'Could not split the mesh into bodies: {describe(e)}')
+
+
+_UNKNOWN_JOB = ('This upload is no longer on the server (old uploads are cleared '
+                'after a day, and a restart forgets jobs that never finished). '
+                'Load the file again.')
+_NO_INPUT = ('The uploaded file is no longer on the server. Load it again.')
 
 
 def _input_path(job_id):
     job = jobs.get(job_id)
     if job is None:
-        raise HTTPException(404, 'unknown job')
-    src = os.path.join(jobs.job_dir(job_id), job.get('input', ''))
+        raise HTTPException(404, _UNKNOWN_JOB)
+    src = os.path.join(jobs.job_dir(job_id), job.get('input') or '')
     if not job.get('input') or not os.path.exists(src):
-        raise HTTPException(404, 'no input file')
+        raise HTTPException(404, _NO_INPUT)
     return job, src
+
+
+@app.post('/api/jobs/{job_id}/convert')
+def convert(job_id: str, params: ConvertParams):
+    job, _ = _input_path(job_id)
+    if job['status'] in ('queued', 'running'):
+        raise HTTPException(409, 'This file is already being converted.')
+    jobs.cleanup_old()
+    try:
+        jobs.start(job_id, job.get('filename'), params.model_dump())
+    except OSError as e:
+        raise HTTPException(500, 'Could not start the conversion: '
+                                 f'{describe(e)}')
+    return {'id': job_id, 'status': 'running'}
+
 
 
 _AXES = ('x', 'y', 'z')
@@ -241,7 +295,7 @@ async def section(job_id: str, axis: str = 'z', offset: float = 0.0, tol: float 
         return sanitize(await run_in_threadpool(trace, src, axis, offset, tol, units, scale, join,
                                                 outline, trim))
     except Exception as e:
-        raise HTTPException(400, f'could not trace the section: {e}')
+        raise HTTPException(400, f'Could not trace the section: {describe(e)}')
 
 
 @app.get('/api/jobs/{job_id}/section-script')
@@ -259,7 +313,7 @@ async def section_script(job_id: str, axis: str = 'z', offset: float = 0.0, tol:
         sec = await run_in_threadpool(trace, src, axis, offset, tol, units, scale, join, outline,
                                       trim)
     except Exception as e:
-        raise HTTPException(400, f'could not trace the section: {e}')
+        raise HTTPException(400, f'Could not trace the section: {describe(e)}')
     name = f"section {axis.upper()}={sec['at']:.2f} mm ({offset:+.1f} from centre)"
     text = emit_fusion_sections_script([{'origin': sec['origin'], 'normal': sec['normal'],
                                          'name': name, 'loops': sec['loops'],
@@ -281,7 +335,7 @@ async def xray(job_id: str, axis: str = 'z', frm: float = Query(0.0, alias='from
     try:
         h = await run_in_threadpool(half_extent, src, axis, units, scale)
     except Exception as e:
-        raise HTTPException(400, f'could not read the mesh: {e}')
+        raise HTTPException(400, f'Could not read the mesh: {describe(e)}')
     offs = stack_offsets(frm, to, step, h)
     return {'axis': axis, 'from': frm, 'to': to, 'step': step, 'half_extent': h,
             'offsets': offs, 'count': len(offs), 'max': XRAY_MAX, 'over_cap': len(offs) > XRAY_MAX}
@@ -306,7 +360,7 @@ async def xray_script(job_id: str, axis: str = 'z', frm: float = Query(0.0, alia
     try:
         h = await run_in_threadpool(half_extent, src, axis, units, scale)
     except Exception as e:
-        raise HTTPException(400, f'could not read the mesh: {e}')
+        raise HTTPException(400, f'Could not read the mesh: {describe(e)}')
     offs = stack_offsets(frm, to, step, h)
     if len(offs) > XRAY_MAX:
         raise HTTPException(400, f'{len(offs)} slices is over the limit of {XRAY_MAX}; raise the '
@@ -317,7 +371,7 @@ async def xray_script(job_id: str, axis: str = 'z', frm: float = Query(0.0, alia
     except TimeoutError as e:
         raise HTTPException(400, str(e))
     except Exception as e:
-        raise HTTPException(400, f'could not trace the sections: {e}')
+        raise HTTPException(400, f'Could not trace the sections: {describe(e)}')
     n = len(secs)
     sections = []
     for i, sec in enumerate(secs):
@@ -336,63 +390,66 @@ async def xray_script(job_id: str, axis: str = 'z', frm: float = Query(0.0, alia
     return _py_attachment(text, f'{_safe_stem(job)}_xray_{axis}{lo:+.1f}_{hi:+.1f}_s{step:g}{suffix}.py')
 
 
-@app.get('/api/jobs/{job_id}/preview')
+# The file routes also answer HEAD (FastAPI does not add it on its own):
+# the UI asks before following a download link, so a file the server no
+# longer has is reported in the page instead of saved as a JSON "download".
+@app.api_route('/api/jobs/{job_id}/preview', methods=['GET', 'HEAD'])
 def preview(job_id: str):
     job = jobs.get(job_id)
     if job is None:
-        raise HTTPException(404, 'unknown job')
+        raise HTTPException(404, _UNKNOWN_JOB)
     path = os.path.join(jobs.job_dir(job_id), 'preview.stl')
     if not os.path.exists(path):
-        raise HTTPException(404, 'no preview')
+        raise HTTPException(404, 'There is no preview for this file.')
     return FileResponse(path, media_type='model/stl')
 
 
-@app.get('/api/jobs/{job_id}/script')
+@app.api_route('/api/jobs/{job_id}/script', methods=['GET', 'HEAD'])
 def script(job_id: str):
     """The CadQuery script that rebuilds the recognised extrusion structure."""
     job = jobs.get(job_id)
     if job is None:
-        raise HTTPException(404, 'unknown job')
+        raise HTTPException(404, _UNKNOWN_JOB)
     path = os.path.join(jobs.job_dir(job_id), 'output.py')
     if not os.path.exists(path):
-        raise HTTPException(404, 'no script')
+        raise HTTPException(404, 'This conversion produced no script to download.')
     safe = _safe_stem(job)
     return FileResponse(path, media_type='text/x-python', filename=f'{safe}.py')
 
 
-@app.get('/api/jobs/{job_id}/fusion-script')
+@app.api_route('/api/jobs/{job_id}/fusion-script', methods=['GET', 'HEAD'])
 def fusion_script(job_id: str):
     job = jobs.get(job_id)
     if job is None:
-        raise HTTPException(404, 'unknown job')
+        raise HTTPException(404, _UNKNOWN_JOB)
     path = os.path.join(jobs.job_dir(job_id), 'output_fusion.py')
     if not os.path.exists(path):
-        raise HTTPException(404, 'no script')
+        raise HTTPException(404, 'This conversion produced no script to download.')
     safe = _safe_stem(job)
     return FileResponse(path, media_type='text/x-python', filename=f'{safe}_fusion.py')
 
 
-@app.get('/api/jobs/{job_id}/fusion-bfill-script')
+@app.api_route('/api/jobs/{job_id}/fusion-bfill-script', methods=['GET', 'HEAD'])
 def fusion_bfill_script(job_id: str):
     """The Fusion 360 Boundary Fill script for face-group results."""
     job = jobs.get(job_id)
     if job is None:
-        raise HTTPException(404, 'unknown job')
+        raise HTTPException(404, _UNKNOWN_JOB)
     path = os.path.join(jobs.job_dir(job_id), 'output_fusion_bfill.py')
     if not os.path.exists(path):
-        raise HTTPException(404, 'no script')
+        raise HTTPException(404, 'This conversion produced no script to download.')
     safe = _safe_stem(job)
     return FileResponse(path, media_type='text/x-python', filename=f'{safe}_fusion_bfill.py')
 
 
-@app.get('/api/jobs/{job_id}/download')
+@app.api_route('/api/jobs/{job_id}/download', methods=['GET', 'HEAD'])
 def download(job_id: str):
     job = jobs.get(job_id)
     if job is None:
-        raise HTTPException(404, 'unknown job')
+        raise HTTPException(404, _UNKNOWN_JOB)
     path = os.path.join(jobs.job_dir(job_id), 'output.step')
     if not os.path.exists(path):
-        raise HTTPException(404, 'no output yet')
+        raise HTTPException(404, 'There is no STEP file for this job yet: convert first.')
     safe = _safe_stem(job)
     return FileResponse(path, media_type='application/step',
                         filename=f'{safe}.step')

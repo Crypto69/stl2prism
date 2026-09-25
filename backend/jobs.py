@@ -4,6 +4,7 @@ One directory per job under DATA_DIR:
     input.<stl|obj>  params.json  output.step  result.json  log.txt
 """
 import json
+import logging
 import os
 import shutil
 import signal
@@ -12,6 +13,10 @@ import sys
 import threading
 import time
 import uuid
+
+from .errors import describe
+
+log = logging.getLogger('stltosolid.jobs')
 
 DATA_DIR = os.environ.get('STLTOSOLID_DATA', os.path.join(os.getcwd(), 'data'))
 # Seconds a cancelled worker gets to stop politely before it is killed.
@@ -45,6 +50,17 @@ def get(job_id):
     with _lock:
         job = _jobs.get(job_id)
     return job if job is not None else _recover(job_id)
+
+
+def discard(job_id):
+    """Forget a job and delete its directory (an upload that failed
+    half-way). Never raises: a job that cannot be removed is only a stray
+    directory the TTL sweep takes later."""
+    with _lock:
+        job = _jobs.pop(job_id, None)
+    if job is not None and job.get('proc') is not None:
+        return
+    shutil.rmtree(job_dir(job_id), ignore_errors=True)
 
 
 def _recover(job_id):
@@ -104,10 +120,16 @@ def _from_disk(job_id):
 
 
 def start(job_id, filename, params):
+    """Queue a conversion. Raises OSError when params.json cannot be
+    written (a full disk): the caller reports that instead of a job that
+    would never start."""
     d = job_dir(job_id)
+    os.makedirs(d, exist_ok=True)
     with open(os.path.join(d, 'params.json'), 'w') as f:
         json.dump(params, f)
     with _lock:
+        if job_id not in _jobs:
+            _jobs[job_id] = {'id': job_id, 'created': time.time(), 'proc': None}
         _jobs[job_id].update(status='queued', filename=filename)
     threading.Thread(target=_run, args=(job_id,), daemon=True).start()
 
@@ -137,12 +159,20 @@ def _own_group():
 def _kill_tree(proc, hard):
     """Stop the worker and its children. POSIX signals the process group
     (SIGTERM, or SIGKILL when hard); Windows has no process groups to
-    signal, so taskkill /T takes the whole tree."""
+    signal, so taskkill /T takes the whole tree. Never raises: a worker
+    that is already gone is the outcome wanted."""
     if _WINDOWS:
-        r = subprocess.run(['taskkill', '/T', '/F', '/PID', str(proc.pid)],
-                           capture_output=True)
-        if r.returncode != 0:
-            proc.kill()
+        try:
+            r = subprocess.run(['taskkill', '/T', '/F', '/PID', str(proc.pid)],
+                               capture_output=True, timeout=30)
+            ok = r.returncode == 0
+        except Exception:           # taskkill missing or hung
+            ok = False
+        if not ok:
+            try:
+                proc.kill()
+            except Exception:
+                pass
         return
     try:
         os.killpg(os.getpgid(proc.pid),
@@ -158,23 +188,64 @@ def _kill_tree(proc, hard):
 
 
 def _run(job_id):
+    try:
+        _run_guarded(job_id)
+    except Exception as e:
+        # The thread is the only thing watching this job. Whatever went
+        # wrong (no log file, a worker that could not be started), the job
+        # must end in a state the UI can show rather than "running" forever.
+        log.exception('job %s could not be run', job_id)
+        with _lock:
+            job = _jobs.get(job_id)
+            if job is None:
+                return
+            job['proc'] = None
+            job.pop('cancelling', None)
+            job['status'] = 'error'
+            job['stale_result'] = True
+            job['killed'] = {'signal': None, 'kind': 'launch', 'message':
+                             'The conversion could not be started: '
+                             f'{describe(e)}.'}
+
+
+def _run_guarded(job_id):
     d = job_dir(job_id)
     with _run_slot:
         with _lock:
-            _jobs[job_id]['status'] = 'running'
-            input_name = _jobs[job_id].get('input', 'input.stl')
-        log = open(os.path.join(d, 'log.txt'), 'wb')
-        proc = subprocess.Popen(
-            _worker_cmd() + [
-                os.path.join(d, input_name), os.path.join(d, 'output.step'),
-                os.path.join(d, 'params.json'), os.path.join(d, 'result.json')],
-            stdout=log, stderr=subprocess.STDOUT,
-            cwd=None if _FROZEN else os.path.dirname(
-                os.path.dirname(os.path.abspath(__file__))),
-            **_own_group())
-        log.close()
+            job = _jobs.get(job_id)
+            if job is None:
+                return
+            if job.pop('cancelling', False):
+                # cancelled while it was still waiting for its turn
+                job['status'] = 'cancelled'
+                job['killed'] = {'signal': None, 'kind': 'cancelled',
+                                 'message': 'Conversion cancelled.'}
+                job['stale_result'] = True
+                return
+            job['status'] = 'running'
+            input_name = job.get('input') or 'input.stl'
+        # a stale result.json from an earlier run must never be read as
+        # this run's answer if the worker dies before writing its own
+        try:
+            os.remove(os.path.join(d, 'result.json'))
+        except OSError:
+            pass
+        with open(os.path.join(d, 'log.txt'), 'wb') as logf:
+            proc = subprocess.Popen(
+                _worker_cmd() + [
+                    os.path.join(d, input_name), os.path.join(d, 'output.step'),
+                    os.path.join(d, 'params.json'), os.path.join(d, 'result.json')],
+                stdout=logf, stderr=subprocess.STDOUT,
+                cwd=None if _FROZEN else os.path.dirname(
+                    os.path.dirname(os.path.abspath(__file__))),
+                **_own_group())
         with _lock:
             _jobs[job_id]['proc'] = proc
+            # a cancel that landed between the slot check and Popen found
+            # no process to kill and only left the flag: honour it now
+            late_cancel = _jobs[job_id].get('cancelling', False)
+        if late_cancel:
+            _kill_tree(proc, hard=True)
         code = proc.wait()
         with _lock:
             job = _jobs.get(job_id)
@@ -199,8 +270,19 @@ def _run(job_id):
 
 # Signals that mean the worker was killed rather than failing on its own.
 # SIGKILL is what the OOM killer sends (and Docker's memory limit); the
-# others are a manual stop or a container shutdown.
-_KILL_SIGNALS = {9: 'killed', 15: 'stopped', 2: 'stopped', 6: 'crashed'}
+# others are a manual stop, a container shutdown, or a crash inside the
+# geometry kernel (OpenCascade is C++: a bad face can take the process
+# down with SIGSEGV / SIGABRT / SIGBUS rather than raise).
+_KILL_SIGNALS = {9: 'killed', 15: 'stopped', 2: 'stopped', 1: 'stopped',
+                 6: 'crashed', 11: 'crashed', 7: 'crashed', 4: 'crashed', 8: 'crashed'}
+# Windows has no signals: a crashed process exits with an NTSTATUS code.
+_WIN_CRASH = {0xC0000005: 'an access violation', 0xC00000FD: 'a stack overflow',
+              0xC0000409: 'a stack buffer overrun', 0xC0000374: 'a heap corruption',
+              0xC000001D: 'an illegal instruction', 0xC0000094: 'a division by zero',
+              0xC0000017: 'running out of memory', 0xC0000142: 'a DLL that failed to load',
+              0xC0000135: 'a missing DLL (is the Microsoft Visual C++ runtime installed?)'}
+_CRASH_HINT = (' Try converting fewer bodies at once, a slightly larger tolerance, or '
+               'the Sliced Loft tool; the pipeline log above ends where it stopped.')
 
 
 def _killed_by(code):
@@ -209,21 +291,41 @@ def _killed_by(code):
     subprocess returns a negative code when a signal killed the child. -9
     is overwhelmingly an out-of-memory kill: several conversions can hold a
     few GB each, so a wide selection of bodies or too many workers for the
-    container's memory limit takes the whole worker out.
+    container's memory limit takes the whole worker out. On Windows a
+    crash shows as a large positive NTSTATUS code instead.
     """
+    if code is None:
+        return None
     if code >= 0:
+        if code == 0xC0000017:
+            return {'signal': code, 'kind': 'oom', 'message': _OOM_MESSAGE}
+        if code in _WIN_CRASH or code >= 0xC0000000:
+            what = _WIN_CRASH.get(code, f'code 0x{code:08X}')
+            return {'signal': code, 'kind': 'crashed', 'message':
+                    f'The conversion crashed ({what}) before it could report '
+                    'an error.' + _CRASH_HINT}
         return None
     sig = -code
     kind = _KILL_SIGNALS.get(sig)
     if sig == 9:
-        return {'signal': sig, 'kind': 'oom', 'message':
-                'The conversion ran out of memory and was stopped by the '
-                'system. Convert fewer bodies at once, or give the server '
-                'more memory (STLTOSOLID_WORKERS controls how many bodies '
-                'are converted at the same time).'}
+        return {'signal': sig, 'kind': 'oom', 'message': _OOM_MESSAGE}
+    if kind == 'crashed':
+        try:
+            name = signal.Signals(sig).name
+        except ValueError:
+            name = f'signal {sig}'
+        return {'signal': sig, 'kind': 'crashed', 'message':
+                f'The geometry kernel crashed ({name}) before it could report '
+                'an error.' + _CRASH_HINT}
     return {'signal': sig, 'kind': kind or 'signal', 'message':
             f'The conversion was stopped by the system (signal {sig}) '
             f'before it could report an error.'}
+
+
+_OOM_MESSAGE = ('The conversion ran out of memory and was stopped by the '
+                'system. Convert fewer bodies at once, or give the server '
+                'more memory (STLTOSOLID_WORKERS controls how many bodies '
+                'are converted at the same time).')
 
 
 def public_state(job_id):
@@ -251,20 +353,34 @@ def public_state(job_id):
     except OSError:
         out['log'] = ''
     if job['status'] in ('done', 'error', 'cancelled'):
+        unreadable = None
         try:
             if job.get('stale_result'):
                 raise OSError('result belongs to an earlier run')
             with open(os.path.join(d, 'result.json')) as f:
                 out['result'] = json.load(f)
+            if not isinstance(out['result'], dict):
+                raise ValueError('result is not an object')
         except OSError:
             out['result'] = None
-            if job['status'] == 'done':
-                out['status'] = 'error'
+        except ValueError as e:          # half-written or corrupt JSON
+            log.warning('job %s: result.json unreadable: %s', job_id, e)
+            out['result'] = None
+            unreadable = e
+        if out['result'] is None and job['status'] == 'done':
+            out['status'] = 'error'
         # No result and a killed worker: say what happened, since the log
         # stops mid-sentence and explains nothing.
         if out.get('result') is None and job.get('killed'):
             out['result'] = {'ok': False, 'error': job['killed']['message'],
                              'failure': job['killed']['kind']}
+        elif out.get('result') is None and out['status'] == 'error':
+            out['result'] = {'ok': False, 'failure': 'no_result', 'error':
+                             'The conversion ended without a result file'
+                             + (' (it could not be read)' if unreadable else '')
+                             + '. The pipeline log above shows how far it got; '
+                             'convert again, and if it stops at the same place try '
+                             'fewer bodies or a larger tolerance.'}
     return out
 
 
@@ -282,15 +398,23 @@ def cancel(job_id):
     if job is None:
         return 'unknown'
     with _lock:
-        proc = job.get('proc')
-        if proc is None or job['status'] not in ('queued', 'running'):
+        if job['status'] not in ('queued', 'running'):
             return 'not_running'
+        proc = job.get('proc')
         job['cancelling'] = True
+        if proc is None:
+            # still waiting for its slot: _run_guarded sees the flag and
+            # ends the job as cancelled without starting a worker
+            return 'cancelled'
     _kill_tree(proc, hard=False)
     try:
         proc.wait(timeout=CANCEL_GRACE_S)
     except subprocess.TimeoutExpired:
         _kill_tree(proc, hard=True)
+        try:
+            proc.wait(timeout=CANCEL_GRACE_S)
+        except subprocess.TimeoutExpired:
+            log.warning('job %s: worker %s did not die', job_id, proc.pid)
     return 'cancelled'
 
 

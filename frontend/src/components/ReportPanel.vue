@@ -1,8 +1,32 @@
 <script setup>
 import { computed, nextTick, ref, watch } from 'vue'
-import { useConvertStore } from '../store'
+import { useConvertStore, checkDownload } from '../store'
 
 const store = useConvertStore()
+
+// The download links are plain <a download> so the desktop window can hand
+// the file to a native Save dialog. A link to a file the server no longer
+// has (cleared after a day, or a restart) would save a small JSON error
+// under the STEP's name; so the click first asks whether the file is there
+// and shows the answer here instead.
+const downloadError = ref(null)
+async function guardDownload(ev, url) {
+  if (!url) return
+  ev.preventDefault()
+  downloadError.value = null
+  const why = await checkDownload(url)
+  if (why) {
+    downloadError.value = `Could not download: ${why}`
+    return
+  }
+  const a = document.createElement('a')
+  a.href = url
+  a.download = ''
+  document.body.appendChild(a)
+  a.click()
+  a.remove()
+}
+watch(() => store.jobId, () => { downloadError.value = null })
 
 // The verdict is what the user waited for; bring it into view when it lands.
 const verdictEl = ref(null)
@@ -279,16 +303,21 @@ const reduction = computed(() => {
       <ul v-if="notes.length" class="notes">
         <li v-for="(n, i) in notes" :key="i">{{ n }}</li>
       </ul>
-      <a class="download" :href="store.downloadUrl" download>Download STEP</a>
-      <a v-if="store.scriptUrl" class="download secondary" :href="store.scriptUrl" download>
+      <a class="download" :href="store.downloadUrl" download
+         @click="guardDownload($event, store.downloadUrl)">Download STEP</a>
+      <a v-if="store.scriptUrl" class="download secondary" :href="store.scriptUrl" download
+         @click="guardDownload($event, store.scriptUrl)">
         Download CadQuery script (.py)
       </a>
-      <a v-if="store.fusionScriptUrl" class="download secondary" :href="store.fusionScriptUrl" download>
+      <a v-if="store.fusionScriptUrl" class="download secondary" :href="store.fusionScriptUrl" download
+         @click="guardDownload($event, store.fusionScriptUrl)">
         Download Fusion 360 script (.py) — experimental
       </a>
-      <a v-if="store.fusionBfillScriptUrl" class="download secondary" :class="{ risky: bfillState === 'fail' }" :href="store.fusionBfillScriptUrl" download>
+      <a v-if="store.fusionBfillScriptUrl" class="download secondary" :class="{ risky: bfillState === 'fail' }" :href="store.fusionBfillScriptUrl" download
+         @click="guardDownload($event, store.fusionBfillScriptUrl)">
         Download Fusion 360 script (Boundary Fill) — {{ bfillState === 'fail' ? 'likely to fail' : bfillState === 'unchecked' ? 'not checked' : 'experimental' }}
       </a>
+      <p v-if="downloadError" class="hint warn dlerror">{{ downloadError }}</p>
       <p v-if="bfillState === 'fail'" class="hint warn">
         This one will probably not build in Fusion: {{ store.bfillCheck.reason }}. The STEP is still fine.
       </p>
@@ -320,6 +349,15 @@ const reduction = computed(() => {
       <p v-if="store.result?.failure === 'oom'" class="fix">
         The most likely fix is to tick fewer bodies: each one converted at the
         same time can hold several gigabytes.
+      </p>
+      <p v-else-if="store.result?.failure === 'crashed'" class="fix">
+        A crash is the geometry kernel giving up on one face, not a problem with
+        your computer. Fewer bodies, a larger tolerance, or the Sliced Loft tool
+        usually gets past it.
+      </p>
+      <p v-else-if="store.status === 'error' && store.jobId && !store.result" class="fix">
+        Your file and settings are still here: fix what the message says and
+        convert again, or load another file.
       </p>
     </section>
 
@@ -413,6 +451,7 @@ th { text-align: left; font-weight: 600; }
 }
 .errorbox p { color: var(--fail); font-size: 13px; word-break: break-word; }
 .errorbox p.fix { color: var(--muted); margin-top: 6px; }
+.dlerror { color: var(--fail); font-size: 12px; }
 
 .logbox summary { cursor: pointer; }
 .logbox pre {
