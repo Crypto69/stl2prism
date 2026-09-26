@@ -159,6 +159,8 @@ export const useConvertStore = defineStore('convert', {
     providerBaseUrl: bpSaved.providerBaseUrl || '',
     apiKeys: bpSaved.apiKeys || {},                 // { provider: key }
     hints: '',
+    // how hard the model thinks on a read: 'low' | 'medium' | 'high'
+    effort: bpSaved.effort || 'high',
     // model lists fetched from each provider with the user's key: { provider: [{id,label}] },
     // with the last failure's sentence and a busy flag
     models: {},
@@ -685,6 +687,10 @@ export const useConvertStore = defineStore('convert', {
       this.providerModel = models
       saveBp({ providerModel: models })
     },
+    setEffort(e) {
+      this.effort = ['low', 'medium', 'high'].includes(e) ? e : 'high'
+      saveBp({ effort: this.effort })
+    },
     setBaseUrl(u) {
       this.providerBaseUrl = (u || '').trim()
       saveBp({ providerBaseUrl: this.providerBaseUrl })
@@ -733,6 +739,7 @@ export const useConvertStore = defineStore('convert', {
             provider: this.provider, model: this.modelName || null,
             base_url: this.provider === 'custom' ? this.providerBaseUrl : null,
             hints: this.hints || '',
+            effort: this.effort,
           }),
         })
         if (!res.ok) throw new Error(await errText(res))

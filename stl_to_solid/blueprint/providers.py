@@ -36,17 +36,24 @@ class Provider:
         self.base_url = base_url
         self.timeout = timeout
 
-    def complete(self, system, image_bytes, media_type, text, schema, history=()):
+    def complete(self, system, image_bytes, media_type, text, schema, history=(), effort='high'):
         """`history`: (role, text) pairs after the first user turn, for the
-        repair round. Returns (text, {'input_tokens', 'output_tokens'}, model)."""
+        repair round. `effort`: 'low' | 'medium' | 'high', how hard the model
+        thinks (Anthropic output_config.effort; OpenAI reasoning_effort,
+        dropped for a server that rejects it). Returns
+        (text, {'input_tokens', 'output_tokens'}, model)."""
         raise NotImplementedError
+
+
+EFFORTS = ('low', 'medium', 'high')
 
 
 class AnthropicProvider(Provider):
     name = 'anthropic'
 
-    def complete(self, system, image_bytes, media_type, text, schema, history=()):
+    def complete(self, system, image_bytes, media_type, text, schema, history=(), effort='high'):
         import anthropic
+        effort = effort if effort in EFFORTS else 'high'
         client = anthropic.Anthropic(api_key=self.api_key, timeout=self.timeout, max_retries=2)
         b64 = base64.standard_b64encode(image_bytes).decode('ascii')
         messages = [{'role': 'user', 'content': [
@@ -59,7 +66,7 @@ class AnthropicProvider(Provider):
         try:
             try:
                 with client.messages.stream(
-                        output_config={'effort': 'high',
+                        output_config={'effort': effort,
                                        'format': {'type': 'json_schema', 'schema': schema}},
                         **kwargs) as stream:
                     resp = stream.get_final_message()
@@ -95,8 +102,9 @@ class AnthropicProvider(Provider):
 class OpenAICompatibleProvider(Provider):
     name = 'openai'
 
-    def complete(self, system, image_bytes, media_type, text, schema, history=()):
+    def complete(self, system, image_bytes, media_type, text, schema, history=(), effort='high'):
         import openai
+        effort = effort if effort in EFFORTS else 'high'
         client = openai.OpenAI(api_key=self.api_key or 'none', base_url=self.base_url,
                                timeout=self.timeout, max_retries=2)
         b64 = base64.standard_b64encode(image_bytes).decode('ascii')
@@ -111,10 +119,17 @@ class OpenAICompatibleProvider(Provider):
             None,
         ]
         resp = None
-        for fmt in formats:
+        # the OpenAI reasoning knob; a compatible server that does not know it
+        # gets the same request without it
+        send_effort = True
+        attempts = list(formats)
+        while attempts:
+            fmt = attempts[0]
             kwargs = dict(model=self.model, messages=messages)
             if fmt is not None:
                 kwargs['response_format'] = fmt
+            if send_effort:
+                kwargs['reasoning_effort'] = effort
             try:
                 resp = client.chat.completions.create(**kwargs)
                 break
@@ -129,10 +144,15 @@ class OpenAICompatibleProvider(Provider):
                 raise ReadError(f'{_where(self)} is rate-limiting this key; wait a minute and read again.', 'rate')
             except openai.BadRequestError as e:
                 msg = _msg(e)
+                low = msg.lower()
+                if send_effort and ('reasoning' in low or 'effort' in low):
+                    send_effort = False               # same format, without the knob
+                    continue
                 # a server that does not know this response_format: try the next
-                if fmt is not None and any(k in msg.lower() for k in
+                if fmt is not None and any(k in low for k in
                                            ('response_format', 'json_schema', 'json_object', 'schema',
                                             'strict', 'unsupported', 'not supported', 'invalid_request')):
+                    attempts.pop(0)
                     continue
                 raise ReadError(f'{_where(self)} rejected the request: {_short(msg)}', 'api')
             except openai.APIStatusError as e:

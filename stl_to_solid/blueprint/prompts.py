@@ -58,6 +58,7 @@ Fewer, cleaner features:
 - Then bosses, tabs, hubs as `join`; then holes and slots as `cut`. Identical holes on one plane share one cut feature (several circles in `shapes`).
 - Never put a hole inside another shape in the same feature: a plate with a hole is a rect `new_body` and then a circle `cut`. Shapes in one feature may be side by side but must not be nested.
 - Where two added shapes overlap (a round boss with a lobe), make them two join features.
+- Anything round is a `circle`, never a many-sided polygon (a polygon comes out as flat facets). A half-cylinder or half-ring is a full circle `join` followed by a rect `cut` that removes the unwanted half; a rounded end on a plate is a circle `join` at the end's centre; a curved slot is a `slot`. Use `polygon` only for shapes with straight sides (a rib, a wedge, a chamfered outline).
 - `source.labels` lists the label texts you used, as printed. `views_found` lists the views present in the picture.
 
 ## 4. CHECK — look at what you built before answering

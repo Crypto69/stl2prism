@@ -73,7 +73,7 @@ def parse_recipe_text(text):
 
 
 def read_drawing(image_bytes, provider, api_key, model=None, base_url=None, hints='',
-                 timeout=300.0, repair=True, client=None):
+                 timeout=300.0, repair=True, client=None, effort='high'):
     """-> {'recipe', 'raw_text', 'usage': {input_tokens, output_tokens, calls},
     'model', 'provider', 'repaired', 'validation': {errors, warnings},
     'seconds'}. `client` (a Provider) is injectable for tests."""
@@ -84,7 +84,7 @@ def read_drawing(image_bytes, provider, api_key, model=None, base_url=None, hint
     usage = {'input_tokens': 0, 'output_tokens': 0, 'calls': 0}
 
     def ask(history=()):
-        out, u, m = p.complete(SYSTEM_PROMPT, img, media, text, SCHEMA, history)
+        out, u, m = p.complete(SYSTEM_PROMPT, img, media, text, SCHEMA, history, effort=effort)
         usage['calls'] += 1
         for k in ('input_tokens', 'output_tokens'):
             if u.get(k) is not None:
@@ -108,6 +108,6 @@ def read_drawing(image_bytes, provider, api_key, model=None, base_url=None, hint
             if len(rep2.errors) <= len(rep.errors):
                 recipe, rep, raw, repaired = recipe2, rep2, raw2, True
     return {'recipe': recipe, 'raw_text': raw, 'usage': usage, 'model': used_model,
-            'provider': provider, 'repaired': repaired,
+            'provider': provider, 'repaired': repaired, 'effort': effort,
             'validation': {'errors': list(rep.errors), 'warnings': list(rep.warnings)},
             'seconds': round(time.time() - t0, 1)}

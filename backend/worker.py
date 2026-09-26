@@ -163,8 +163,8 @@ def _blueprint(params, out_path, result):
     read = params.get('read') or {}
     if read.get('model'):
         u = read.get('usage') or {}
-        print('read with %s (%s): %s in / %s out tokens in %s s%s' % (
-            read['model'], read.get('provider', '?'), u.get('input_tokens', '?'),
+        print('read with %s (%s, effort %s): %s in / %s out tokens in %s s%s' % (
+            read['model'], read.get('provider', '?'), read.get('effort', 'high'), u.get('input_tokens', '?'),
             u.get('output_tokens', '?'), read.get('seconds', '?'),
             ', repaired once' if read.get('repaired') else ''))
         for w in (read.get('validation') or {}).get('warnings') or []:

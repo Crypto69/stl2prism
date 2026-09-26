@@ -166,6 +166,16 @@ const readLabel = computed(() => {
       </div>
       <p v-if="store.modelsError" class="hint warn">Could not list models: {{ store.modelsError }}</p>
       <p v-else-if="modelList && !modelList.length" class="hint">The provider listed no vision models for this key; type a model name.</p>
+      <div class="row">
+        <label for="bp_effort">Effort <span class="help">how hard it thinks</span></label>
+        <select id="bp_effort" :value="store.effort" :class="{ touched: store.effort !== 'high' }"
+                title="high: most careful, slowest, dearest. medium: about half the time. low: quick look."
+                @change="store.setEffort($event.target.value)">
+          <option value="low">low</option>
+          <option value="medium">medium</option>
+          <option value="high">high</option>
+        </select>
+      </div>
       <div v-if="store.provider === 'custom'" class="row">
         <label for="bp_url">Base URL</label>
         <input

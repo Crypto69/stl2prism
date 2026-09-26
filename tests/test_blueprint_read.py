@@ -58,9 +58,9 @@ class Scripted(Provider):
         self.answers = list(answers)
         self.calls = []
 
-    def complete(self, system, image_bytes, media_type, text, schema, history=()):
+    def complete(self, system, image_bytes, media_type, text, schema, history=(), effort='high'):
         self.calls.append({'system': system, 'text': text, 'history': list(history), 'media': media_type,
-                           'schema': schema})
+                           'schema': schema, 'effort': effort})
         return self.answers.pop(0), {'input_tokens': 100, 'output_tokens': 50}, 'scripted-1'
 
 
@@ -74,6 +74,10 @@ def test_read_drawing_good_answer_no_repair():
     assert out['model'] == 'scripted-1' and out['provider'] == 'anthropic'
     assert out['recipe']['params'][0]['name'] == 'body_w'
     assert 'the top view has the boss' in p.calls[0]['text']
+    assert p.calls[0]['effort'] == 'high' and out['effort'] == 'high'
+    p2 = Scripted([rec])
+    out2 = read_drawing(_png_bytes((800, 600)), 'openai', 'k', client=p2, effort='medium')
+    assert p2.calls[0]['effort'] == 'medium' and out2['effort'] == 'medium'
     assert 'Origin = the minimum corner' in p.calls[0]['system']
     assert p.calls[0]['schema']['type'] == 'object'
 

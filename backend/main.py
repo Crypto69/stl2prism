@@ -522,6 +522,7 @@ class ReadBody(BaseModel):
     model: Optional[str] = Field(None, max_length=200)
     base_url: Optional[str] = Field(None, max_length=500)
     hints: str = Field('', max_length=2000, description='notes for the reader, e.g. which view is which')
+    effort: Literal['low', 'medium', 'high'] = 'high'
 
 
 @app.post('/api/blueprints/{job_id}/read')
@@ -550,10 +551,11 @@ def blueprint_read(job_id: str, body: ReadBody,
         image = f.read()
     stem = _safe_stem(job)
     hints = body.hints
+    effort = body.effort
 
     def read_fn():
         return read_drawing(image, body.provider, key or '', model=model, base_url=base_url,
-                            hints=hints, timeout=bp.READ_TIMEOUT_S)
+                            hints=hints, timeout=bp.READ_TIMEOUT_S, effort=effort)
 
     def then_params(res):
         return {'tool': 'blueprint', 'recipe': res['recipe'], 'title': stem,
