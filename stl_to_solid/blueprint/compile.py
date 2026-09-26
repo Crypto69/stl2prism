@@ -73,7 +73,7 @@ def quick_preview(recipe, out_dir, stem='live'):
     rep = validate(r)
     if not rep.ok:
         raise BlueprintError('; '.join(rep.errors[:5]), kind='recipe', report=rep)
-    b = build(rep.resolved)
+    b = build(rep.resolved, measure=False)
     os.makedirs(out_dir, exist_ok=True)
     mesh = preview_mesh(b)
     mesh.export(os.path.join(out_dir, f'{stem}.stl'))

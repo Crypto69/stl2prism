@@ -90,8 +90,10 @@ def _volume(shape):
         return 0.0
 
 
-def build(resolved):
-    """Build a validated, resolved recipe (validate.Report.resolved)."""
+def build(resolved, measure=True):
+    """Build a validated, resolved recipe (validate.Report.resolved).
+    `measure` records every feature's volume delta (an adaptive volume
+    integration each, slow); the live preview turns it off."""
     result = None
     per = []
     warnings = []
@@ -123,7 +125,7 @@ def build(resolved):
                 raise BlueprintError(f'{fid}: shape {j} could not be drawn ({type(e).__name__}: {e})') from e
             tool = t if tool is None else tool.union(t)
         tools.append(tool)
-        before = _volume(result) if result is not None else 0.0
+        before = (_volume(result) if result is not None else 0.0) if measure else 0.0
         try:
             if f['op'] == 'new_body' or result is None:
                 if f['op'] != 'new_body':
@@ -138,9 +140,10 @@ def build(resolved):
         except Exception as e:
             raise BlueprintError(f'{fid}: the {f["op"]} failed in the geometry kernel '
                                  f'({type(e).__name__}: {e})') from e
-        after = _volume(result)
+        after = _volume(result) if measure else 0.0
         n_sol = len(result.solids().vals())
-        per.append({'id': fid, 'op': f['op'], 'volume_delta_mm3': after - before, 'solids': n_sol})
+        per.append({'id': fid, 'op': f['op'], 'volume_delta_mm3': (after - before) if measure else None,
+                    'solids': n_sol})
     if result is None:
         raise BlueprintError('the recipe built nothing')
     n_sol = len(result.solids().vals())
@@ -156,6 +159,7 @@ def build(resolved):
 PREVIEW_TOL = 0.02
 PREVIEW_ANG = 0.1
 OWNER_TOL = 0.1        # mm: a triangle whose centre is this close to a tool's surface is that tool's
+TOOL_TOL = 0.05        # the tools are tessellated coarser: only their distance matters, within OWNER_TOL
 
 
 def preview_mesh(b):
@@ -182,11 +186,17 @@ def feature_map(b, mesh, tol=OWNER_TOL):
         if i == 0:
             continue                          # the body owns whatever nothing else claims
         try:
-            tm = tessellate_solid(tool, PREVIEW_TOL, PREVIEW_ANG)
+            bb = tool.val().BoundingBox()
+            lo = np.array([bb.xmin, bb.ymin, bb.zmin]) - tol
+            hi = np.array([bb.xmax, bb.ymax, bb.zmax]) + tol
+            near = np.flatnonzero(np.all((centres >= lo) & (centres <= hi), axis=1))
+            if len(near) == 0:
+                continue
+            tm = tessellate_solid(tool, TOOL_TOL, PREVIEW_ANG * 2)
             if len(tm.faces) == 0:
                 continue
-            _, dist, _ = trimesh.proximity.ProximityQuery(tm).on_surface(centres)
+            _, dist, _ = trimesh.proximity.ProximityQuery(tm).on_surface(centres[near])
         except Exception:
             continue
-        owner[dist <= tol] = i
+        owner[near[dist <= tol]] = i
     return owner.tolist()
