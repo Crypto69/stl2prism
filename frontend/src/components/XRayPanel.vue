@@ -22,8 +22,8 @@ const scheduleTrace = () => {
   traceTimer = setTimeout(() => store.traceXray(), 350)
 }
 watch(() => [store.xrayFrom, store.xrayTo, store.xraySpacing, store.resolvedSliceAxis, store.params.tol,
-             store.params.units, store.params.scale, store.jobId, store.params.slice_join, store.sliceOutline,
-             store.params.slice_trim],
+             store.params.units, store.params.scale, store.jobId, store.xrayJoin, store.sliceOutline,
+             store.xrayTrim],
       ([, , , axis, , , , job]) => {
         // the old traces belong to the old planes: stop and drop them at once
         store.stopXray()
@@ -46,6 +46,9 @@ const overBudget = computed(() => estimate.value != null && estimate.value > BUD
 const startSummary = computed(() => summarise(store.xrayStartSection?.stats, store.sliceOutline))
 const endSummary = computed(() => summarise(store.xrayEndSection?.stats, store.sliceOutline))
 const canDownload = computed(() => store.xrayScriptUrl && store.xrayStartSection)
+// slivers trimmed anywhere in the stack, not just on the two end planes:
+// a trim wider than a real wall used to cut that wall down to a stub
+const trimmedSlices = computed(() => store.xrayTraces.filter((t) => t?.stats?.trimmed).length)
 
 // The script is built on demand (every slice is fitted again on the
 // server), which takes from under a second to minutes. A plain download
@@ -127,7 +130,7 @@ async function download() {
         <input type="checkbox" v-model="store.xrayExtrude" :disabled="store.xrayCount < 2" />
         <span>
           Extrude each slice to the next (solid slabs)
-          <span class="help">Every sketch is extruded up to the next plane and joined to the slab before it, so the stack comes out as a stepped solid Fusion builds without fail, where a Loft between two complex profiles folds over. Holes are filled unless Outline only is off and the hole loops are drawn; Outline only gives the cleanest slabs on a leaky mesh. Needs at least two slices.</span>
+          <span class="help">Every sketch is extruded up to the next plane and joined to the slab before it, so the stack comes out as one stepped solid Fusion builds without fail, where a Loft between two complex profiles folds over (a feature that starts mid-stack is its own body until a slab joins it). A hole along the axis stays open as long as its loop is drawn; Outline only leaves hole loops out, so it fills them. The last slab stops at the part's face. Needs at least two slices.</span>
         </span>
       </label>
       <p v-if="store.xrayBusy" class="hint">
@@ -146,6 +149,10 @@ async function download() {
         <p class="hint num">{{ single ? '' : 'start: ' }}{{ startSummary }}</p>
         <p v-if="!single && endSummary" class="hint num">end: {{ endSummary }}</p>
       </template>
+      <p v-if="trimmedSlices" class="hint warn">
+        Slivers were trimmed in {{ trimmedSlices }} of {{ store.xrayTraces.length }} slices. If the
+        part has real tabs or ribs thinner than {{ store.xrayTrim }} mm, lower Trim slivers.
+      </p>
       <button
         v-if="canDownload" type="button" class="dl press"
         :class="{ busy: downloading }" :disabled="downloading"

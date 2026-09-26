@@ -603,28 +603,90 @@ def draw_section(sketch, sec):
     return n
 
 
-def _extrude_slice(root, sketch, dist_cm, bodies):
-    \"\"\"Extrude every profile of `sketch` by `dist_cm` (signed, along the
-    sketch normal), one profile at a time: joined to the bodies made so
-    far when it touches one of them, a new body otherwise (a feature that
-    appears mid-stack starts its own body; Fusion refuses a Join that
-    touches nothing, and one such profile must not cost the slice).
-    `bodies` is extended in place. Returns the number of profiles
-    extruded. With Outline only the profiles are just the outer regions;
-    otherwise inner loops are filled too.\"\"\"
+def _token(body):
+    try:
+        return body.entityToken
+    except Exception:
+        return None
+
+
+def _live(bodies):
+    \"\"\"The bodies still there, each once (a body merged into another goes
+    invalid; the same body can be reached through two references).\"\"\"
+    out, seen = [], set()
+    for b in bodies:
+        try:
+            if not b.isValid:
+                continue
+        except Exception:
+            continue
+        t = _token(b)
+        if t is not None:
+            if t in seen:
+                continue
+            seen.add(t)
+        out.append(b)
+    return out
+
+
+def _track(feat, bodies, seen):
+    \"\"\"Remember every body `feat` left behind. A Join whose profile touches
+    none of its participants does not fail: Fusion quietly makes a new
+    body. Unless that body becomes a participant of the next slab, every
+    slab above it in that column joins nothing too, and one arm of the part
+    comes out as a hundred loose slabs.\"\"\"
+    for k in range(feat.bodies.count):
+        b = feat.bodies.item(k)
+        t = _token(b)
+        if t is None or t not in seen:
+            if t is not None:
+                seen.add(t)
+            bodies.append(b)
+
+
+def _material_profiles(sketch, areas_cm2, rel=0.03):
+    \"\"\"The profiles to extrude. Fusion lists a hole's interior as a
+    profile as well as the ring around it; extruding both fills the hole.
+    The section data carries each loop's material area (outer minus its
+    holes), so the profiles whose area matches one of those are the
+    material. Returns (profiles, matched): with no expected areas, or none
+    matching (a fit that went wrong), every profile is taken and matched
+    is False so the run can say so.\"\"\"
+    profs = [sketch.profiles.item(i) for i in range(sketch.profiles.count)]
+    if not areas_cm2:
+        return profs, True
+    out = []
+    for pr in profs:
+        a = pr.areaProperties().area
+        if any(abs(a - e) <= rel * max(e, 1e-9) for e in areas_cm2):
+            out.append(pr)
+    if out:
+        return out, True
+    return profs, False
+
+
+def _extrude_slice(root, sketch, dist_cm, bodies, seen, areas_cm2=None):
+    \"\"\"Extrude the material profiles of `sketch` by `dist_cm` (signed,
+    along the sketch normal), one profile at a time: joined to the bodies
+    made so far (all of them as participants; the one it touches takes
+    it), which leaves a new body where it touches none (a feature that
+    appears mid-stack starts its own column). Every body a feature leaves
+    behind is added to `bodies` (see _track) so the next slab can join
+    it. Returns (profiles extruded, areas matched).\"\"\"
     if sketch.profiles.count == 0:
         raise RuntimeError('no closed profile to extrude')
     ops = adsk.fusion.FeatureOperations
     ext = root.features.extrudeFeatures
+    profs, matched = _material_profiles(sketch, areas_cm2)
     made = 0
-    for i in range(sketch.profiles.count):
-        prof = sketch.profiles.item(i)
+    for prof in profs:
         feat = None
-        if bodies:
+        live = _live(bodies)
+        if live:
             try:
                 inp = ext.createInput(prof, ops.JoinFeatureOperation)
                 inp.setDistanceExtent(False, adsk.core.ValueInput.createByReal(dist_cm))
-                inp.participantBodies = [b for b in bodies if b.isValid]
+                inp.participantBodies = live
                 feat = ext.add(inp)
             except Exception:
                 feat = None
@@ -632,10 +694,9 @@ def _extrude_slice(root, sketch, dist_cm, bodies):
             inp = ext.createInput(prof, ops.NewBodyFeatureOperation)
             inp.setDistanceExtent(False, adsk.core.ValueInput.createByReal(dist_cm))
             feat = ext.add(inp)
-            for k in range(feat.bodies.count):
-                bodies.append(feat.bodies.item(k))
+        _track(feat, bodies, seen)
         made += 1
-    return made
+    return made, matched
 
 
 def run(context):
@@ -650,7 +711,7 @@ def run(context):
         prog = ui.createProgressDialog()
         prog.isCancelButtonShown = True
         prog.show(TITLE, 'Sketch %v of %m', 0, n, 0)
-        made, n_ext, cancelled, bodies, notes = 0, 0, False, [], []
+        made, n_ext, cancelled, bodies, seen, notes, unmatched = 0, 0, False, [], set(), [], 0
         for i, sec in enumerate(SECTIONS):
             prog.progressValue = i
             adsk.doEvents()
@@ -672,8 +733,12 @@ def run(context):
             made += 1
             if sec.get('extrude_mm'):
                 try:
-                    _extrude_slice(root, sk, sgn * sec['extrude_mm'] / 10.0, bodies)
+                    areas = [a / 100.0 for a in (sec.get('areas_mm2') or [])]
+                    _, ok = _extrude_slice(root, sk, sgn * sec['extrude_mm'] / 10.0, bodies, seen,
+                                           areas)
                     n_ext += 1
+                    if not ok:
+                        unmatched += 1
                 except Exception:
                     why = traceback.format_exc().strip().splitlines()[-1]
                     notes.append('%s: extrude failed: %s' % (sk.name, why))
@@ -682,9 +747,14 @@ def run(context):
         if cancelled:
             msg += ' (stopped)'
         if n_ext:
-            msg += ', extruded %d' % n_ext
-        if notes:
-            msg += '\\n' + '\\n'.join(notes[:10])
+            live = _live(bodies)
+            msg += ', extruded %d into %d body%s' % (n_ext, len(live), '' if len(live) == 1 else 'ies')
+        if unmatched:
+            notes.append('%d slice(s): no profile matched the expected area, so every profile '
+                         'was extruded there (a hole along the axis is filled in those slabs)'
+                         % unmatched)
+        if NOTES or notes:
+            msg += '\\n' + '\\n'.join(list(NOTES) + notes[:10])
         ui.messageBox(msg)
     except:
         if prog is not None:
@@ -712,17 +782,20 @@ def _xray_round(x, nd=4):
     return x
 
 
-def emit_fusion_xray_script(sections, title='X-Ray'):
+def emit_fusion_xray_script(sections, title='X-Ray', notes=()):
     """Fusion script for a stack of section sketches, the way the add-in
     does it: the sections are embedded once as data and a small loop draws
     them (one construction plane + one sketch each, curves drawn with
     compute deferred), with a progress dialog that can be cancelled.
     `sections` is a list of {'origin' (mm), 'normal', 'name', 'loops':
     [(outer_prims3d, [hole_prims3d...])], 'open': [prims3d...],
-    'extrude_mm': None | signed mm} with the primitives' points already
-    in 3-D mm (section_fit.lift_prims). A section with 'extrude_mm' set
-    is extruded that far along its normal after drawing (every profile,
-    joined to the slabs so far), so the stack comes out as solid slices."""
+    'areas_mm2': [material area per loop], 'extrude_mm': None | signed mm}
+    with the primitives' points already in 3-D mm (section_fit.lift_prims).
+    A section with 'extrude_mm' set is extruded that far along its normal
+    after drawing: the profiles whose area matches a loop's material area
+    (so a hole's interior, which Fusion lists as a profile too, stays
+    open), each joined to the slabs so far, so the stack comes out as solid
+    slices. `notes` are sentences the script adds to its closing message."""
     data = []
     for i, sec in enumerate(sections):
         data.append(_xray_round({
@@ -730,6 +803,7 @@ def emit_fusion_xray_script(sections, title='X-Ray'):
             'origin': list(sec['origin']), 'normal': list(sec['normal']),
             'loops': [[outer, list(holes)] for outer, holes in sec['loops']],
             'open': list(sec.get('open', [])),
+            'areas_mm2': list(sec.get('areas_mm2') or []),
             'extrude_mm': sec.get('extrude_mm'),
         }))
     L = [
@@ -742,9 +816,11 @@ def emit_fusion_xray_script(sections, title='X-Ray'):
         'import adsk.core, adsk.fusion, traceback',
         '',
         f'TITLE = {title!r}',
+        f'NOTES = {[str(s) for s in notes]!r}',
         '',
         '# one entry per section: name, origin (mm), normal, loops [[outer, [holes]]],',
-        '# open chains, extrude_mm (None, or how far to extrude towards the next plane)',
+        '# open chains, areas_mm2 (material area per loop: outer minus holes),',
+        '# extrude_mm (None, or how far to extrude towards the next plane)',
         'SECTIONS = [',
     ]
     L += [f'    {e!r},' for e in data]

@@ -329,6 +329,10 @@ def trim_slivers(xy, w, max_rounds=50):
     dense points on a bend); a twist of any length is removed, since the
     smallest ones (0.02 mm curls where two patches overlap) are exactly
     what makes Fusion refuse to loft the profile.
+    A loop that is thin all over (its mean width, 2*area/perimeter, under
+    `w`: the 1.3 mm strip left beside a cross hole when `w` is 1.5) is a
+    feature, not a sliver on a loop, and is left whole; cutting it would
+    only leave a stub of it.
     Returns (xy, slivers removed)."""
     P = np.asarray(xy, float).copy()
     removed = 0
@@ -343,6 +347,8 @@ def trim_slivers(xy, w, max_rounds=50):
         # running shoelace sum: the area of the stretch i..j closed by its
         # chord is 0.5 * (S[j] - S[i] + (xj*yi - xi*yj)), in O(1)
         S = np.concatenate([[0.0], np.cumsum(P[:, 0] * Pn[:, 1] - Pn[:, 0] * P[:, 1])])
+        if total <= 0 or abs(S[n]) / total < w:          # 2 * area / perimeter < w
+            break
         cands = []                                    # (L, lo, hi, kind, X)
         # stretches whose two ends nearly meet
         D = np.linalg.norm(P[:, None, :] - P[None, :, :], axis=2)
@@ -376,8 +382,10 @@ def trim_slivers(xy, w, max_rounds=50):
         if not cands:
             break
         # take every candidate whose index span is free of the ones already
-        # taken (shortest first): one pass removes all disjoint slivers
-        cands.sort(key=lambda c: c[0])
+        # taken, longest first: a hairpin is a candidate at every depth
+        # (its tip, its tip plus a bit, ...) and the whole of it must go,
+        # not the tip round after round until a stub under 2*w is left
+        cands.sort(key=lambda c: -c[0])
         taken = np.zeros(n, bool)
         drop = np.zeros(n, bool)                       # points to delete
         insert = {}                                    # index -> point to put after it
@@ -904,7 +912,10 @@ def section_preview(V, F, origin, normal, tol=0.08, join_mm=0.0, closed_only=Fal
     {'origin', 'normal', 'loops': [(outer3d, [holes3d])], 'open':
     [prims3d...] (open chains), 'polylines': [[x, y, z]...] dense curves
     per loop for drawing (closed ones repeat their first point, open ones
-    do not), 'stats'}. `closed_only` keeps just the outer outlines: the
+    do not), 'areas_mm2': the material area of each loop (outer minus its
+    holes; what a Fusion profile of it measures, so a script can tell the
+    material profiles from the hole interiors Fusion also lists),
+    'stats'}. `closed_only` keeps just the outer outlines: the
     open chains (loose pieces of a leaky mesh) and every inner loop (a
     hole, an island inside a hole) are left out of the drawing, an outline
     to extrude and nothing else; stats['open'] and stats['inner'] still
@@ -912,20 +923,24 @@ def section_preview(V, F, origin, normal, tol=0.08, join_mm=0.0, closed_only=Fal
     sec = fit_section(V, F, origin, normal, tol=tol, join_mm=join_mm, trim_mm=trim_mm,
                       closed_only=closed_only)
     frame = (sec['origin'], sec['u'], sec['v'], sec['normal'])
-    loops, polys = [], []
+    loops, polys, areas = [], [], []
     for fo, fh in sec['loops']:
         loops.append((lift_prims(fo, frame), [lift_prims(h, frame) for h in fh]))
-        for prims in [fo] + fh:
+        area = 0.0
+        for k, prims in enumerate([fo] + fh):
             if len(prims):
                 q = prim_points(prims)
                 polys.append(to_3d(np.vstack([q, q[:1]]), frame).tolist())
+                area += abs(signed_area(q)) * (1.0 if k == 0 else -1.0)
+        areas.append(float(max(area, 0.0)))
     opens = []
     for prims in sec['open']:
         opens.append(lift_prims(prims, frame))
         if len(prims):
             polys.append(to_3d(prim_points(prims, closed=False), frame).tolist())
     return {'origin': np.asarray(sec['origin']).tolist(), 'normal': np.asarray(sec['normal']).tolist(),
-            'loops': loops, 'open': opens, 'polylines': polys, 'stats': sec['stats']}
+            'loops': loops, 'open': opens, 'polylines': polys, 'areas_mm2': areas,
+            'stats': sec['stats']}
 
 
 # ---------------------------------------------------------------------------

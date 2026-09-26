@@ -100,7 +100,7 @@ def trace_stack(path, axis, offsets, tol=0.08, units='mm', scale=1.0, join=2.5, 
         mask = (zmin <= at) & (zmax >= at)
         if not mask.any():
             sec = {'origin': origin.tolist(), 'normal': normal.tolist(), 'loops': [], 'open': [],
-                   'polylines': [], 'stats': dict(_ZERO_STATS), 'empty': True}
+                   'polylines': [], 'areas_mm2': [], 'stats': dict(_ZERO_STATS), 'empty': True}
         else:
             sec = section_preview(V, F[mask], origin, normal, tol=tol, join_mm=join,
                                   closed_only=outline, trim_mm=trim)
