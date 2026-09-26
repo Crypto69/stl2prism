@@ -1,4 +1,5 @@
 import { defineStore } from 'pinia'
+import { markRaw } from 'vue'
 import { errText, friendlyError } from './errors'
 
 // STL/OBJ files carry no units. `units` says what the file's numbers mean;
@@ -66,6 +67,7 @@ const bpSaved = loadBp()
 const XRAY_EDGE = 1e-3
 
 let pollTimer = null
+let liveSeq = 0
 let traceSeq = 0
 let axisSeq = 0
 let xraySeq = 0
@@ -163,6 +165,16 @@ export const useConvertStore = defineStore('convert', {
     bbox: null,
     volume: null,
     overallCheck: null,
+    // the coloured view: the feature list of the shape on the stage and
+    // one feature index per triangle of its mesh (from the full build's
+    // preview_features.json or a live preview), plus the live preview's
+    // mesh itself ({ data, kind, seq }) and its state
+    featureList: [],
+    featureMap: null,
+    liveStl: null,
+    liveBusy: false,
+    liveError: null,
+    liveInfo: null,          // { bbox, volume_mm3, solids, warnings, overall_check } of the live shape
   }),
 
   getters: {
@@ -329,6 +341,7 @@ export const useConvertStore = defineStore('convert', {
         loftAxisAuto: null, loftAxisScores: null,
         imageUrl: null, imageSize: null, recipe: null, recipeRead: null, warnings: [],
         bbox: null, volume: null, overallCheck: null,
+        featureList: [], featureMap: null, liveStl: null, liveBusy: false, liveError: null, liveInfo: null,
       })
       try {
         const body = new FormData()
@@ -651,9 +664,11 @@ export const useConvertStore = defineStore('convert', {
         status: 'uploading', jobId: null, inputStats: null, log: '', result: null, error: null,
         cancelled: false, filename: file.name, imageUrl: null, imageSize: null,
         recipe: null, recipeRead: null, warnings: [], bbox: null, volume: null, overallCheck: null,
+        featureList: [], featureMap: null, liveStl: null, liveBusy: false, liveError: null, liveInfo: null,
         bodies: [], triangleBody: null, selected: [], hovered: -1, bodiesError: null,
         section: null, xrayTraces: [], xrayTotal: 0, loftAxisAuto: null, loftAxisScores: null,
       })
+      liveSeq++
       try {
         const body = new FormData()
         body.append('file', file)
@@ -732,7 +747,58 @@ export const useConvertStore = defineStore('convert', {
         recipe: r.recipe, recipeRead: rd,
         warnings: [...(rd?.validation?.warnings || []), ...(r.warnings || [])],
         bbox: r.bbox, volume: r.volume_mm3, overallCheck: r.overall_check || null,
+        liveStl: null, liveInfo: null, liveError: null,
       })
+      liveSeq++
+      this.fetchFeatureMap()
+    },
+
+    // the full build's colouring (which feature made each triangle of preview.stl)
+    async fetchFeatureMap() {
+      if (!this.jobId) return
+      const job = this.jobId
+      try {
+        const res = await fetch(`/api/blueprints/${job}/preview-map?t=${Date.now()}`)
+        if (!res.ok) return
+        const d = await res.json()
+        if (job !== this.jobId) return
+        this.$patch({ featureList: d.features || [], featureMap: d.triangle_feature || null,
+                      selected: (d.features || []).map((_, i) => i) })
+      } catch { /* the view stays grey */ }
+    },
+
+    // A live look at the draft: the warm helper builds the shape (well
+    // under a second) and the view shows it coloured by feature. Debounced
+    // by the panel; a stale answer is dropped.
+    async previewLive(recipe) {
+      if (!this.jobId || !this.isImageJob) return
+      const mine = ++liveSeq
+      const job = this.jobId
+      this.$patch({ liveBusy: true, liveError: null })
+      try {
+        const res = await fetch(`/api/blueprints/${job}/preview`, {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ recipe }),
+        })
+        if (!res.ok) throw new Error(await errText(res))
+        const d = await res.json()
+        if (mine !== liveSeq || job !== this.jobId) return
+        const stl = await fetch(`${d.stl_url}?t=${Date.now()}`)
+        if (!stl.ok) throw new Error(await errText(stl))
+        const data = await stl.arrayBuffer()
+        if (mine !== liveSeq || job !== this.jobId) return
+        this.$patch({
+          liveStl: markRaw({ data, kind: 'stl', seq: mine }),
+          featureList: d.features || [], featureMap: d.triangle_feature || null,
+          selected: (d.features || []).map((_, i) => i),
+          liveInfo: { bbox: d.bbox, volume_mm3: d.volume_mm3, solids: d.solids,
+                      warnings: d.warnings || [], overall_check: d.overall_check || null },
+        })
+      } catch (e) {
+        if (mine === liveSeq) this.liveError = friendlyError(e)
+      } finally {
+        if (mine === liveSeq) this.liveBusy = false
+      }
     },
 
     // stop the slice-by-slice trace where it is (the traces so far stay)

@@ -58,6 +58,14 @@ function onPaste(e) {
   takeFile(file)
 }
 
+// A live preview of the edited recipe replaces the shape on the stage
+watch(() => store.liveStl, (live) => {
+  if (!live || !store.isImageJob) return
+  buffer.value = markRaw({ data: live.data, kind: 'stl' })
+  stageView.value = '3d'
+  previewError.value = null
+})
+
 // A finished Blueprint build has a preview.stl: show it (a rebuild
 // rewrites the file, so the fetch is never cached).
 watch(() => [store.status, store.jobId], async ([s, job]) => {
@@ -203,13 +211,13 @@ const canConvert = computed(
         <MeshViewer
           v-if="buffer && (!store.isImageJob || stageView === '3d')"
           :buffer="buffer"
-          :unit-scale="store.unitScale"
-          :triangle-body="store.triangleBody"
+          :unit-scale="store.isImageJob ? 1 : store.unitScale"
+          :triangle-body="store.isImageJob ? store.featureMap : store.triangleBody"
           :selected="store.selected"
           :hovered="store.hovered"
           :planes="store.viewPlanes"
           :sections="store.viewSections"
-          @pick="store.toggleBody($event)"
+          @pick="store.isImageJob ? null : store.toggleBody($event)"
           @hover="store.hovered = $event"
           @error="previewError = $event"
         />

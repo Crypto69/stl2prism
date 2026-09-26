@@ -37,6 +37,8 @@ class Build:
     n_solids: int
     per_feature: list = field(default_factory=list)
     warnings: list = field(default_factory=list)
+    tools: list = field(default_factory=list)      # one cq.Workplane per feature: what it added or cut
+    features: list = field(default_factory=list)   # [{'id', 'name', 'op'}] in build order
 
 
 def _workplane(plane, offset):
@@ -93,6 +95,7 @@ def build(resolved):
     result = None
     per = []
     warnings = []
+    tools = []
     n_bodies_expected = sum(1 for f in resolved['features'] if f['op'] == 'new_body')
     for f in resolved['features']:
         fid = f['id']
@@ -119,6 +122,7 @@ def build(resolved):
             except Exception as e:
                 raise BlueprintError(f'{fid}: shape {j} could not be drawn ({type(e).__name__}: {e})') from e
             tool = t if tool is None else tool.union(t)
+        tools.append(tool)
         before = _volume(result) if result is not None else 0.0
         try:
             if f['op'] == 'new_body' or result is None:
@@ -145,4 +149,44 @@ def build(resolved):
                         f'{n_bodies_expected} new_body feature{"s" if n_bodies_expected != 1 else ""}); '
                         'a join that touches nothing, or a cut that split the part')
     return Build(solid=result, bbox=_bbox(result), volume_mm3=_volume(result), n_solids=n_sol,
-                 per_feature=per, warnings=warnings)
+                 per_feature=per, warnings=warnings, tools=tools,
+                 features=[{'id': f['id'], 'name': f['name'], 'op': f['op']} for f in resolved['features']])
+
+
+PREVIEW_TOL = 0.02
+PREVIEW_ANG = 0.1
+OWNER_TOL = 0.1        # mm: a triangle whose centre is this close to a tool's surface is that tool's
+
+
+def preview_mesh(b):
+    """The result as a trimesh, the way the web viewer and the feature map
+    both see it (one tessellation, so triangle order matches)."""
+    from ..pipeline import tessellate_solid
+    return tessellate_solid(b.solid, PREVIEW_TOL, PREVIEW_ANG)
+
+
+def feature_map(b, mesh, tol=OWNER_TOL):
+    """Which feature made each triangle's surface: the last feature (in
+    build order) whose tool surface passes through the triangle's centre.
+    A boss's sides belong to the boss, a hole's wall to the cut that made
+    it, everything else to the body. Returns a list, one int per triangle
+    (an index into b.features)."""
+    import numpy as np
+    import trimesh
+    from ..pipeline import tessellate_solid
+    if len(mesh.faces) == 0:
+        return []
+    centres = mesh.triangles_center
+    owner = np.zeros(len(centres), dtype=int)
+    for i, tool in enumerate(b.tools):
+        if i == 0:
+            continue                          # the body owns whatever nothing else claims
+        try:
+            tm = tessellate_solid(tool, PREVIEW_TOL, PREVIEW_ANG)
+            if len(tm.faces) == 0:
+                continue
+            _, dist, _ = trimesh.proximity.ProximityQuery(tm).on_surface(centres)
+        except Exception:
+            continue
+        owner[dist <= tol] = i
+    return owner.tolist()

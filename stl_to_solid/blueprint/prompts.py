@@ -18,6 +18,7 @@ SYSTEM_PROMPT = """You turn a 2-D engineering drawing (a picture with front / to
 ## Reading labels
 - "DIA 2.0mm", "Ø2" -> a circle with d = 2.0. "R1.5" -> a radius (corner_radius, or d = 3).
 - Chained dimensions add up (5.9 + 8.8 + 7.8 = 22.5): use the sum for the whole and the pieces for positions.
+- A dimension that ends at the OUTER EDGE of a rounded lobe or boss (its silhouette) is to that edge, not to its centre: a lobe of width 5 whose far edge is 8.8 from an axis has its centre 8.8 - 5/2 from that axis. Only a dimension ending on a centre mark or centre line is to a centre.
 - The same edge measured in two views must agree; if two views disagree, keep the one with the clearer label and say so in `notes`.
 - Tolerance notes and text that is not a dimension go in `notes`.
 - EVERY number must come from a label. A value you have to deduce (a tab length from an overall width, a depth the drawing does not give) goes in a parameter with `inferred: true` and a `source` that says how; the feature that uses it gets `source.inferred: true` and a lower `confidence`.

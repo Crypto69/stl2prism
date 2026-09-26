@@ -147,8 +147,12 @@ one or more shapes on it (rectangle, circle, slot, polygon) and one
 extrude (new body / join / cut, a distance or through-all). Numbers may be
 expressions over the parameters (`body_w/2`). Every number is shown in a
 table with where it came from; values the model had to deduce are marked.
-Fix a misread one and press **Rebuild**: the checks and the build run
-again without asking the model.
+Fix a misread one and the view redraws within a second (a warm helper
+process keeps the geometry kernel loaded; the shape only, no files); press
+**Rebuild** for the STEP and the script, again without asking the model.
+The 3D view is coloured by feature, the same colours as the swatches in
+the feature list, and hovering a feature lights it up in the view, so
+which number moves what is plain to see.
 
 Before anything is built the recipe goes through deterministic checks:
 every expression resolves, shapes have size, the first feature is a body,
@@ -189,7 +193,10 @@ the key in `X-Api-Key`; the job goes `reading` → `queued` → `running` →
 `done`), `POST /api/blueprints/{id}/build` (`{recipe}`, no model call; a
 400 lists what the checks refused), `GET /api/blueprints/{id}/recipe`
 and `/drawing`; then the usual `/api/jobs/{id}`, `/download`,
-`/fusion-script` and `/preview`. Install the reader's dependencies with
+`/fusion-script` and `/preview`; `POST /api/blueprints/{id}/preview`
+(`{recipe}`) is the live look (the mesh at `/live.stl`, one feature index
+per triangle in the answer) and `GET /api/blueprints/{id}/preview-map`
+the same colouring for the full build. Install the reader's dependencies with
 `pip install -e '.[blueprint]'` (the Docker image has them).
 
 ## Screenshots
@@ -310,7 +317,8 @@ bodies to use, input units and scale, the mesh's stats).
   every number editable, inferred and low-confidence ones marked;
   **Rebuild** after an edit; the size against the drawing's, the volume,
   who read it and what it cost in tokens; downloads of the parametric
-  Fusion script and the STEP.
+  Fusion script and the STEP. Edits redraw the coloured shape live; the
+  feature list's swatches match the view and hovering a row lights it up.
 - **X-Ray.** Axis, start plane, end plane, spacing (or *Whole part*); the
   slice count and a time estimate; the slices traced one by one and left
   in the 3D view (a *stop* link halts the trace, *trace the rest* resumes
@@ -360,7 +368,9 @@ browser's 300 s response limit), `STLTOSOLID_ANTHROPIC_API_KEY` /
 `STLTOSOLID_OPENAI_API_KEY` / `STLTOSOLID_DEEPSEEK_API_KEY` (Blueprint's
 opt-in server-side keys), `STLTOSOLID_BLUEPRINT_TIMEOUT` (seconds one
 read of a drawing may take, default 300), `STLTOSOLID_MAX_IMAGE` (bytes,
-default 20 MB). The budgets are backstops: a shell that reaches one is scored on
+default 20 MB), `STLTOSOLID_PREVIEW_TIMEOUT` (seconds one live preview
+may take in the helper before it is killed and restarted, default 45).
+The budgets are backstops: a shell that reaches one is scored on
 what was done by then, so its result can depend on machine load. The CLI
 takes the first two as `--workers` and `--shell-timeout`. The same workers
 score a big single shell's axis candidates side by side and run the

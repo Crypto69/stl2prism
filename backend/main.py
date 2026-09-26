@@ -21,6 +21,7 @@ from stl_to_solid.mesh_prep import SUPPORTED_EXTS
 
 from . import jobs
 from . import blueprint as bp
+from . import preview as bp_preview
 from .analysis import sanitize, mesh_stats, body_list
 from .errors import describe
 
@@ -35,6 +36,7 @@ async def _lifespan(app):
     os.makedirs(jobs.DATA_DIR, exist_ok=True)
     jobs.cleanup_old()
     yield
+    bp_preview.helper.close()
 
 
 app = FastAPI(title='stlToSolid', lifespan=_lifespan)
@@ -572,6 +574,55 @@ def blueprint_build(job_id: str, body: BuildBody):
     except OSError as e:
         raise HTTPException(500, f'Could not start the build: {describe(e)}')
     return {'id': job_id, 'status': 'running', 'warnings': rep.warnings}
+
+
+@app.post('/api/blueprints/{job_id}/preview')
+async def blueprint_preview(job_id: str, body: BuildBody):
+    """A live look at an edited recipe: the shape only, built by the warm
+    preview helper (no STEP, no script, the job's result untouched). Answers
+    with the size, volume and warnings plus the per-triangle feature index
+    for colouring; the mesh itself is at /live.stl."""
+    from stl_to_solid.blueprint import normalize, validate
+    job, _ = _drawing_path(job_id)
+    recipe = normalize(body.recipe)
+    rep = validate(recipe)
+    if rep.errors:
+        n = len(rep.errors)
+        raise HTTPException(400, f'The recipe is not valid ({n} problem{"s" if n != 1 else ""}): '
+                                 + '; '.join(rep.errors[:5]) + ('; …' if n > 5 else ''))
+    d = jobs.job_dir(job_id)
+    try:
+        ans = await run_in_threadpool(bp_preview.helper.build, recipe, d, 'live')
+    except bp_preview.PreviewError as e:
+        raise HTTPException(400 if e.kind == 'recipe' else 500, str(e))
+    ans['stl_url'] = f'/api/blueprints/{job_id}/live.stl'
+    ans['recipe'] = recipe
+    return sanitize(ans)
+
+
+@app.api_route('/api/blueprints/{job_id}/live.stl', methods=['GET', 'HEAD'])
+def blueprint_live_stl(job_id: str):
+    _drawing_path(job_id)
+    path = os.path.join(jobs.job_dir(job_id), 'live.stl')
+    if not os.path.exists(path):
+        raise HTTPException(404, 'No live preview has been built for this drawing yet.')
+    return FileResponse(path, media_type='model/stl',
+                        headers={'Cache-Control': 'no-store'})
+
+
+@app.get('/api/blueprints/{job_id}/preview-map')
+def blueprint_preview_map(job_id: str):
+    """Which feature made each triangle of the built preview (preview.stl),
+    for colouring the view by feature after a full build."""
+    _drawing_path(job_id)
+    path = os.path.join(jobs.job_dir(job_id), 'preview_features.json')
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except OSError:
+        raise HTTPException(404, 'This drawing has not been built yet.')
+    except ValueError:
+        raise HTTPException(500, 'The feature map could not be read; rebuild.')
 
 
 @app.get('/api/blueprints/{job_id}/recipe')

@@ -1,6 +1,7 @@
 <script setup>
-import { computed, onMounted, ref, watch } from 'vue'
+import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { useConvertStore, checkDownload } from '../store'
+import { swatch } from '../colors'
 import RecipeField from './RecipeField.vue'
 
 const store = useConvertStore()
@@ -31,6 +32,27 @@ const clone = (x) => (x == null ? null : JSON.parse(JSON.stringify(x)))
 watch(() => store.recipe, (r) => { draft.value = clone(r) }, { immediate: true })
 const dirty = computed(() => !!draft.value && JSON.stringify(draft.value) !== JSON.stringify(store.recipe))
 const revert = () => { draft.value = clone(store.recipe) }
+
+// Every edit redraws the shape after a short rest: the warm helper builds
+// it in well under a second, so which number moves what is visible at
+// once. The full Rebuild (STEP + Fusion script) stays a button.
+let liveTimer = null
+watch(draft, (d) => {
+  clearTimeout(liveTimer)
+  if (!d || !dirty.value || store.busy) return
+  liveTimer = setTimeout(() => store.previewLive(d), 500)
+}, { deep: true })
+onBeforeUnmount(() => clearTimeout(liveTimer))
+
+// which feature the pointer is on, in the list or in the view
+const hover = (i) => { store.hovered = i }
+const unhover = () => { store.hovered = -1 }
+const liveOverall = computed(() => {
+  const oc = store.liveInfo?.overall_check
+  if (!oc?.expected) return null
+  const worst = Math.max(...(oc.dev_pct || []).filter((d) => d != null).map(Math.abs), 0)
+  return `${store.liveInfo.bbox.size.map((v) => fmt(v, 2)).join(' × ')} mm · worst ${fmt(worst, 1)} % off the drawing`
+})
 const rebuild = () => { if (draft.value) store.rebuild(draft.value) }
 const orig = (fi, path) => {
   // the server's value at the same place, for the changed-outline
@@ -186,11 +208,14 @@ const readLabel = computed(() => {
         </tbody>
       </table>
 
-      <h2 class="micro">Features</h2>
+      <h2 class="micro">Features <span class="help">colours match the 3D view; hover to light one up</span></h2>
       <ol class="features">
-        <li v-for="(f, fi) in draft.features" :key="f.id || fi">
+        <li v-for="(f, fi) in draft.features" :key="f.id || fi"
+            :class="{ lit: store.hovered === fi }"
+            @mouseenter="hover(fi)" @mouseleave="unhover">
           <div class="row top">
             <span class="fname">
+              <span class="swatch" :style="{ background: swatch(fi) }"></span>
               <b>{{ f.name || f.id }}</b>
               <span class="badge op" :class="f.op">{{ f.op.replace('_', ' ') }}</span>
               <span v-if="f.source?.inferred" class="badge" title="some numbers deduced">?</span>
@@ -222,8 +247,14 @@ const readLabel = computed(() => {
           </div>
         </li>
       </ol>
+      <p v-if="store.liveBusy" class="hint"><span class="spin edge" aria-hidden="true"></span> redrawing…</p>
+      <p v-else-if="store.liveError" class="hint warn">Could not redraw: {{ store.liveError }}</p>
+      <p v-else-if="dirty && liveOverall" class="hint num">live: {{ liveOverall }}</p>
+      <ul v-if="dirty && store.liveInfo?.warnings?.length" class="warn list">
+        <li v-for="(w, i) in store.liveInfo.warnings" :key="i">{{ w }}</li>
+      </ul>
       <button type="button" class="dl press" :disabled="!dirty || store.busy" @click="rebuild">
-        {{ dirty ? 'Rebuild with these values' : 'Rebuild (nothing changed)' }}
+        {{ dirty ? 'Rebuild with these values (STEP + Fusion script)' : 'Rebuild (nothing changed)' }}
       </button>
       <p class="hint">
         A value may be a number or an expression over the parameters, like
@@ -313,7 +344,10 @@ const readLabel = computed(() => {
 .badge.op.cut { border-color: var(--fail); color: var(--fail); }
 .badge.op.join, .badge.op.new_body { border-color: var(--edge); color: var(--edge); }
 .features { margin: 0; padding: 0; list-style: none; display: flex; flex-direction: column; gap: 6px; }
-.features li { border-top: 1px solid var(--line); padding-top: 6px; display: flex; flex-direction: column; gap: 4px; }
+.features li { border-top: 1px solid var(--line); padding: 6px 4px 2px; margin: 0 -4px; border-radius: 4px; display: flex; flex-direction: column; gap: 4px; }
+.features li.lit { background: var(--panel-2); }
+.swatch { display: inline-block; width: 10px; height: 10px; border-radius: 2px; margin-right: 6px; vertical-align: -1px; }
+.hint .spin { display: inline-block; vertical-align: -2px; margin-right: 6px; }
 .features .top { align-items: baseline; }
 .features .fname { font-size: 12px; }
 .features .plane { color: var(--muted); font-size: 11px; white-space: nowrap; }
