@@ -168,3 +168,50 @@ def test_through_all_cut_through_more_than_its_target_warns(sg90):
          'width': 1.3})
     rep = validate(sg90)
     assert any('tab_holes' in w and 'passes through tabs, body' in w for w in rep.warnings), rep.warnings
+
+
+def _bracket():
+    """A half-ring upright drawn the recommended way: full circle join, then a
+    rect cut that trims the half sticking out past the base's back edge."""
+    return {'name': 'bracket', 'units': 'mm', 'overall': {'w': '100', 'd': '60', 'h': '45'},
+            'params': [{'name': 'r', 'value': 30}, {'name': 'L', 'value': 70}, {'name': 't', 'value': 15},
+                       {'name': 'H', 'value': 45}],
+            'features': [
+                {'id': 'base_rect', 'plane': 'XY', 'op': 'new_body', 'offset': '0', 'direction': '+', 'distance': 't',
+                 'shapes': [{'kind': 'rect', 'center': {'u': 'r + L/2', 'v': 'r'}, 'w': 'L', 'h': '2*r'}]},
+                {'id': 'base_end', 'plane': 'XY', 'op': 'join', 'offset': '0', 'direction': '+', 'distance': 't',
+                 'shapes': [{'kind': 'circle', 'center': {'u': 'r', 'v': 'r'}, 'd': '2*r'}]},
+                {'id': 'base_hole', 'plane': 'XY', 'op': 'cut', 'offset': 't', 'direction': '-', 'distance': '0',
+                 'through_all': True,
+                 'shapes': [{'kind': 'circle', 'center': {'u': 'r', 'v': 'r'}, 'd': '22'}]},
+                {'id': 'upright', 'plane': 'XY', 'op': 'join', 'offset': 't', 'direction': '+', 'distance': 'H - t',
+                 'shapes': [{'kind': 'circle', 'center': {'u': 'r + L', 'v': 'r'}, 'd': '2*r'}]},
+                {'id': 'upright_trim', 'plane': 'XY', 'op': 'cut', 'offset': 't', 'direction': '+', 'distance': 'H - t',
+                 'shapes': [{'kind': 'rect', 'center': {'u': 'r + L + r/2', 'v': 'r'}, 'w': 'r', 'h': '2*r'}]},
+                {'id': 'upright_bore', 'plane': 'XY', 'op': 'cut', 'offset': 'H', 'direction': '-', 'distance': 'H - t',
+                 'shapes': [{'kind': 'circle', 'center': {'u': 'r + L', 'v': 'r'}, 'd': '30'}]},
+            ]}
+
+
+def test_a_trimming_cut_shortens_the_box_check():
+    rep = validate(_bracket())
+    assert rep.errors == [], rep.errors
+    assert rep.bbox['size'] == pytest.approx([100, 60, 45], abs=1e-6)
+    # a hole through a plate drawn as two side-by-side shapes is not "through more than its target"
+    assert not any('passes through' in w for w in rep.warnings), rep.warnings
+
+
+def test_a_hole_through_the_middle_keeps_the_box():
+    r = _bracket()
+    r['features'] = r['features'][:3]
+    r['overall'] = {'w': '100', 'd': '60', 'h': '15'}
+    rep = validate(r)
+    assert rep.errors == [] and rep.bbox['size'] == pytest.approx([100, 60, 15], abs=1e-6)
+
+
+def test_a_cut_that_removes_a_whole_feature_is_still_flagged_elsewhere():
+    r = _bracket()
+    # a cut spanning the whole upright removes its box; the drawing's 45 then fails honestly
+    r['features'][4]['shapes'][0] = {'kind': 'rect', 'center': {'u': 'r + L', 'v': 'r'}, 'w': '2*r + 2', 'h': '2*r + 2'}
+    rep = validate(r)
+    assert any('along Z' in e for e in rep.errors)

@@ -192,6 +192,39 @@ def _overlap(a, b, tol=TOUCH):
     return all(a[0][i] <= b[1][i] + tol and b[0][i] <= a[1][i] + tol for i in range(3))
 
 
+def _covers(c, m, axis, tol=TOUCH):
+    """the cut box spans the material box along `axis`"""
+    return c[0][axis] <= m[0][axis] + tol and c[1][axis] >= m[1][axis] - tol
+
+
+def _clip(material, box_owner, cut, tol=TOUCH):
+    """Take `cut` out of the material boxes where the result is still a
+    box: a cut that spans a box in two axes and lops off one end along the
+    third shortens it; a cut that spans all three removes it. Anything
+    else (a hole through the middle) leaves the box, since the extent is
+    what the bounding-box check needs."""
+    keep_m, keep_o = [], []
+    for m, owner in zip(material, box_owner):
+        if not _overlap(cut, m, tol=-tol):
+            keep_m.append(m); keep_o.append(owner)
+            continue
+        spans = [_covers(cut, m, a, tol) for a in range(3)]
+        if all(spans):
+            continue                                   # gone
+        if sum(spans) == 2:
+            n = spans.index(False)
+            lo, hi = list(m[0]), list(m[1])
+            if cut[0][n] <= lo[n] + tol:               # takes the low end
+                lo[n] = max(lo[n], cut[1][n])
+            elif cut[1][n] >= hi[n] - tol:             # takes the high end
+                hi[n] = min(hi[n], cut[0][n])
+            if hi[n] - lo[n] > tol:
+                keep_m.append((lo, hi)); keep_o.append(owner)
+            continue
+        keep_m.append(m); keep_o.append(owner)
+    return keep_m, keep_o
+
+
 def _contains_uv(host, fb, plane, tol=TOUCH):
     u, v, _ = PLANE_AXES[plane]
     return (host[0][u] - tol <= fb[0][u] and fb[1][u] <= host[1][u] + tol
@@ -311,15 +344,21 @@ def validate(recipe):
                     break
             if f['through_all']:
                 # a through-all cut goes the whole way: everything in line is
-                # cut, not just the face it was aimed at
-                hit = []
+                # cut, not just the face it was aimed at. Two features side by
+                # side at the same level (a plate drawn as a rect plus a round
+                # end) are one plate to the hole; only pieces stacked at
+                # different levels along the normal are worth a warning.
+                hit = {}
                 for b in boxes:
                     for m, owner in zip(material, box_owner):
-                        if _overlap(b, m, tol=-TOUCH) and owner not in hit:
-                            hit.append(owner)
-                if len(hit) > 1:
+                        if _overlap(b, m, tol=-TOUCH):
+                            hit.setdefault(owner, (round(m[0][n], 3), round(m[1][n], 3)))
+                levels = set(hit.values())
+                if len(hit) > 1 and len(levels) > 1:
                     report.warnings.append(f'{fid}: this through-all cut passes through {", ".join(hit)}; if '
                                            'only one of them should be cut, give it a distance instead')
+            for b in boxes:
+                material, box_owner = _clip(material, box_owner, b)
 
     # --- duplicates -----------------------------------------------------------------
     keys = {}
