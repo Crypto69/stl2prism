@@ -445,6 +445,30 @@ def blueprint_config():
     return bp.config()
 
 
+@app.get('/api/blueprints/models')
+async def blueprint_models(provider: Literal['anthropic', 'openai', 'deepseek', 'custom'] = 'anthropic',
+                           base_url: Optional[str] = None,
+                           x_api_key: Optional[str] = Header(None, alias='X-Api-Key')):
+    """The models the given key can use with this provider, newest first,
+    for the panel's dropdown (Anthropic: only ones that take images). The
+    key travels in the header for this one call, as for /read."""
+    preset = bp.PRESETS[provider]
+    key = bp.resolve_key(provider, x_api_key)
+    if not key and preset['needs_key']:
+        raise HTTPException(400, bp.NO_KEY_MESSAGE.format(label=preset['label'], env=preset['env']))
+    if provider == 'custom' and not (base_url or '').strip():
+        raise HTTPException(400, 'The custom provider needs a base URL to list its models.')
+    missing = bp.sdk_available(provider)
+    if missing:
+        raise HTTPException(503, missing + '.')
+    try:
+        models = await run_in_threadpool(bp.list_models, provider, key or '', base_url)
+    except Exception as e:
+        raise HTTPException(400 if getattr(e, 'kind', '') == 'key' else 502,
+                            f'Could not list models: {describe(e)}')
+    return {'provider': provider, 'models': models, 'default': preset['default_model']}
+
+
 @app.post('/api/blueprints')
 async def create_blueprint(file: UploadFile):
     """Upload a drawing image. Same job directory layout as a mesh upload,

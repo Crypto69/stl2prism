@@ -253,3 +253,38 @@ def test_cancel_while_reading(tmp_path, monkeypatch):
         s = _wait(c, job)
         assert s['status'] == 'cancelled'
         assert started == []
+
+
+def test_models_route(tmp_path, monkeypatch):
+    from backend import blueprint as bp
+    calls = []
+
+    def fake_list(provider, key, base_url=None, timeout=30.0):
+        calls.append((provider, key, base_url))
+        return [{'id': 'claude-opus-5', 'label': 'Claude Opus 5', 'created': '2026-04-01'}]
+    monkeypatch.setattr(bp, 'list_models', fake_list)
+    with _client(tmp_path, monkeypatch) as c:
+        r = c.get('/api/blueprints/models?provider=anthropic')
+        assert r.status_code == 400 and 'Blueprint panel' in r.json()['detail']
+        r = c.get('/api/blueprints/models?provider=anthropic', headers={'X-Api-Key': 'sk-x'})
+        assert r.status_code == 200
+        assert r.json()['models'][0]['id'] == 'claude-opus-5' and r.json()['default'] == 'claude-opus-5'
+        assert calls[-1] == ('anthropic', 'sk-x', None)
+        r = c.get('/api/blueprints/models?provider=custom', headers={'X-Api-Key': 'k'})
+        assert r.status_code == 400 and 'base URL' in r.json()['detail']
+        from stl_to_solid.blueprint.providers import ReadError
+
+        def refused(provider, key, base_url=None, timeout=30.0):
+            raise ReadError('OpenAI refused the API key. Check the key in the Blueprint panel.', 'key')
+        monkeypatch.setattr(bp, 'list_models', refused)
+        r = c.get('/api/blueprints/models?provider=openai', headers={'X-Api-Key': 'bad'})
+        assert r.status_code == 400 and 'refused the API key' in r.json()['detail']
+
+
+def test_openai_model_filter():
+    from backend.blueprint import _OPENAI_VISION_PREFIXES, _OPENAI_SKIP
+    keep = ['gpt-5', 'gpt-5-mini', 'gpt-4o', 'gpt-4.1', 'o3', 'chatgpt-4o-latest']
+    drop = ['gpt-4o-audio-preview', 'gpt-4o-realtime-preview', 'text-embedding-3-large', 'whisper-1',
+            'gpt-4o-mini-tts', 'dall-e-3', 'gpt-image-1', 'gpt-5-codex', 'omni-moderation-latest']
+    ok = lambda m: m.startswith(_OPENAI_VISION_PREFIXES) and not any(w in m for w in _OPENAI_SKIP)
+    assert all(ok(m) for m in keep) and not any(ok(m) for m in drop)

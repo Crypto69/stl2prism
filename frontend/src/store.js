@@ -159,6 +159,11 @@ export const useConvertStore = defineStore('convert', {
     providerBaseUrl: bpSaved.providerBaseUrl || '',
     apiKeys: bpSaved.apiKeys || {},                 // { provider: key }
     hints: '',
+    // model lists fetched from each provider with the user's key: { provider: [{id,label}] },
+    // with the last failure's sentence and a busy flag
+    models: {},
+    modelsBusy: false,
+    modelsError: null,
     recipe: null,
     recipeRead: null,        // { model, provider, usage, seconds, repaired }
     warnings: [],
@@ -643,6 +648,36 @@ export const useConvertStore = defineStore('convert', {
       else delete keys[this.provider]
       this.apiKeys = keys
       saveBp({ apiKeys: keys })
+      const fresh = { ...this.models }
+      delete fresh[this.provider]
+      this.models = fresh
+    },
+
+    // GET /models with the browser's key: the dropdown's contents. Any
+    // failure leaves the typed model name in charge.
+    async fetchModels(force = false) {
+      const p = this.provider
+      if (!force && this.models[p]) return
+      const preset = this.providerPreset
+      if (!preset) return
+      if (!this.apiKey && !this.hasServerKey && preset.needs_key !== false) return
+      if (p === 'custom' && !this.providerBaseUrl) return
+      this.modelsBusy = true
+      this.modelsError = null
+      try {
+        const headers = this.apiKey ? { 'X-Api-Key': this.apiKey } : {}
+        const q = new URLSearchParams({ provider: p })
+        if (p === 'custom') q.set('base_url', this.providerBaseUrl)
+        const res = await fetch(`/api/blueprints/models?${q}`, { headers })
+        if (!res.ok) throw new Error(await errText(res))
+        const d = await res.json()
+        if (p !== this.provider) return
+        this.models = { ...this.models, [p]: d.models || [] }
+      } catch (e) {
+        if (p === this.provider) this.modelsError = friendlyError(e)
+      } finally {
+        if (p === this.provider) this.modelsBusy = false
+      }
     },
     setModel(m) {
       const models = { ...this.providerModel, [this.provider]: (m || '').trim() }

@@ -20,6 +20,19 @@ watch(() => store.blueprintConfig, () => { if (!modelDraft.value) modelDraft.val
 const saveKey = () => store.setKey(keyDraft.value)
 const clearKey = () => { keyDraft.value = ''; store.setKey('') }
 const saveModel = () => store.setModel(modelDraft.value)
+// the dropdown lists what the key can use; "type a name" keeps the free field
+const modelList = computed(() => store.models[store.provider] || null)
+const typing = ref(false)
+const pickModel = (id) => {
+  if (id === '__type__') { typing.value = true; return }
+  typing.value = false
+  modelDraft.value = id
+  store.setModel(id)
+}
+const loadModels = (force = false) => store.fetchModels(force)
+watch(() => [store.provider, store.apiKey, store.blueprintConfig, store.providerBaseUrl], () => { typing.value = false; loadModels() },
+      { immediate: true })
+const modelInList = computed(() => !!modelList.value?.some((m) => m.id === modelDraft.value))
 const saveUrl = () => store.setBaseUrl(urlDraft.value)
 const preset = computed(() => store.providerPreset)
 const providers = computed(() => store.blueprintConfig?.providers || [])
@@ -130,13 +143,29 @@ const readLabel = computed(() => {
         </select>
       </div>
       <div class="row">
-        <label for="bp_model">Model</label>
+        <label for="bp_model">
+          Model
+          <button class="link" type="button" :disabled="store.modelsBusy" title="ask the provider for its model list again" @click="loadModels(true)">
+            {{ store.modelsBusy ? 'listing…' : 'refresh' }}
+          </button>
+        </label>
+        <select
+          v-if="modelList && modelList.length && !typing" id="bp_model" class="num wide"
+          :value="modelInList ? modelDraft : '__type__'" :class="{ touched: modelDraft !== (preset?.default_model || '') }"
+          @change="pickModel($event.target.value)"
+        >
+          <option v-for="m in modelList" :key="m.id" :value="m.id">{{ m.label }}</option>
+          <option value="__type__">type a name…</option>
+        </select>
         <input
+          v-else
           id="bp_model" type="text" class="num wide" v-model="modelDraft" spellcheck="false" autocomplete="off"
           :placeholder="preset?.default_model || 'model name'" :class="{ touched: modelDraft !== (preset?.default_model || '') }"
           @blur="saveModel" @keydown.enter="saveModel"
         />
       </div>
+      <p v-if="store.modelsError" class="hint warn">Could not list models: {{ store.modelsError }}</p>
+      <p v-else-if="modelList && !modelList.length" class="hint">The provider listed no vision models for this key; type a model name.</p>
       <div v-if="store.provider === 'custom'" class="row">
         <label for="bp_url">Base URL</label>
         <input

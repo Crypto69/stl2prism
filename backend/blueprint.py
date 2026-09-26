@@ -96,3 +96,64 @@ def verify_image(path):
     if w < 64 or h < 64:
         raise ValueError(f'the image is only {w} x {h} pixels; the labels would be unreadable')
     return w, h
+
+
+# OpenAI-compatible servers only give model ids; these are the families that
+# take images in a chat completion, and the words that mark models that do not
+_OPENAI_VISION_PREFIXES = ('gpt-4o', 'gpt-4.1', 'gpt-4.5', 'gpt-5', 'o1', 'o3', 'o4', 'chatgpt-')
+_OPENAI_SKIP = ('audio', 'realtime', 'transcribe', 'tts', 'search', 'image', 'embedding', 'moderation',
+                'codex', 'computer-use', 'instruct', 'preview-2024', 'whisper', 'dall-e', 'babbage', 'davinci')
+
+
+def list_models(provider, api_key, base_url=None, timeout=30.0):
+    """[{'id', 'label', 'created'}], newest first, for the panel's dropdown:
+    Anthropic filtered to models that take images (the API says so); an
+    OpenAI-compatible server filtered by family names for OpenAI itself and
+    left whole for DeepSeek / a custom server (they say nothing about
+    images). Raises ReadError with a sentence."""
+    from stl_to_solid.blueprint.providers import ReadError, _short
+    preset = PRESETS[provider]
+    url = (base_url or '').strip() or preset['base_url'] or None
+    if provider == 'anthropic':
+        import anthropic
+        try:
+            client = anthropic.Anthropic(api_key=api_key, timeout=timeout, max_retries=1)
+            out = []
+            for m in client.models.list():
+                caps = getattr(m, 'capabilities', None)
+                img = getattr(getattr(caps, 'image_input', None), 'supported', True)
+                if not img:
+                    continue
+                created = getattr(m, 'created_at', None)
+                out.append({'id': m.id, 'label': getattr(m, 'display_name', None) or m.id,
+                            'created': created.isoformat() if hasattr(created, 'isoformat') else str(created or '')})
+            out.sort(key=lambda x: x['created'], reverse=True)
+            return out
+        except anthropic.AuthenticationError:
+            raise ReadError('Anthropic refused the API key. Check the key in the Blueprint panel.', 'key')
+        except anthropic.APIStatusError as e:
+            raise ReadError(f'Anthropic answered {e.status_code}: {_short(e.message)}', 'api')
+        except anthropic.APIConnectionError:
+            raise ReadError('Could not reach the Anthropic API from the server (network or timeout).', 'network')
+    import openai
+    where = f'the server at {url}' if url else 'OpenAI'
+    try:
+        client = openai.OpenAI(api_key=api_key or 'none', base_url=url, timeout=timeout, max_retries=1)
+        models = list(client.models.list())
+    except openai.AuthenticationError:
+        raise ReadError(f'{where} refused the API key. Check the key in the Blueprint panel.', 'key')
+    except openai.APIStatusError as e:
+        raise ReadError(f'{where} answered {e.status_code}: {_short(getattr(e, "message", str(e)))}', 'api')
+    except openai.APIConnectionError:
+        raise ReadError(f'Could not reach {where} from the server (network or timeout).', 'network')
+    out = []
+    for m in models:
+        mid = getattr(m, 'id', None)
+        if not mid:
+            continue
+        if provider == 'openai':
+            if not mid.startswith(_OPENAI_VISION_PREFIXES) or any(w in mid for w in _OPENAI_SKIP):
+                continue
+        out.append({'id': mid, 'label': mid, 'created': int(getattr(m, 'created', 0) or 0)})
+    out.sort(key=lambda x: (x['created'], x['id']), reverse=True)
+    return out
