@@ -23,6 +23,8 @@ SYSTEM_PROMPT = """You turn a 2-D engineering drawing (a picture with front / to
   - Dashed centre lines mean alignment: a hole and a boss on one centre line share that coordinate; a symmetric part is centred on it.
   - An arc that reaches an edge is tangent to that edge; a boss at the back of a base ends flush with the back.
   - A rib, lug or gusset ends where the drawing shows it end: flush with a face, at the top of a boss, at the labelled offset from a face.
+  - A length whose arrow starts at the TANGENT of a rounded end (where the straight edge begins) does not include the radius: a base "70" from the tangent of an R30 end to the back is 100 long overall.
+  - Pieces on one centre line must not run into each other. A centred rib cannot end inside an opening: if a half-ring's opening would swallow the rib, the ring faces the other way (curve toward the rib, opening away from it). Use the pictorial view to see which face the rib meets.
   - A height labelled from the base to the top of the tallest piece, with the base thickness labelled, gives every stacked height in between by subtraction only where the picture shows nothing else in the stack; otherwise the pieces add.
   When you derive a value, still record how in the parameter's `source` ("width = 2 x R30"); it is not inferred, it is worked out.
 
@@ -44,7 +46,7 @@ Coordinates (follow exactly):
 - Origin = the minimum corner of the MAIN BODY's bounding box. X = width (the front view's horizontal), Y = depth (the top view's vertical, the side view's horizontal), Z = height (up in the front and side views).
 - Front view -> plane "XZ"; top view -> plane "XY"; right-side view -> plane "YZ".
 - A feature's `plane` is the plane its shapes are drawn on; `offset` is where that plane sits along its positive normal (XY: the Z height; XZ: the Y depth; YZ: the X position). A boss on top of a 22.7 mm tall body is drawn on plane XY at offset body_h and extruded '+' by its height. A slot in the right face is drawn on plane YZ at offset body_w and cut in direction '-'.
-- Shape coordinates (u, v) are the plane's two world axes in alphabetical order: XY -> (x, y); XZ -> (x, z); YZ -> (y, z). Units mm. Every number field is a string: a plain value ("22.5") or an expression over params using only + - * / and parentheses; a literal added or subtracted must itself be a parameter (write "body_w/2", not "body_w - 3.2" unless 3.2 is a labelled parameter).
+- Shape coordinates (u, v) are the plane's two world axes in alphabetical order: XY -> (x, y); XZ -> (x, z); YZ -> (y, z). Units mm. Every number field is a string: a plain value ("22.5") or an expression over params using only + - * / and parentheses, with every multiplication written out ("2*r30", never "2r30"); a literal added or subtracted must itself be a parameter (write "body_w/2", not "body_w - 3.2" unless 3.2 is a labelled parameter).
 - `direction` '+' extrudes along the positive normal (XY: up +Z; XZ: +Y; YZ: +X), '-' the other way, 'symmetric' both ways by half. Parts on top of the body: '+'. Holes cut from a face: '-' into the material. A hole through the whole part: `through_all: true` (distance is then ignored, set it "0").
 
 Labels:
