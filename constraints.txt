@@ -1,7 +1,7 @@
 # Locked versions for the Docker image (linux x86_64, CPython 3.12).
 # Resolved with: pip download --platform manylinux_2_35_x86_64 (and older
 # tags) --python-version 3.12 --only-binary=:all: over pyproject deps +
-# [scan] + fastapi/uvicorn/python-multipart — so every pin is proven to
+# [scan,blueprint] + fastapi/uvicorn/python-multipart — so every pin is proven to
 # have a wheel the python:3.12-slim (bookworm, glibc 2.36) image installs.
 # NOTE: pymeshlab and cadquery-ocp wheels need glibc >= 2.35 / 2.31: the
 # base image must stay bookworm or newer.
@@ -11,23 +11,28 @@ aiohttp==3.14.3
 aiosignal==1.4.0
 annotated-doc==0.0.5
 annotated-types==0.8.0
+anthropic==1.8.0
 anyio==4.15.0
 attrs==26.1.0
-cadquery==2.8.0
-cadquery-ocp==7.9.3.1.1
 cadquery-ocp-proxy==7.9.3.1.1
+cadquery-ocp==7.9.3.1.1
+cadquery==2.8.0
 casadi==3.8.0
 click==8.5.0
 contourpy==1.3.3
 cycler==0.12.1
+docstring-parser==0.18.0
 ezdxf==1.4.4
 fast-simplification==0.2.0
 fastapi==0.141.1
 fonttools==4.64.0
 frozenlist==1.8.0
 h11==0.16.0
+httpcore2==2.13.1
 httptools==0.8.0
+httpx2==2.13.1
 idna==3.19
+jiter==0.17.0
 kiwisolver==1.5.1
 llvmlite==0.49.0
 lxml==6.1.3
@@ -40,11 +45,12 @@ networkx==3.6.1
 nlopt==2.11.0
 numba==0.67.0
 numpy==2.5.2
+openai==3.19.2
 packaging==26.3
 pillow==12.3.0
 propcache==0.5.2
-pydantic==2.13.5
 pydantic-core==2.46.5
+pydantic==2.13.5
 pymeshlab==2025.7.post1
 pyparsing==3.3.2
 python-dateutil==2.9.0.post0
@@ -56,15 +62,17 @@ runtype==0.5.3
 scipy==1.18.1
 shapely==2.1.2
 six==1.17.0
+sniffio==1.3.1
 starlette==1.6.0
-trame==3.13.2
 trame-client==3.13.6
 trame-common==1.2.7
 trame-components==2.5.0
 trame-server==3.14.1
 trame-vtk==2.11.16
 trame-vuetify==3.2.5
+trame==3.13.2
 trimesh==5.1.0
+truststore==0.10.4
 typing-extensions==4.16.0
 typing-inspection==0.4.4
 uvicorn==0.52.4
