@@ -117,6 +117,15 @@ export const useConvertStore = defineStore('convert', {
     xrayBusy: false,
     xrayError: null,
     xrayTraceMs: null,
+    // X-Ray's own gap joining and sliver trimming (mm). The loft keeps its
+    // values in params: a trim set for a leaky loft must not quietly eat the
+    // thin walls of the next part put through the X-Ray
+    xrayJoin: 2.5,
+    xrayTrim: 0,
+    // the part's exact side along one axis, from the server ({job, axis,
+    // units, scale, mm}); bbox_mm is rounded to 0.01 mm, and a plane clamped
+    // with the rounded half can land just outside the part and cut nothing
+    exactExtent: null,
   }),
 
   getters: {
@@ -151,8 +160,15 @@ export const useConvertStore = defineStore('convert', {
       const a = s.resolvedSliceAxis
       const bb = s.inputStats?.bbox_mm
       if (!a || !bb) return 0
+      const e = s.exactExtent
+      if (e && e.job === s.jobId && e.axis === a && e.units === s.params.units && e.scale === s.params.scale) {
+        return e.mm / 2
+      }
       return (bb['xyz'.indexOf(a)] * s.unitScale) / 2
     },
+    // the gap and sliver settings of the tool in use
+    sliceJoin: (s) => (s.tool === 'xray' ? s.xrayJoin : s.params.slice_join),
+    sliceTrim: (s) => (s.tool === 'xray' ? s.xrayTrim : s.params.slice_trim),
     sectionScriptUrl: (s) => {
       const a = s.resolvedSliceAxis
       if (!s.jobId || !a) return null
@@ -275,7 +291,7 @@ export const useConvertStore = defineStore('convert', {
           bodies: [], triangleBody: null, selected: [], hovered: -1, bodiesError: null,
           sliceOffset: 0, sliceOutline: false, section: null, sectionError: null,
           xrayFrom: 0, xrayTo: 0, xrayExtrude: false, xrayTraces: [], xrayTotal: 0,
-          xrayError: null, xrayTraceMs: null,
+          xrayError: null, xrayTraceMs: null, exactExtent: null,
         })
         this.loadBodies()
       } catch (e) {
@@ -431,6 +447,39 @@ export const useConvertStore = defineStore('convert', {
 
     resetParams() {
       this.params = { ...DEFAULT_PARAMS, method: this.tool === 'loft' ? 'loft' : 'auto' }
+      this.xrayJoin = DEFAULT_PARAMS.slice_join
+      this.xrayTrim = DEFAULT_PARAMS.slice_trim
+    },
+
+    // Remember the part's exact side along `axis` (mm, converted frame), as
+    // a /section or /xray answer reports it.
+    noteExtent(axis, mm) {
+      if (!(mm > 0) || !this.jobId) return
+      const e = this.exactExtent
+      if (e && e.job === this.jobId && e.axis === axis && e.units === this.params.units
+          && e.scale === this.params.scale && e.mm === mm) return
+      this.exactExtent = { job: this.jobId, axis, units: this.params.units, scale: this.params.scale, mm }
+    },
+
+    // Make sure the half extent on the resolved axis is the server's exact
+    // one before the planes are placed (one cheap /xray call; nothing is
+    // cut). Any failure leaves the rounded value, which is fine for the
+    // count and only ever matters at the very ends of the part.
+    async ensureExtent() {
+      const a = this.resolvedSliceAxis
+      if (!this.jobId || !a) return
+      const e = this.exactExtent
+      if (e && e.job === this.jobId && e.axis === a && e.units === this.params.units && e.scale === this.params.scale) return
+      try {
+        const q = new URLSearchParams({ axis: a, from: '0', to: '0', step: '1',
+                                        units: this.params.units, scale: String(this.params.scale) })
+        const res = await fetch(`/api/jobs/${this.jobId}/xray?${q}`)
+        if (!res.ok) return
+        const got = await res.json()
+        if (got?.half_extent > 0) this.noteExtent(a, got.half_extent * 2)
+      } catch (e) {
+        /* the rounded value stays */
+      }
     },
 
     // Ask which axis a whole-body loft would pick for 'auto', so the plane
@@ -474,14 +523,18 @@ export const useConvertStore = defineStore('convert', {
     async traceXray() {
       if (!this.jobId || !this.resolvedSliceAxis) return
       const mine = ++xraySeq
+      this.$patch({ xrayTraces: [], xrayTotal: 0, xrayBusy: true, xrayError: null })
+      await this.ensureExtent()
+      if (mine !== xraySeq) return
       const all = this.xrayOffsets
       const offs = this.xrayOverCap ? [all[0], all[all.length - 1]] : all
-      this.$patch({ xrayTraces: [], xrayTotal: offs.length, xrayBusy: true, xrayError: null })
+      this.xrayTotal = offs.length
       const t0 = performance.now()
       try {
         for (let i = 0; i < offs.length; i++) {
           const sec = await this.fetchSection(offs[i])
           if (mine !== xraySeq) return
+          if (sec?.axis && sec.extent) this.noteExtent(sec.axis, sec.extent)
           // a new array each time, so the viewer's watcher sees the change
           this.xrayTraces = [...this.xrayTraces, sec]
           this.xrayTraceMs = (performance.now() - t0) / (i + 1)
@@ -517,6 +570,7 @@ export const useConvertStore = defineStore('convert', {
       try {
         const sec = await this.fetchSection(this.sliceOffset)
         if (mine !== traceSeq) return
+        if (sec?.axis && sec.extent) this.noteExtent(sec.axis, sec.extent)
         this.section = sec
         this.sectionError = null
       } catch (e) {
@@ -534,8 +588,8 @@ function sectionQuery(s, offset) {
   return new URLSearchParams({
     axis: s.resolvedSliceAxis, offset: String(offset), tol: String(s.params.tol),
     units: s.params.units, scale: String(s.params.scale),
-    join: String(s.params.slice_join), outline: s.sliceOutline ? 'true' : 'false',
-    trim: String(s.params.slice_trim || 0),
+    join: String(s.sliceJoin), outline: s.sliceOutline ? 'true' : 'false',
+    trim: String(s.sliceTrim || 0),
   })
 }
 

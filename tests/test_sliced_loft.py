@@ -205,6 +205,30 @@ def test_trim_slivers_removes_hairpins_and_twists_only():
     assert sec0['stats']['trimmed'] == 0
 
 
+def test_trim_slivers_leaves_a_thin_loop_whole():
+    """A 5 x 1.3 mm strip (what is left beside a 1.6 mm cross hole in a 5 mm
+    bar) with the trim at 1.5 mm: every point on it is within 1.5 mm of the
+    opposite side, so each end used to pass as a hairpin and the strip came
+    back as a stub in the middle. A loop that is thin all over is a feature
+    and is left whole; a hairpin on a wide loop is still cut."""
+    from stl_to_solid.section_fit import trim_slivers, signed_area
+    def dense(pts, step=0.2):
+        pts = np.asarray(pts, float)
+        out = []
+        for a, b in zip(pts, np.roll(pts, -1, axis=0)):
+            k = max(1, int(np.linalg.norm(b - a) / step))
+            out.append(a + (b - a) * np.linspace(0, 1, k, endpoint=False)[:, None])
+        return np.vstack(out)
+    strip = dense([[0, 0], [5, 0], [5, 1.3], [0, 1.3]])
+    Q, k = trim_slivers(strip, 1.5)
+    assert k == 0 and np.array_equal(Q, strip)
+    assert abs(signed_area(Q)) == pytest.approx(6.5, abs=1e-9)
+    # the same strip on a 20 x 10 plate is a hairpin of it and goes
+    plate = dense([[0, 0], [20, 0], [20, 10], [12.65, 10], [12.65, 15], [11.35, 15], [11.35, 10], [0, 10]])
+    Q, k = trim_slivers(plate, 1.5)
+    assert k >= 1 and not any(p[1] > 10 + 1e-9 for p in Q)
+
+
 def test_fit_loop_rounded_rect_is_lines_and_arcs():
     from stl_to_solid.section_fit import section_loops, fit_loop
     p = synth.export(synth.rounded_rect(), '/tmp/_s2p_rr.stl')

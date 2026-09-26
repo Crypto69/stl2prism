@@ -366,12 +366,15 @@ async def xray_script(job_id: str, axis: str = 'z', frm: float = Query(0.0, alia
     one Fusion 360 script: a construction plane and a fully enclosed
     sketch per slice (lines, arcs, circles, fitted splines), drawn by the
     script with a progress dialog. `extrude` also extrudes every slice to
-    the next plane, so the stack comes out as solid slabs. At most
+    the next plane, so the stack comes out as solid slabs: the last slice
+    one spacing further but never past the part's far face, and an end
+    plane closer than half a spacing to the slice before it is drawn only,
+    that slice's slab running through instead (no hair-thin slab). At most
     XRAY_MAX slices and XRAY_BUDGET_S seconds of fitting."""
     _check_slice_params(axis, tol, join, trim, step)
     job, src = _input_path(job_id)
     from .sections import half_extent, trace_stack, XRAY_MAX
-    from stl_to_solid.section_fit import stack_offsets
+    from stl_to_solid.section_fit import stack_offsets, STACK_EDGE_MM
     from stl_to_solid.fusion_export import emit_fusion_xray_script
     try:
         h = await run_in_threadpool(half_extent, src, axis, units, scale)
@@ -389,19 +392,39 @@ async def xray_script(job_id: str, axis: str = 'z', frm: float = Query(0.0, alia
     except Exception as e:
         raise HTTPException(400, f'Could not trace the sections: {describe(e)}')
     n = len(secs)
+    exts = [None] * n
+    if extrude and n > 1:
+        # each slice to the next plane (the offsets ascend, so every slab
+        # goes towards +axis); the last one a full spacing, like the add-in,
+        # but never past the part's far face
+        far = secs[-1]['centre'] + secs[-1]['extent'] / 2.0 - STACK_EDGE_MM
+        for i in range(n - 1):
+            exts[i] = secs[i + 1]['at'] - secs[i]['at']
+        exts[-1] = max(0.0, min(step, far - secs[-1]['at']))
+        # the end plane is always cut, so the slice before it may be a
+        # hair away: draw that end plane but let the previous slab run
+        # through to where the end slab would have finished
+        if n > 2 and exts[-2] < 0.5 * step:
+            exts[-2] += exts[-1]
+            exts[-1] = None
+        if exts[-1] is not None and exts[-1] < 0.01:
+            exts[-1] = None                       # the end plane sits on the face
     sections = []
     for i, sec in enumerate(secs):
-        ext = None
-        if extrude and n > 1:
-            # to the next plane; the last slice goes one spacing further,
-            # like the add-in, so the stack ends flush with a full slab
-            ext = (secs[i + 1]['at'] - sec['at']) if i + 1 < n else step
         sections.append({'origin': sec['origin'], 'normal': sec['normal'],
                          'name': f"xray {axis.upper()}={sec['at']:.2f} mm ({i + 1}/{n})",
-                         'loops': sec['loops'], 'open': sec['open'], 'extrude_mm': ext})
+                         'loops': sec['loops'], 'open': sec['open'],
+                         'areas_mm2': sec.get('areas_mm2', []), 'extrude_mm': exts[i]})
+    notes = []
+    n_trim = sum(1 for s in secs if s['stats'].get('trimmed'))
+    if n_trim:
+        k = sum(s['stats']['trimmed'] for s in secs)
+        notes.append(f"{k} sliver{'s' if k != 1 else ''} trimmed in {n_trim} of {n} slices "
+                     f"(Trim slivers up to {trim:g} mm); if the part has real walls that thin, "
+                     "lower it")
     lo, hi = sorted((frm, to))
     title = f'X-Ray {axis.upper()} {lo:+.1f}..{hi:+.1f} mm every {step:g} mm'
-    text = emit_fusion_xray_script(sections, title=title)
+    text = emit_fusion_xray_script(sections, title=title, notes=notes)
     suffix = '_solid' if extrude and n > 1 else ''
     return _py_attachment(text, f'{_safe_stem(job)}_xray_{axis}{lo:+.1f}_{hi:+.1f}_s{step:g}{suffix}.py')
 

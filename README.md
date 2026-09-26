@@ -85,7 +85,12 @@ nothing. "Outline only" (`outline=true`) draws just the outer outline,
 leaving the open pieces and every inner loop out, for one clean profile
 to extrude; "Trim slivers up to"
 (`trim=`) cuts hairpins and thin twists narrower than that out of the
-loops, where the mesh has a double skin.
+loops, where the mesh has a double skin. A loop that is thin all over (a
+1.3 mm wall beside a cross hole with the trim at 1.5) is a feature and is
+left whole (0.4.7; it used to come back as a stub), and the panel warns
+when the mesh is watertight, since such a mesh has no double skin to
+trim. The X-Ray keeps its own gap and trim values, so a trim set for a
+leaky loft does not carry into the next part's X-Ray.
 
 **X-Ray (v0.4.5).** The X-Ray tool draws a whole stack of those sketches
 between two planes: pick the axis, a start plane, an end plane and a
@@ -103,9 +108,19 @@ loop with each sketch's compute deferred, behind a progress dialog with
 Cancel — the same approach as the private Fusion add-in — so a
 hundred-sketch stack opens in seconds. "Extrude each slice to the next"
 (`extrude=true`) also extrudes every sketch up to the next plane and joins
-it to the slab before it (a new body where nothing touches), giving a
-stepped solid that Fusion builds without fail where a Loft between two
-complex profiles folds over. One download fits at most 500 slices and
+it to the slabs before it (a new body where nothing touches, which the
+next slab then joins: Fusion does not fail a Join that meets nothing, it
+quietly makes a new body, and until 0.4.7 that body was never joined
+again, so one arm of a bracket came out as a stack of loose slabs),
+giving a stepped solid that Fusion builds without fail where a Loft
+between two complex profiles folds over. Only the material profiles are
+extruded: each section carries its loops' areas (outer minus holes) and
+the script skips the hole interiors Fusion also lists as profiles, so a
+hole along the axis stays open when its loop is drawn (Outline only
+leaves hole loops out and so fills them). The last slab is one spacing
+long but stops at the part's far face, and an end plane closer than half
+a spacing to the slice before it is drawn only, that slice's slab running
+through, so no hair-thin slab is made. One download fits at most 500 slices and
 spends at most 240 s fitting (`STLTOSOLID_XRAY_BUDGET`); the panel
 estimates the build time from the traces so far and suggests Outline
 only, which is about five times faster on organic sections (the fit is
