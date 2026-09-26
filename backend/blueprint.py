@@ -25,7 +25,7 @@ PRESETS = {
     'anthropic': {'label': 'Anthropic (Claude)', 'default_model': 'claude-opus-5', 'base_url': None,
                   'env': 'STLTOSOLID_ANTHROPIC_API_KEY', 'sdk': 'anthropic', 'needs_key': True,
                   'note': ''},
-    'openai': {'label': 'OpenAI', 'default_model': 'gpt-5', 'base_url': None,
+    'openai': {'label': 'OpenAI', 'default_model': 'gpt-5.5', 'base_url': None,
                'env': 'STLTOSOLID_OPENAI_API_KEY', 'sdk': 'openai', 'needs_key': True,
                'note': 'Model names change; edit the model if the API says it does not exist.'},
     'deepseek': {'label': 'DeepSeek', 'default_model': 'deepseek-chat', 'base_url': 'https://api.deepseek.com',
@@ -155,5 +155,10 @@ def list_models(provider, api_key, base_url=None, timeout=30.0):
             if not mid.startswith(_OPENAI_VISION_PREFIXES) or any(w in mid for w in _OPENAI_SKIP):
                 continue
         out.append({'id': mid, 'label': mid, 'created': int(getattr(m, 'created', 0) or 0)})
+    # a dated snapshot ("gpt-5.5-2026-04-23") next to its undated alias is noise
+    import re
+    ids = {m['id'] for m in out}
+    out = [m for m in out if not (re.search(r'-\d{4}-\d{2}-\d{2}$', m['id'])
+                                 and re.sub(r'-\d{4}-\d{2}-\d{2}$', '', m['id']) in ids)]
     out.sort(key=lambda x: (x['created'], x['id']), reverse=True)
     return out
