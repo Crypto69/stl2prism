@@ -2,6 +2,11 @@
 
 One directory per job under DATA_DIR:
     input.<stl|obj>  params.json  output.step  result.json  log.txt
+A Blueprint job holds a drawing instead of a mesh and two more files:
+    input.<jpg|png|webp>  recipe.json  read.json
+Statuses: created, uploaded, reading (Blueprint: the vision model is
+reading the drawing, no worker yet), queued, running, done, error,
+cancelled.
 """
 import json
 import logging
@@ -96,6 +101,8 @@ def _from_disk(job_id):
         entry['input'] = next(n for n in os.listdir(d) if n.startswith('input.'))
     except StopIteration:
         entry['input'] = None
+    if entry['input'] and entry['input'].rsplit('.', 1)[-1].lower() in ('jpg', 'jpeg', 'png', 'webp'):
+        entry['tool'] = 'blueprint'
     res = os.path.join(d, 'result.json')
     par = os.path.join(d, 'params.json')
     have_res, have_par = os.path.exists(res), os.path.exists(par)
@@ -130,8 +137,86 @@ def start(job_id, filename, params):
     with _lock:
         if job_id not in _jobs:
             _jobs[job_id] = {'id': job_id, 'created': time.time(), 'proc': None}
-        _jobs[job_id].update(status='queued', filename=filename)
+        # a fresh run: whatever an earlier run, cancel or read left behind
+        # must not hide this run's result
+        _jobs[job_id].update(status='queued', filename=filename, stale_result=False)
+        _jobs[job_id].pop('killed', None)
     threading.Thread(target=_run, args=(job_id,), daemon=True).start()
+
+
+def start_reading(job_id, filename, read_fn, then_params_fn):
+    """Blueprint: run `read_fn()` (the vision model, network only) in a
+    thread with the job in status 'reading'; on success write recipe.json
+    and read.json and queue the build with `then_params_fn(result)` as
+    params. A failure ends the job as 'error' with the sentence in
+    `killed`, which public_state reports like a killed worker; a cancel
+    that lands while the model is answering ends it as 'cancelled' (the
+    HTTP call itself cannot be aborted, so the flag is honoured after).
+    `read_fn` returns a dict with at least 'recipe'."""
+    d = job_dir(job_id)
+    os.makedirs(d, exist_ok=True)
+    with _lock:
+        if job_id not in _jobs:
+            _jobs[job_id] = {'id': job_id, 'created': time.time(), 'proc': None}
+        _jobs[job_id].update(status='reading', filename=filename, proc=None, stale_result=True)
+        _jobs[job_id].pop('killed', None)
+        _jobs[job_id].pop('cancelling', None)
+    try:
+        os.remove(os.path.join(d, 'result.json'))
+    except OSError:
+        pass
+    with open(os.path.join(d, 'log.txt'), 'w') as f:
+        f.write('reading the drawing…\n')
+
+    def go():
+        try:
+            res = read_fn()
+            recipe = res['recipe']
+            with open(os.path.join(d, 'recipe.json'), 'w') as f:
+                json.dump(recipe, f, indent=1)
+            meta = {k: v for k, v in res.items() if k != 'recipe'}
+            with open(os.path.join(d, 'read.json'), 'w') as f:
+                json.dump(meta, f, indent=1)
+            with open(os.path.join(d, 'log.txt'), 'a') as f:
+                u = meta.get('usage') or {}
+                f.write('read with %s: %s in / %s out tokens in %.1f s\n' % (
+                    meta.get('model'), u.get('input_tokens', '?'), u.get('output_tokens', '?'),
+                    meta.get('seconds') or 0.0))
+                for w in (meta.get('validation') or {}).get('warnings', []):
+                    f.write('warning: %s\n' % w)
+            with _lock:
+                job = _jobs.get(job_id)
+                if job is None:
+                    return
+                if job.pop('cancelling', False):
+                    job.update(status='cancelled', stale_result=True,
+                               killed={'signal': None, 'kind': 'cancelled', 'message': 'Reading cancelled.'})
+                    return
+            errors = (meta.get('validation') or {}).get('errors') or []
+            if errors:
+                # read, but not buildable as it stands: the UI shows the
+                # table (via /recipe) so the numbers can be fixed
+                n = len(errors)
+                with _lock:
+                    job = _jobs.get(job_id)
+                    if job is not None:
+                        job.update(status='error', stale_result=True, killed={
+                            'signal': None, 'kind': 'recipe', 'message':
+                            'The drawing was read, but %d check%s failed: %s. Fix the values in the '
+                            'table and rebuild.' % (n, 's' if n != 1 else '', '; '.join(errors[:3]))})
+                return
+            start(job_id, filename, then_params_fn(res))
+        except Exception as e:
+            log.warning('job %s: reading the drawing failed: %s', job_id, describe(e))
+            with _lock:
+                job = _jobs.get(job_id)
+                if job is None:
+                    return
+                job.pop('cancelling', None)
+                job.update(status='error', stale_result=True,
+                           killed={'signal': None, 'kind': 'read', 'message': describe(e)})
+
+    threading.Thread(target=go, daemon=True).start()
 
 
 _FROZEN = getattr(sys, 'frozen', False)
@@ -346,7 +431,7 @@ def public_state(job_id):
                     job = cur
     d = job_dir(job_id)
     out = {'id': job_id, 'status': job['status'],
-           'filename': job.get('filename')}
+           'filename': job.get('filename'), 'tool': job.get('tool')}
     try:
         with open(os.path.join(d, 'log.txt'), errors='replace') as f:
             out['log'] = f.read()
@@ -398,13 +483,15 @@ def cancel(job_id):
     if job is None:
         return 'unknown'
     with _lock:
-        if job['status'] not in ('queued', 'running'):
+        if job['status'] not in ('queued', 'running', 'reading'):
             return 'not_running'
         proc = job.get('proc')
         job['cancelling'] = True
         if proc is None:
-            # still waiting for its slot: _run_guarded sees the flag and
-            # ends the job as cancelled without starting a worker
+            # still waiting for its slot (_run_guarded sees the flag and
+            # ends the job as cancelled without starting a worker), or a
+            # Blueprint read in flight (start_reading honours the flag when
+            # the model answers)
             return 'cancelled'
     _kill_tree(proc, hard=False)
     try:
@@ -422,7 +509,8 @@ def running_summary():
     """{'running': n, 'jobs': [...]} for the jobs converting right now."""
     with _lock:
         live = [j for j in _jobs.values()
-                if j.get('proc') is not None and j['status'] in ('queued', 'running')]
+                if (j.get('proc') is not None and j['status'] in ('queued', 'running'))
+                or j['status'] == 'reading']
         return {'running': len(live),
                 'jobs': [{'id': j['id'], 'filename': j.get('filename'),
                           'status': j['status']} for j in live]}

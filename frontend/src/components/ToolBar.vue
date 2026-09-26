@@ -20,12 +20,16 @@ const TOOLS = [
     key: 'xray', label: 'X-Ray',
     title: 'X-Ray: a stack of section sketches between two planes, as a Fusion script. Like Create Mesh Section Sketch + Fit Curves, for every slice at once.',
   },
+  {
+    key: 'blueprint', label: 'Blueprint',
+    title: 'Blueprint: read a dimensioned drawing (front / top / side views) into named parameters and sketch + extrude features; edit the numbers, rebuild, download a parametric Fusion script and a STEP. The picture is sent to the vision provider you pick, with your key.',
+  },
 ]
 </script>
 
 <template>
   <nav class="tools" aria-label="Tool">
-    <button class="new" title="New project: start over with another mesh file" @click="emit('new')">
+    <button class="new" title="New project: start over with another mesh file or drawing" @click="emit('new')">
       <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M13 3H6a1 1 0 0 0-1 1v16a1 1 0 0 0 1 1h12a1 1 0 0 0 1-1V9z" /><path d="M13 3v6h6M12 12v6M9 15h6" /></svg>
       <span>New project</span>
     </button>
@@ -39,7 +43,8 @@ const TOOLS = [
     >
       <svg v-if="t.key === 'solid'" viewBox="0 0 24 24"><path d="M12 3l8 4.5v9L12 21l-8-4.5v-9L12 3z" /><path d="M12 12l8-4.5M12 12v9M12 12L4 7.5" /></svg>
       <svg v-else-if="t.key === 'loft'" viewBox="0 0 24 24"><path d="M5 6c3-2 11-2 14 0M5 6c-1 2 0 4 2 5M19 6c1 2 0 4-2 5M7 11c3 2 7 2 10 0M5 17c3-2 11-2 14 0M5 17c-1-2 0-4 2-6M19 17c1-2 0-4-2-6" /></svg>
-      <svg v-else viewBox="0 0 24 24"><rect x="4" y="3" width="16" height="18" rx="1.5" /><path d="M7 8h10M7 12h10M7 16h10" stroke-dasharray="2 1.6" /></svg>
+      <svg v-else-if="t.key === 'xray'" viewBox="0 0 24 24"><rect x="4" y="3" width="16" height="18" rx="1.5" /><path d="M7 8h10M7 12h10M7 16h10" stroke-dasharray="2 1.6" /></svg>
+      <svg v-else viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="16" rx="1.5" /><path d="M7 16V8h5a2.5 2.5 0 0 1 0 5H7M15 8v8" /><path d="M3 9h2M3 15h2M19 9h2M19 15h2" stroke-dasharray="1.5 1.5" /></svg>
       <span>{{ t.label }}</span>
     </button>
   </nav>

@@ -46,7 +46,7 @@ def compile_recipe(recipe, out_dir, title=None, stem='output'):
         'overall_check': {'expected': want, 'got': got, 'dev_pct': dev},
         'per_feature': b.per_feature,
         'has_fusion_script': True, 'has_step': True, 'preview': 'preview.stl',
-        'features': len(r['features']), 'params': len(r['params']),
+        'n_features': len(r['features']), 'n_params': len(r['params']),
     }
 
 
