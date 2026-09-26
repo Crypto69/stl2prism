@@ -10,8 +10,15 @@ import re
 
 from .expr import check_name, ExprError
 
-NUM = {'anyOf': [{'type': 'number'}, {'type': 'string'}]}
-NUM_OR_NULL = {'anyOf': [{'type': 'number'}, {'type': 'string'}, {'type': 'null'}]}
+# Every value is text: a number ("22.5") or an expression over the
+# parameters ("body_w/2"). Plain numbers are accepted by the evaluator as
+# well; the model is asked for strings because the structured-output
+# compilers cap the number of union-typed fields (Anthropic: 16) and a
+# recipe has more numeric fields than that.
+NUM = {'type': 'string',
+       'description': 'a length in mm as text: a number ("22.5") or an expression over the params ("body_w/2")'}
+NUM_OR_NULL = {'type': 'string',
+               'description': 'as NUM; "0" for none'}
 
 PLANES = ('XY', 'XZ', 'YZ')
 OPS = ('new_body', 'join', 'cut')

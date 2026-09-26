@@ -12,7 +12,7 @@ SYSTEM_PROMPT = """You turn a 2-D engineering drawing (a picture with front / to
 - Origin = the minimum corner of the MAIN BODY's bounding box. X = width (the front view's horizontal), Y = depth (the top view's vertical, the side view's horizontal), Z = height (up in the front and side views).
 - Front view -> plane "XZ"; top view -> plane "XY"; right-side view -> plane "YZ".
 - A feature's `plane` is the plane its shapes are drawn on; `offset` is where that plane sits along its positive normal (XY: the Z height; XZ: the Y depth; YZ: the X position). A boss on top of a 22.7 mm tall body is drawn on plane XY at offset body_h and extruded '+' by its height. A slot in the right face is drawn on plane YZ at offset body_w and cut in direction '-'.
-- Shape coordinates (u, v) are the plane's two world axes in alphabetical order: XY -> (x, y); XZ -> (x, z); YZ -> (y, z). Units mm. Any number may be an expression over params using only + - * / and parentheses; a literal added or subtracted must itself be a parameter (write "body_w/2", not "body_w - 3.2" unless 3.2 is a labelled parameter).
+- Shape coordinates (u, v) are the plane's two world axes in alphabetical order: XY -> (x, y); XZ -> (x, z); YZ -> (y, z). Units mm. Every number field is a string: a plain value ("22.5") or an expression over params using only + - * / and parentheses; a literal added or subtracted must itself be a parameter (write "body_w/2", not "body_w - 3.2" unless 3.2 is a labelled parameter).
 - `direction` '+' extrudes along the positive normal (XY: up +Z; XZ: +Y; YZ: +X), '-' the other way, 'symmetric' both ways by half. Parts on top of the body: '+'. Holes cut from a face: '-' into the material. A hole through the whole part: `through_all: true` (distance is then ignored, set it 0).
 
 ## Reading labels
@@ -38,14 +38,14 @@ SYSTEM_PROMPT = """You turn a 2-D engineering drawing (a picture with front / to
             {"name": "hole_d", "value": 4, "source": "top: DIA 4", "inferred": false},
             {"name": "hole_in", "value": 5, "source": "top: 5", "inferred": false}],
  "features": [
-  {"id": "plate", "name": "plate", "plane": "XY", "offset": 0,
-   "shapes": [{"kind": "rect", "center": {"u": "plate_w/2", "v": "plate_d/2"}, "w": "plate_w", "h": "plate_d", "corner_radius": null}],
+  {"id": "plate", "name": "plate", "plane": "XY", "offset": "0",
+   "shapes": [{"kind": "rect", "center": {"u": "plate_w/2", "v": "plate_d/2"}, "w": "plate_w", "h": "plate_d", "corner_radius": "0"}],
    "op": "new_body", "direction": "+", "distance": "plate_t", "through_all": false,
    "source": {"view": "top", "labels": ["40", "30", "5"], "inferred": false}, "confidence": 0.95},
   {"id": "holes", "name": "mounting holes", "plane": "XY", "offset": "plate_t",
    "shapes": [{"kind": "circle", "center": {"u": "hole_in", "v": "plate_d/2"}, "d": "hole_d"},
               {"kind": "circle", "center": {"u": "plate_w - hole_in", "v": "plate_d/2"}, "d": "hole_d"}],
-   "op": "cut", "direction": "-", "distance": 0, "through_all": true,
+   "op": "cut", "direction": "-", "distance": "0", "through_all": true,
    "source": {"view": "top", "labels": ["DIA 4", "5"], "inferred": false}, "confidence": 0.9}],
  "views_found": ["front", "top"], "notes": []}
 """

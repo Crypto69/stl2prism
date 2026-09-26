@@ -36,6 +36,20 @@ def test_schema_is_strict_everywhere():
             for i, v in enumerate(node):
                 walk(v, f'{path}[{i}]')
     walk(SCHEMA)
+    # Anthropic caps union-typed fields at 16 per schema
+    unions = sum(1 for _ in _walk_unions(SCHEMA))
+    assert unions <= 16, unions
+
+
+def _walk_unions(node):
+    if isinstance(node, dict):
+        if 'anyOf' in node or isinstance(node.get('type'), list):
+            yield node
+        for v in node.values():
+            yield from _walk_unions(v)
+    elif isinstance(node, list):
+        for v in node:
+            yield from _walk_unions(v)
 
 
 def test_fixture_validates_and_boxes_to_the_drawing(sg90):

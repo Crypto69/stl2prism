@@ -22,7 +22,9 @@ class ReadError(RuntimeError):
         self.kind = kind
 
 
-MAX_TOKENS = 16000
+# the model's thinking counts against this too, so it is generous; the
+# request streams so the HTTP connection is not held open for one answer
+MAX_TOKENS = 64000
 
 
 class Provider:
@@ -56,13 +58,15 @@ class AnthropicProvider(Provider):
                       messages=messages)
         try:
             try:
-                resp = client.messages.create(
-                    output_config={'effort': 'high',
-                                   'format': {'type': 'json_schema', 'schema': schema}},
-                    **kwargs)
+                with client.messages.stream(
+                        output_config={'effort': 'high',
+                                       'format': {'type': 'json_schema', 'schema': schema}},
+                        **kwargs) as stream:
+                    resp = stream.get_final_message()
             except TypeError:
                 # an older SDK without output_config: the prompt alone asks for JSON
-                resp = client.messages.create(**kwargs)
+                with client.messages.stream(**kwargs) as stream:
+                    resp = stream.get_final_message()
         except anthropic.AuthenticationError:
             raise ReadError('Anthropic refused the API key. Check the key in the Blueprint panel.', 'key')
         except anthropic.PermissionDeniedError as e:
@@ -78,10 +82,11 @@ class AnthropicProvider(Provider):
         stop = getattr(resp, 'stop_reason', None)
         if stop == 'refusal':
             raise ReadError('The model declined to read this image.', 'refusal')
-        if stop == 'max_tokens':
-            raise ReadError('The answer was cut off; try a drawing with fewer features.', 'truncated')
-        out = ''.join(b.text for b in resp.content if getattr(b, 'type', '') == 'text')
         u = getattr(resp, 'usage', None)
+        if stop == 'max_tokens':
+            raise ReadError('The answer was cut off after %s output tokens; try a drawing with fewer '
+                            'features.' % getattr(u, 'output_tokens', '?'), 'truncated')
+        out = ''.join(b.text for b in resp.content if getattr(b, 'type', '') == 'text')
         usage = {'input_tokens': getattr(u, 'input_tokens', None),
                  'output_tokens': getattr(u, 'output_tokens', None)}
         return out, usage, getattr(resp, 'model', self.model)
