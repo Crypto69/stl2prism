@@ -134,6 +134,71 @@ outlines the slice view shows. "Loft only N mm from this plane" (`--slice-from`,
 at the slider's plane, with flat ends; the check then measures only that
 stretch of the mesh.
 
+### Blueprint (v0.5)
+
+The fourth tool starts from a picture, not a mesh: drop or paste a
+dimensioned drawing (front / top / side views with their labels, like a
+servo's datasheet drawing) and get back a parametric Fusion 360 script,
+a STEP and a 3D preview. A vision model of your choice reads the labels
+into a small **recipe**: named parameters in mm (`body_w = 22.5`,
+`hole_d = 2.0`) and a short list of features, each one sketch plane (XY =
+top view, XZ = front, YZ = right side, at an offset along its normal),
+one or more shapes on it (rectangle, circle, slot, polygon) and one
+extrude (new body / join / cut, a distance or through-all). Numbers may be
+expressions over the parameters (`body_w/2`). Every number is shown in a
+table with where it came from; values the model had to deduce are marked.
+Fix a misread one and the view redraws within a second (a warm helper
+process keeps the geometry kernel loaded; the shape only, no files); press
+**Rebuild** for the STEP and the script, again without asking the model.
+The 3D view is coloured by feature, the same colours as the swatches in
+the feature list, and hovering a feature lights it up in the view, so
+which number moves what is plain to see.
+
+Before anything is built the recipe goes through deterministic checks:
+every expression resolves, shapes have size, the first feature is a body,
+a cut removes something, a join touches something, no shape is nested
+inside another in one sketch, and the built bounding box matches the
+drawing's overall size (an error beyond ±3 %, a warning beyond ±1.5 %,
+with a hint when two axes are off because a view was mapped to the wrong
+plane). A recipe that fails a check is sent back to the model once with
+the list; what still fails is shown in the table for you to fix.
+
+The same recipe is built twice from one source: CadQuery makes the STEP
+and the preview the web viewer shows, and the Fusion script
+(`output_fusion.py`, run from Scripts and Add-Ins in a new parametric
+design) makes **User Parameters** for every recipe parameter, one sketch
+per feature with driving dimensions bound to those parameters
+(`body_w / 2`), and an Extrude per feature. Change `body_h` in Modify →
+Change Parameters and the boss on top moves with it. The X-Ray script's
+plumbing is reused: data literals plus a fixed runtime, a progress
+dialog, profiles picked by their expected area so holes stay open.
+
+**Providers and keys.** The panel offers Anthropic (Claude, the default),
+OpenAI, DeepSeek and a *Custom* OpenAI-compatible URL (Ollama with a
+vision model keeps the drawing on your own machine; OpenRouter works
+too). Model names are editable. Your key is kept in the browser's local
+storage and sent with each read as a header; the server uses it for
+that one call and never writes it to disk or a log. With no key in the
+browser the server's own `STLTOSOLID_<PROVIDER>_API_KEY` is used when
+set — an opt-in for a private install, since anyone who can reach the
+app could spend it. DeepSeek's hosted API may not accept images; if it
+refuses, its own message is shown. The drawing is sent to the provider
+you pick and nowhere else.
+
+Routes: `POST /api/blueprints` (the image; .jpg, .png or .webp, up to
+`STLTOSOLID_MAX_IMAGE`), `GET /api/blueprints/config` (providers and
+whether the server holds a key for each), `POST
+/api/blueprints/{id}/read` (`{provider, model?, base_url?, hints?}` with
+the key in `X-Api-Key`; the job goes `reading` → `queued` → `running` →
+`done`), `POST /api/blueprints/{id}/build` (`{recipe}`, no model call; a
+400 lists what the checks refused), `GET /api/blueprints/{id}/recipe`
+and `/drawing`; then the usual `/api/jobs/{id}`, `/download`,
+`/fusion-script` and `/preview`; `POST /api/blueprints/{id}/preview`
+(`{recipe}`) is the live look (the mesh at `/live.stl`, one feature index
+per triangle in the answer) and `GET /api/blueprints/{id}/preview-map`
+the same colouring for the full build. Install the reader's dependencies with
+`pip install -e '.[blueprint]'` (the Docker image has them).
+
 ## Screenshots
 
 The web app: drop a mesh, inspect it, pick a tool, set the acceptance gate,
@@ -230,7 +295,8 @@ frame — see Roadmap). Bodies with more than 200 regions get no script;
 A browser UI for the same pipeline: drag a mesh in, inspect it in 3D, pick
 a tool in the top toolbar, set the tolerances, and download the result.
 The toolbar (v0.4.5) starts with **New project** (load another file) and
-then one button per tool; the panel on the right shows that tool's name
+then one button per tool (four since v0.5, Blueprint being the one that
+takes a picture); the panel on the right shows that tool's name
 as a cyan heading and only its controls, over the shared setup (which
 bodies to use, input units and scale, the mesh's stats).
 
@@ -243,6 +309,16 @@ bodies to use, input units and scale, the mesh's stats).
   drag through the part with its traced outline, gap joining, sliver
   trimming, outline-only, a partial loft from that plane, ruled or smooth.
   Convert gives the lofted STEP and the Fusion loft script.
+- **Blueprint.** Drop or paste a dimensioned drawing (the stage shows it,
+  with a *Drawing | 3D* switch once the part is built); pick the vision
+  model and paste your key (kept in this browser); optional notes for the
+  reader; **Read drawing** shows *Reading the drawing…* then *Building…*
+  (Cancel works in both); the parameters table and the feature list with
+  every number editable, inferred and low-confidence ones marked;
+  **Rebuild** after an edit; the size against the drawing's, the volume,
+  who read it and what it cost in tokens; downloads of the parametric
+  Fusion script and the STEP. Edits redraw the coloured shape live; the
+  feature list's swatches match the view and hovering a row lights it up.
 - **X-Ray.** Axis, start plane, end plane, spacing (or *Whole part*); the
   slice count and a time estimate; the slices traced one by one and left
   in the 3D view (a *stop* link halts the trace, *trace the rest* resumes
@@ -288,7 +364,13 @@ a shell may run in a worker before it is built faceted instead, default
 take before the best candidate so far is used, default 120; 0 means no
 limit), `STLTOSOLID_XRAY_BUDGET` (seconds one X-Ray script download may
 spend fitting its slices before it answers 400, default 240 — under a
-browser's 300 s response limit). The budgets are backstops: a shell that reaches one is scored on
+browser's 300 s response limit), `STLTOSOLID_ANTHROPIC_API_KEY` /
+`STLTOSOLID_OPENAI_API_KEY` / `STLTOSOLID_DEEPSEEK_API_KEY` (Blueprint's
+opt-in server-side keys), `STLTOSOLID_BLUEPRINT_TIMEOUT` (seconds one
+read of a drawing may take, default 300), `STLTOSOLID_MAX_IMAGE` (bytes,
+default 20 MB), `STLTOSOLID_PREVIEW_TIMEOUT` (seconds one live preview
+may take in the helper before it is killed and restarted, default 45).
+The budgets are backstops: a shell that reaches one is scored on
 what was done by then, so its result can depend on machine load. The CLI
 takes the first two as `--workers` and `--shell-timeout`. The same workers
 score a big single shell's axis candidates side by side and run the

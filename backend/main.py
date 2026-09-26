@@ -1,4 +1,6 @@
-"""FastAPI app: upload an STL or OBJ, convert it to STEP, report fidelity."""
+"""FastAPI app: upload an STL or OBJ, convert it to STEP, report fidelity;
+or upload a dimensioned drawing (Blueprint) and build it from its labels."""
+import json
 import logging
 import mimetypes
 import os
@@ -7,7 +9,7 @@ from typing import Optional, Literal
 
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, HTTPException, Query, Request, UploadFile
+from fastapi import FastAPI, Header, HTTPException, Query, Request, UploadFile
 from fastapi.concurrency import run_in_threadpool
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
@@ -18,6 +20,8 @@ from pydantic import BaseModel, Field
 from stl_to_solid.mesh_prep import SUPPORTED_EXTS
 
 from . import jobs
+from . import blueprint as bp
+from . import preview as bp_preview
 from .analysis import sanitize, mesh_stats, body_list
 from .errors import describe
 
@@ -25,12 +29,14 @@ log = logging.getLogger('stltosolid.api')
 
 _EXT_RE = re.compile(r'\.(' + '|'.join(e.lstrip('.') for e in SUPPORTED_EXTS)
                      + r')$', re.IGNORECASE)
+_IMG_RE = re.compile(r'\.(' + '|'.join(bp.IMAGE_EXTS) + r')$', re.IGNORECASE)
 
 @asynccontextmanager
 async def _lifespan(app):
     os.makedirs(jobs.DATA_DIR, exist_ok=True)
     jobs.cleanup_old()
     yield
+    bp_preview.helper.close()
 
 
 app = FastAPI(title='stlToSolid', lifespan=_lifespan)
@@ -265,7 +271,7 @@ def _check_slice_params(axis, tol, join, trim, step=None):
 
 
 def _safe_stem(job):
-    stem = _EXT_RE.sub('', job.get('filename') or 'part')
+    stem = _IMG_RE.sub('', _EXT_RE.sub('', job.get('filename') or 'part'))
     return re.sub(r'[^\w.-]+', '_', stem) or 'part'
 
 
@@ -427,6 +433,248 @@ async def xray_script(job_id: str, axis: str = 'z', frm: float = Query(0.0, alia
     text = emit_fusion_xray_script(sections, title=title, notes=notes)
     suffix = '_solid' if extrude and n > 1 else ''
     return _py_attachment(text, f'{_safe_stem(job)}_xray_{axis}{lo:+.1f}_{hi:+.1f}_s{step:g}{suffix}.py')
+
+
+# ---------------------------------------------------------------------------
+# Blueprint: a dimensioned drawing (image) -> recipe -> sketches + extrusions
+
+@app.get('/api/blueprints/config')
+def blueprint_config():
+    """The vision providers the panel can offer, with whether the server
+    holds a key for each (never the key itself)."""
+    return bp.config()
+
+
+@app.get('/api/blueprints/models')
+async def blueprint_models(provider: Literal['anthropic', 'openai', 'deepseek', 'custom'] = 'anthropic',
+                           base_url: Optional[str] = None,
+                           x_api_key: Optional[str] = Header(None, alias='X-Api-Key')):
+    """The models the given key can use with this provider, newest first,
+    for the panel's dropdown (Anthropic: only ones that take images). The
+    key travels in the header for this one call, as for /read."""
+    preset = bp.PRESETS[provider]
+    key = bp.resolve_key(provider, x_api_key)
+    if not key and preset['needs_key']:
+        raise HTTPException(400, bp.NO_KEY_MESSAGE.format(label=preset['label'], env=preset['env']))
+    if provider == 'custom' and not (base_url or '').strip():
+        raise HTTPException(400, 'The custom provider needs a base URL to list its models.')
+    missing = bp.sdk_available(provider)
+    if missing:
+        raise HTTPException(503, missing + '.')
+    try:
+        models = await run_in_threadpool(bp.list_models, provider, key or '', base_url)
+    except Exception as e:
+        raise HTTPException(400 if getattr(e, 'kind', '') == 'key' else 502,
+                            f'Could not list models: {describe(e)}')
+    return {'provider': provider, 'models': models, 'default': preset['default_model']}
+
+
+@app.post('/api/blueprints')
+async def create_blueprint(file: UploadFile):
+    """Upload a drawing image. Same job directory layout as a mesh upload,
+    so the polling, cancel and download routes serve it unchanged."""
+    m = _IMG_RE.search(file.filename or '')
+    if not m:
+        raise HTTPException(400, 'That is not a drawing image. Expected a .jpg, .png or .webp '
+                                 '(a mesh goes to Mesh → Solid, Sliced Loft or X-Ray).')
+    input_name = 'input.' + m.group(1).lower()
+    job_id, d = jobs.new_job()
+    try:
+        size = 0
+        with open(os.path.join(d, input_name), 'wb') as out:
+            while chunk := await file.read(1 << 20):
+                size += len(chunk)
+                if size > bp.MAX_IMAGE:
+                    raise HTTPException(
+                        413, f'The image is too large: the limit is {bp.MAX_IMAGE // (1 << 20)} MB.')
+                out.write(chunk)
+        if size == 0:
+            raise HTTPException(400, 'The file is empty.')
+        try:
+            w, h = await run_in_threadpool(bp.verify_image, os.path.join(d, input_name))
+        except Exception as e:
+            raise HTTPException(400, f'Could not read {file.filename or "the image"}: {describe(e)}')
+    except BaseException:
+        jobs.discard(job_id)
+        raise
+    with jobs._lock:
+        jobs._jobs[job_id].update(filename=file.filename, input=input_name,
+                                  status='uploaded', tool='blueprint')
+    return {'id': job_id, 'filename': file.filename, 'width': w, 'height': h}
+
+
+def _drawing_path(job_id):
+    job, src = _input_path(job_id)
+    if not _IMG_RE.search(src):
+        raise HTTPException(400, 'This job holds a mesh, not a drawing. Blueprint works on an '
+                                 'image (.jpg, .png or .webp).')
+    return job, src
+
+
+@app.api_route('/api/blueprints/{job_id}/drawing', methods=['GET', 'HEAD'])
+def blueprint_drawing(job_id: str):
+    _, src = _drawing_path(job_id)
+    return FileResponse(src, media_type=bp.IMAGE_MEDIA[src.rsplit('.', 1)[1].lower()])
+
+
+class ReadBody(BaseModel):
+    provider: Literal['anthropic', 'openai', 'deepseek', 'custom'] = 'anthropic'
+    model: Optional[str] = Field(None, max_length=200)
+    base_url: Optional[str] = Field(None, max_length=500)
+    hints: str = Field('', max_length=2000, description='notes for the reader, e.g. which view is which')
+    effort: Literal['low', 'medium', 'high'] = 'high'
+
+
+@app.post('/api/blueprints/{job_id}/read')
+def blueprint_read(job_id: str, body: ReadBody,
+                   x_api_key: Optional[str] = Header(None, alias='X-Api-Key')):
+    """Read the drawing with a vision model, then build. The key comes in
+    the header for this one call (the browser keeps it); with none, the
+    server's own key for the provider is used when set."""
+    job, src = _drawing_path(job_id)
+    if job['status'] in ('reading', 'queued', 'running'):
+        raise HTTPException(409, 'This drawing is already being read or built; wait or cancel first.')
+    preset = bp.PRESETS[body.provider]
+    key = bp.resolve_key(body.provider, x_api_key)
+    if not key and preset['needs_key']:
+        raise HTTPException(400, bp.NO_KEY_MESSAGE.format(label=preset['label'], env=preset['env']))
+    model = (body.model or '').strip() or preset['default_model']
+    base_url = (body.base_url or '').strip() or preset['base_url'] or None
+    if body.provider == 'custom' and not (model and base_url):
+        raise HTTPException(400, 'The custom provider needs both a base URL and a model name.')
+    missing = bp.sdk_available(body.provider)
+    if missing:
+        raise HTTPException(503, missing + '.')
+    jobs.cleanup_old()
+    from stl_to_solid.blueprint.read_drawing import read_drawing
+    with open(src, 'rb') as f:
+        image = f.read()
+    stem = _safe_stem(job)
+    hints = body.hints
+    effort = body.effort
+
+    def read_fn():
+        return read_drawing(image, body.provider, key or '', model=model, base_url=base_url,
+                            hints=hints, timeout=bp.READ_TIMEOUT_S, effort=effort)
+
+    def then_params(res):
+        return {'tool': 'blueprint', 'recipe': res['recipe'], 'title': stem,
+                'read': {k: v for k, v in res.items() if k not in ('recipe', 'raw_text')}}
+
+    try:
+        jobs.start_reading(job_id, job.get('filename'), read_fn, then_params)
+    except OSError as e:
+        raise HTTPException(500, f'Could not start reading: {describe(e)}')
+    return {'id': job_id, 'status': 'reading', 'provider': body.provider, 'model': model}
+
+
+class BuildBody(BaseModel):
+    recipe: dict
+
+
+@app.post('/api/blueprints/{job_id}/build')
+def blueprint_build(job_id: str, body: BuildBody):
+    """Build an edited recipe: no model call, the validator first (a
+    refused recipe is a 400 listing what is wrong), then the worker."""
+    from stl_to_solid.blueprint import normalize, validate
+    job, _ = _drawing_path(job_id)
+    if job['status'] in ('reading', 'queued', 'running'):
+        raise HTTPException(409, 'This drawing is still being read or built; wait or cancel first.')
+    recipe = normalize(body.recipe)
+    rep = validate(recipe)
+    if rep.errors:
+        n = len(rep.errors)
+        raise HTTPException(400, f'The recipe is not valid ({n} problem{"s" if n != 1 else ""}): '
+                                 + '; '.join(rep.errors[:5]) + ('; …' if n > 5 else ''))
+    d = jobs.job_dir(job_id)
+    read_meta = None
+    try:
+        with open(os.path.join(d, 'read.json')) as f:
+            read_meta = json.load(f)
+    except (OSError, ValueError):
+        pass
+    jobs.cleanup_old()
+    try:
+        jobs.start(job_id, job.get('filename'),
+                   {'tool': 'blueprint', 'recipe': recipe, 'title': _safe_stem(job), 'read': read_meta})
+    except OSError as e:
+        raise HTTPException(500, f'Could not start the build: {describe(e)}')
+    return {'id': job_id, 'status': 'running', 'warnings': rep.warnings}
+
+
+@app.post('/api/blueprints/{job_id}/preview')
+async def blueprint_preview(job_id: str, body: BuildBody):
+    """A live look at an edited recipe: the shape only, built by the warm
+    preview helper (no STEP, no script, the job's result untouched). Answers
+    with the size, volume and warnings, the per-triangle feature index for
+    colouring, and the mesh itself (binary STL, base64) so mesh and map
+    always belong to the same build."""
+    from stl_to_solid.blueprint import normalize, validate
+    job, _ = _drawing_path(job_id)
+    recipe = normalize(body.recipe)
+    rep = validate(recipe)
+    if rep.errors:
+        n = len(rep.errors)
+        raise HTTPException(400, f'The recipe is not valid ({n} problem{"s" if n != 1 else ""}): '
+                                 + '; '.join(rep.errors[:5]) + ('; …' if n > 5 else ''))
+    d = jobs.job_dir(job_id)
+    try:
+        ans = await run_in_threadpool(bp_preview.helper.build, recipe, d, 'live')
+    except bp_preview.PreviewError as e:
+        raise HTTPException(400 if e.kind == 'recipe' else 500, str(e))
+    import base64
+    ans['stl_b64'] = base64.b64encode(ans.pop('stl_bytes', b'')).decode('ascii')
+    ans['recipe'] = recipe
+    return sanitize(ans)
+
+
+@app.api_route('/api/blueprints/{job_id}/live.stl', methods=['GET', 'HEAD'])
+def blueprint_live_stl(job_id: str):
+    _drawing_path(job_id)
+    path = os.path.join(jobs.job_dir(job_id), 'live.stl')
+    if not os.path.exists(path):
+        raise HTTPException(404, 'No live preview has been built for this drawing yet.')
+    return FileResponse(path, media_type='model/stl',
+                        headers={'Cache-Control': 'no-store'})
+
+
+@app.get('/api/blueprints/{job_id}/preview-map')
+def blueprint_preview_map(job_id: str):
+    """Which feature made each triangle of the built preview (preview.stl),
+    for colouring the view by feature after a full build."""
+    _drawing_path(job_id)
+    path = os.path.join(jobs.job_dir(job_id), 'preview_features.json')
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except OSError:
+        raise HTTPException(404, 'This drawing has not been built yet.')
+    except ValueError:
+        raise HTTPException(500, 'The feature map could not be read; rebuild.')
+
+
+@app.get('/api/blueprints/{job_id}/recipe')
+def blueprint_recipe(job_id: str):
+    """The last recipe read or built for this drawing (recipe.json) with
+    the read's metadata, so the table can show a recipe whose build was
+    refused or is still running."""
+    _drawing_path(job_id)
+    d = jobs.job_dir(job_id)
+    try:
+        with open(os.path.join(d, 'recipe.json')) as f:
+            recipe = json.load(f)
+    except OSError:
+        raise HTTPException(404, 'This drawing has not been read yet.')
+    except ValueError:
+        raise HTTPException(500, 'The saved recipe could not be read; read the drawing again.')
+    meta = {}
+    try:
+        with open(os.path.join(d, 'read.json')) as f:
+            meta = json.load(f)
+    except (OSError, ValueError):
+        pass
+    meta.pop('raw_text', None)
+    return {'id': job_id, 'recipe': recipe, 'read': meta}
 
 
 # The file routes also answer HEAD (FastAPI does not add it on its own):

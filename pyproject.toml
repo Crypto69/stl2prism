@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "stltosolid"
-version = "0.4.7"
+version = "0.5.0"
 description = "Convert STL/OBJ meshes into prismatic STEP solids via extrusion-structure recognition, with a faceted-BREP fallback"
 readme = "README.md"
 license = "PolyForm-Noncommercial-1.0.0"
@@ -24,6 +24,8 @@ dependencies = [
 
 [project.optional-dependencies]
 scan = ["pymeshlab"]
+# Blueprint: reading a drawing with a vision model (the web app's 4th tool)
+blueprint = ["anthropic>=1", "openai>=1", "pillow"]
 
 [project.scripts]
 stltosolid = "stl_to_solid.pipeline:main"

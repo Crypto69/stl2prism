@@ -24,7 +24,7 @@ WORKDIR /app
 # deliberately, then rebuild.
 COPY pyproject.toml README.md LICENSE constraints.txt ./
 COPY stl_to_solid/ stl_to_solid/
-RUN pip install --no-cache-dir --timeout 300 --retries 10 -c constraints.txt '.[scan]' fastapi 'uvicorn[standard]' python-multipart
+RUN pip install --no-cache-dir --timeout 300 --retries 10 -c constraints.txt '.[scan,blueprint]' fastapi 'uvicorn[standard]' python-multipart
 COPY backend/ backend/
 COPY --from=webbuild /build/dist frontend/dist
 

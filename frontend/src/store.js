@@ -1,4 +1,5 @@
 import { defineStore } from 'pinia'
+import { markRaw } from 'vue'
 import { errText, friendlyError } from './errors'
 
 // STL/OBJ files carry no units. `units` says what the file's numbers mean;
@@ -44,10 +45,29 @@ export const DEFAULT_PARAMS = {
 
 // the most sketches one x-ray script may hold (backend/sections.XRAY_MAX)
 export const XRAY_MAX = 500
+// drawing images the Blueprint tool reads (backend/blueprint.IMAGE_EXTS)
+export const IMAGE_EXTS = ['jpg', 'jpeg', 'png', 'webp']
+// the Blueprint keys and choices live in this browser only
+const BP_STORE = 'stltosolid.blueprint'
+
+function loadBp() {
+  try {
+    return JSON.parse(localStorage.getItem(BP_STORE) || '{}') || {}
+  } catch {
+    return {}
+  }
+}
+function saveBp(patch) {
+  try {
+    localStorage.setItem(BP_STORE, JSON.stringify({ ...loadBp(), ...patch }))
+  } catch { /* private window or storage off: the choice lasts the session */ }
+}
+const bpSaved = loadBp()
 // planes are kept this far inside the part's ends (section_fit.STACK_EDGE_MM)
 const XRAY_EDGE = 1e-3
 
 let pollTimer = null
+let liveSeq = 0
 let traceSeq = 0
 let axisSeq = 0
 let xraySeq = 0
@@ -126,10 +146,58 @@ export const useConvertStore = defineStore('convert', {
     // units, scale, mm}); bbox_mm is rounded to 0.01 mm, and a plane clamped
     // with the rounded half can land just outside the part and cut nothing
     exactExtent: null,
+    // Blueprint: the uploaded drawing (served back by /drawing), its pixel
+    // size, the providers the server offers (/blueprints/config), the
+    // provider, model, URL and per-provider keys this browser keeps, and
+    // the last read's recipe plus the build's report (mirrors result.*
+    // so the panel binds to one place)
+    imageUrl: null,
+    imageSize: null,
+    blueprintConfig: null,
+    provider: bpSaved.provider || 'anthropic',
+    providerModel: bpSaved.providerModel || {},     // { provider: model }
+    providerBaseUrl: bpSaved.providerBaseUrl || '',
+    apiKeys: bpSaved.apiKeys || {},                 // { provider: key }
+    hints: '',
+    // how hard the model thinks on a read: 'low' | 'medium' | 'high'
+    effort: bpSaved.effort || 'high',
+    // model lists fetched from each provider with the user's key: { provider: [{id,label}] },
+    // with the last failure's sentence and a busy flag
+    models: {},
+    modelsBusy: false,
+    modelsError: null,
+    recipe: null,
+    recipeRead: null,        // { model, provider, usage, seconds, repaired }
+    warnings: [],
+    bbox: null,
+    volume: null,
+    overallCheck: null,
+    // the coloured view: the feature list of the shape on the stage and
+    // one feature index per triangle of its mesh (from the full build's
+    // preview_features.json or a live preview), plus the live preview's
+    // mesh itself ({ data, kind, seq }) and its state
+    featureList: [],
+    featureMap: null,
+    liveStl: null,
+    liveBusy: false,
+    liveError: null,
+    liveInfo: null,          // { bbox, volume_mm3, solids, warnings, overall_check } of the live shape
   }),
 
   getters: {
     busy: (s) => s.status === 'uploading' || s.status === 'running',
+    // Blueprint
+    isImageJob: (s) => !!s.imageUrl,
+    // what the panel's button says while the job runs
+    readStatus: (s) => (s.status !== 'running' ? null : s.serverStatus === 'reading' ? 'reading' : 'building'),
+    providerPreset: (s) => (s.blueprintConfig?.providers || []).find((p) => p.key === s.provider) || null,
+    hasServerKey: (s) => !!s.providerPreset?.server_key,
+    apiKey: (s) => s.apiKeys[s.provider] || '',
+    modelName: (s) => (s.providerModel[s.provider] ?? s.providerPreset?.default_model ?? ''),
+    canRead: (s) =>
+      !!s.jobId && !!s.imageUrl && !s.busy && s.status !== 'uploading'
+      && (!!s.apiKey || s.hasServerKey || s.providerPreset?.needs_key === false)
+      && (s.provider !== 'custom' || (!!s.providerBaseUrl && !!s.modelName)),
     // A file with one body needs no picker at all.
     hasBodyPicker: (s) => s.bodies.length > 1,
     selectedCount: (s) => (s.selected.length || s.bodies.length),
@@ -278,6 +346,9 @@ export const useConvertStore = defineStore('convert', {
         status: 'uploading', jobId: null, inputStats: null,
         log: '', result: null, error: null, filename: file.name,
         loftAxisAuto: null, loftAxisScores: null,
+        imageUrl: null, imageSize: null, recipe: null, recipeRead: null, warnings: [],
+        bbox: null, volume: null, overallCheck: null,
+        featureList: [], featureMap: null, liveStl: null, liveBusy: false, liveError: null, liveInfo: null,
       })
       try {
         const body = new FormData()
@@ -397,9 +468,22 @@ export const useConvertStore = defineStore('convert', {
           if (job !== this.jobId) return
           this.log = s.log || ''
           this.serverStatus = s.status
+          if (s.status === 'uploaded' && this.isImageJob) {
+            // the server restarted while the drawing was being read: the
+            // registry only knows the upload again
+            this.stopPolling()
+            this.$patch({ status: 'error',
+                          error: 'The server restarted while the drawing was being read. Read it again.' })
+            return
+          }
           if (s.status === 'done' || s.status === 'error' || s.status === 'cancelled') {
             this.stopPolling()
             this.result = s.result
+            if (s.result?.mode === 'blueprint' && s.result?.ok) this.takeBlueprintResult(s.result)
+            if (s.status === 'error' && s.result?.failure === 'recipe' && this.isImageJob) {
+              // read, but a check failed: show the table so the numbers can be fixed
+              this.fetchRecipe()
+            }
             if (s.status === 'done' && s.result?.ok) {
               this.status = 'done'
             } else if (s.status === 'cancelled') {
@@ -422,9 +506,9 @@ export const useConvertStore = defineStore('convert', {
           this.$patch({
             status: 'error',
             error: e.fatal ? friendlyError(e)
-              : `Lost contact with the server while converting: ${friendlyError(e)} `
-                + 'The conversion may still be running on the server; once it answers again, '
-                + 'convert again or load the file again to start over.',
+              : `Lost contact with the server while working: ${friendlyError(e)} `
+                + 'The job may still be running on the server; once it answers again, '
+                + 'run it again or load the file again to start over.',
           })
         } finally {
           inFlight = false
@@ -543,6 +627,221 @@ export const useConvertStore = defineStore('convert', {
         if (mine === xraySeq) this.xrayError = friendlyError(e)
       } finally {
         if (mine === xraySeq) this.xrayBusy = false
+      }
+    },
+
+    // ---- Blueprint ---------------------------------------------------------
+
+    async loadBlueprintConfig() {
+      try {
+        const res = await fetch('/api/blueprints/config')
+        if (res.ok) this.blueprintConfig = await res.json()
+      } catch { /* the panel says it could not ask */ }
+    },
+
+    setProvider(p) {
+      this.provider = p
+      saveBp({ provider: p })
+    },
+    setKey(k) {
+      const keys = { ...this.apiKeys }
+      const v = (k || '').trim()
+      if (v) keys[this.provider] = v
+      else delete keys[this.provider]
+      this.apiKeys = keys
+      saveBp({ apiKeys: keys })
+      const fresh = { ...this.models }
+      delete fresh[this.provider]
+      this.models = fresh
+    },
+
+    // GET /models with the browser's key: the dropdown's contents. Any
+    // failure leaves the typed model name in charge.
+    async fetchModels(force = false) {
+      const p = this.provider
+      if (!force && this.models[p]) return
+      const preset = this.providerPreset
+      if (!preset) return
+      if (!this.apiKey && !this.hasServerKey && preset.needs_key !== false) return
+      if (p === 'custom' && !this.providerBaseUrl) return
+      this.modelsBusy = true
+      this.modelsError = null
+      try {
+        const headers = this.apiKey ? { 'X-Api-Key': this.apiKey } : {}
+        const q = new URLSearchParams({ provider: p })
+        if (p === 'custom') q.set('base_url', this.providerBaseUrl)
+        const res = await fetch(`/api/blueprints/models?${q}`, { headers })
+        if (!res.ok) throw new Error(await errText(res))
+        const d = await res.json()
+        if (p !== this.provider) return
+        this.models = { ...this.models, [p]: d.models || [] }
+      } catch (e) {
+        if (p === this.provider) this.modelsError = friendlyError(e)
+      } finally {
+        if (p === this.provider) this.modelsBusy = false
+      }
+    },
+    setModel(m) {
+      const models = { ...this.providerModel, [this.provider]: (m || '').trim() }
+      if (!models[this.provider]) delete models[this.provider]
+      this.providerModel = models
+      saveBp({ providerModel: models })
+    },
+    setEffort(e) {
+      this.effort = ['low', 'medium', 'high'].includes(e) ? e : 'high'
+      saveBp({ effort: this.effort })
+    },
+    setBaseUrl(u) {
+      this.providerBaseUrl = (u || '').trim()
+      saveBp({ providerBaseUrl: this.providerBaseUrl })
+    },
+
+    // POST /api/blueprints: a drawing, not a mesh. Same reset as upload()
+    // plus the Blueprint fields; the mesh state is cleared so the rail has
+    // nothing stale.
+    async uploadImage(file) {
+      this.stopPolling()
+      this.$patch({
+        status: 'uploading', jobId: null, inputStats: null, log: '', result: null, error: null,
+        cancelled: false, filename: file.name, imageUrl: null, imageSize: null,
+        recipe: null, recipeRead: null, warnings: [], bbox: null, volume: null, overallCheck: null,
+        featureList: [], featureMap: null, liveStl: null, liveBusy: false, liveError: null, liveInfo: null,
+        bodies: [], triangleBody: null, selected: [], hovered: -1, bodiesError: null,
+        section: null, xrayTraces: [], xrayTotal: 0, loftAxisAuto: null, loftAxisScores: null,
+      })
+      liveSeq++
+      try {
+        const body = new FormData()
+        body.append('file', file)
+        const res = await fetch('/api/blueprints', { method: 'POST', body })
+        if (!res.ok) throw new Error(await errText(res))
+        const d = await res.json()
+        if (!d?.id) throw new Error('the server sent no job id back')
+        this.$patch({ status: 'ready', jobId: d.id, imageUrl: `/api/blueprints/${d.id}/drawing`,
+                      imageSize: { width: d.width, height: d.height } })
+        if (!this.blueprintConfig) this.loadBlueprintConfig()
+      } catch (e) {
+        this.$patch({ status: 'error', error: `Upload failed: ${friendlyError(e)}` })
+      }
+    },
+
+    // POST /read with the browser's key as a header (never in the URL or body)
+    async readDrawing() {
+      if (!this.canRead) return
+      this.$patch({ status: 'running', serverStatus: 'reading', log: '', result: null, error: null,
+                    cancelled: false, warnings: [], bbox: null, volume: null, overallCheck: null })
+      try {
+        const headers = { 'Content-Type': 'application/json' }
+        if (this.apiKey) headers['X-Api-Key'] = this.apiKey
+        const res = await fetch(`/api/blueprints/${this.jobId}/read`, {
+          method: 'POST', headers,
+          body: JSON.stringify({
+            provider: this.provider, model: this.modelName || null,
+            base_url: this.provider === 'custom' ? this.providerBaseUrl : null,
+            hints: this.hints || '',
+            effort: this.effort,
+          }),
+        })
+        if (!res.ok) throw new Error(await errText(res))
+        this.startPolling()
+      } catch (e) {
+        this.$patch({ status: 'ready', error: `Could not start reading: ${friendlyError(e)}` })
+      }
+    },
+
+    // POST /build with an edited recipe: validated, then built; no model call
+    async rebuild(recipe) {
+      if (!this.jobId || this.busy) return
+      const before = this.status
+      this.$patch({ status: 'running', serverStatus: 'queued', log: '', result: null, error: null,
+                    cancelled: false })
+      try {
+        const res = await fetch(`/api/blueprints/${this.jobId}/build`, {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ recipe }),
+        })
+        if (!res.ok) throw new Error(await errText(res))
+        this.startPolling()
+      } catch (e) {
+        // a refused recipe (the validator's list): keep the draft, say why
+        this.$patch({ status: before === 'running' ? 'ready' : before,
+                      error: `Rebuild refused: ${friendlyError(e)}` })
+      }
+    },
+
+    async fetchRecipe() {
+      if (!this.jobId) return
+      const job = this.jobId
+      try {
+        const res = await fetch(`/api/blueprints/${job}/recipe`)
+        if (!res.ok) return
+        const d = await res.json()
+        if (job !== this.jobId) return
+        this.recipe = d.recipe
+        this.recipeRead = d.read || null
+        this.warnings = [...(d.read?.validation?.errors || []), ...(d.read?.validation?.warnings || [])]
+      } catch { /* the table stays as it was */ }
+    },
+
+    takeBlueprintResult(r) {
+      const rd = r.params?.read || null
+      this.$patch({
+        recipe: r.recipe, recipeRead: rd,
+        warnings: [...(rd?.validation?.warnings || []), ...(r.warnings || [])],
+        bbox: r.bbox, volume: r.volume_mm3, overallCheck: r.overall_check || null,
+        liveStl: null, liveInfo: null, liveError: null,
+      })
+      liveSeq++
+      this.fetchFeatureMap()
+    },
+
+    // the full build's colouring (which feature made each triangle of preview.stl)
+    async fetchFeatureMap() {
+      if (!this.jobId) return
+      const job = this.jobId
+      try {
+        const res = await fetch(`/api/blueprints/${job}/preview-map?t=${Date.now()}`)
+        if (!res.ok) return
+        const d = await res.json()
+        if (job !== this.jobId) return
+        this.$patch({ featureList: d.features || [], featureMap: d.triangle_feature || null,
+                      selected: (d.features || []).map((_, i) => i) })
+      } catch { /* the view stays grey */ }
+    },
+
+    // A live look at the draft: the warm helper builds the shape (well
+    // under a second) and the view shows it coloured by feature. Debounced
+    // by the panel; a stale answer is dropped.
+    async previewLive(recipe) {
+      if (!this.jobId || !this.isImageJob) return
+      const mine = ++liveSeq
+      const job = this.jobId
+      this.$patch({ liveBusy: true, liveError: null })
+      try {
+        const res = await fetch(`/api/blueprints/${job}/preview`, {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ recipe }),
+        })
+        if (!res.ok) throw new Error(await errText(res))
+        const d = await res.json()
+        if (mine !== liveSeq || job !== this.jobId) return
+        // the mesh comes inside the answer, so it always matches the map
+        const bin = atob(d.stl_b64 || '')
+        const data = new ArrayBuffer(bin.length)
+        const view = new Uint8Array(data)
+        for (let i = 0; i < bin.length; i++) view[i] = bin.charCodeAt(i)
+        if (!bin.length) throw new Error('the server sent an empty preview mesh')
+        this.$patch({
+          liveStl: markRaw({ data, kind: 'stl', seq: mine }),
+          featureList: d.features || [], featureMap: d.triangle_feature || null,
+          selected: (d.features || []).map((_, i) => i),
+          liveInfo: { bbox: d.bbox, volume_mm3: d.volume_mm3, solids: d.solids,
+                      warnings: d.warnings || [], overall_check: d.overall_check || null },
+        })
+      } catch (e) {
+        if (mine === liveSeq) this.liveError = friendlyError(e)
+      } finally {
+        if (mine === liveSeq) this.liveBusy = false
       }
     },
 

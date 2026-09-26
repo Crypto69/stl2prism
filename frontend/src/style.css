@@ -57,6 +57,8 @@ button.info:not(:disabled):active {
 }
 
 input[type='number'],
+input[type='text'],
+input[type='password'],
 select {
   font-family: var(--font-data);
   background: var(--ink);
@@ -70,6 +72,9 @@ select {
 select { width: auto; max-width: 170px; }
 
 input[type='number']:focus-visible,
+input[type='text']:focus-visible,
+input[type='password']:focus-visible,
+textarea:focus-visible,
 select:focus-visible,
 button:focus-visible,
 input[type='checkbox']:focus-visible,
@@ -185,3 +190,27 @@ summary:focus-visible {
 .params .dl:hover { background: var(--panel-2); }
 .params .dl.off { border-color: var(--line); color: var(--muted); cursor: default; }
 .params .dl.off:hover { background: none; }
+.params .dl:disabled { border-color: var(--line); color: var(--muted); cursor: default; background: none; }
+/* a button that visibly presses: it sinks and fills on the click, then
+   turns into the working state */
+.params .press {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  transition: transform 0.08s ease, background 0.12s ease, box-shadow 0.12s ease;
+}
+.params .press:not(:disabled):hover { box-shadow: 0 0 0 1px var(--edge) inset; }
+.params .press:not(:disabled):active {
+  transform: scale(0.96);
+  background: rgba(90, 210, 234, 0.22);
+}
+.params .press.busy {
+  cursor: progress;
+  background: rgba(90, 210, 234, 0.12);
+  animation: pulse 1.2s ease-in-out infinite;
+}
+@keyframes pulse {
+  0%, 100% { box-shadow: 0 0 0 0 rgba(90, 210, 234, 0); }
+  50% { box-shadow: 0 0 0 3px rgba(90, 210, 234, 0.25); }
+}

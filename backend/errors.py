@@ -10,6 +10,9 @@ import errno
 
 def describe(exc):
     """A short, user-readable description of `exc`."""
+    # an exception written as a sentence for the user (Blueprint's) is kept as is
+    if getattr(exc, 'readable', False) and str(exc).strip():
+        return str(exc).strip()
     if isinstance(exc, MemoryError):
         return ('the computer ran out of memory. Convert fewer bodies at once, '
                 'close other programs, or use a coarser tolerance')

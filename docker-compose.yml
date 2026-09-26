@@ -35,6 +35,17 @@ services:
       # seconds an X-Ray script download may spend fitting its slices
       # before it gives up (default 240; under a browser's 300 s limit)
       # STLTOSOLID_XRAY_BUDGET: "240"
+      # Blueprint (drawing -> solid). Users paste their own vision-model key
+      # in the panel (kept in their browser, sent per request, never stored
+      # here). A server-side key is an opt-in fallback for a private
+      # install: on a shared LAN anyone who can reach the app could spend it.
+      # STLTOSOLID_ANTHROPIC_API_KEY: "sk-ant-…"
+      # STLTOSOLID_OPENAI_API_KEY: "sk-…"
+      # STLTOSOLID_DEEPSEEK_API_KEY: "…"
+      # seconds one read of a drawing may take (default 300)
+      # STLTOSOLID_BLUEPRINT_TIMEOUT: "300"
+      # largest drawing image accepted, bytes (default 20 MB)
+      # STLTOSOLID_MAX_IMAGE: "20971520"
     # keep a runaway conversion from starving the NAS's other services
     mem_limit: 12g
     restart: unless-stopped

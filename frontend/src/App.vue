@@ -1,5 +1,5 @@
 <script setup>
-import { computed, markRaw, onMounted, ref, shallowRef } from 'vue'
+import { computed, markRaw, onBeforeUnmount, onMounted, ref, shallowRef, watch } from 'vue'
 import MeshViewer from './components/MeshViewer.vue'
 import BodyPicker from './components/BodyPicker.vue'
 import ToolBar from './components/ToolBar.vue'
@@ -7,8 +7,9 @@ import SetupPanel from './components/SetupPanel.vue'
 import SolidPanel from './components/SolidPanel.vue'
 import LoftPanel from './components/LoftPanel.vue'
 import XRayPanel from './components/XRayPanel.vue'
+import BlueprintPanel from './components/BlueprintPanel.vue'
 import ReportPanel from './components/ReportPanel.vue'
-import { useConvertStore } from './store'
+import { useConvertStore, IMAGE_EXTS } from './store'
 import { appError, clearAppError, friendlyError } from './errors'
 
 const store = useConvertStore()
@@ -16,7 +17,12 @@ const buffer = shallowRef(null)
 const dragOver = ref(false)
 const fileInput = ref(null)
 
-const ACCEPT = ['stl', 'obj', 'ply', 'off', '3mf', 'glb', 'gltf']
+const MESH_ACCEPT = ['stl', 'obj', 'ply', 'off', '3mf', 'glb', 'gltf']
+// a drawing image goes to Blueprint, a mesh to the other tools
+const ACCEPT = [...MESH_ACCEPT, ...IMAGE_EXTS]
+const ACCEPT_ATTR = ACCEPT.map((e) => '.' + e).join(',')
+// Blueprint's stage: the drawing itself, or the 3D preview of the build
+const stageView = ref('drawing')
 // a file is being read (the browser parses STL/OBJ itself; other formats
 // wait for the server's preview): the drop zone says so meanwhile
 const loading = ref(false)
@@ -26,10 +32,55 @@ const loadingName = ref('')
 // /api/version, so a tester can match the browser to a commit at a glance.
 const build = ref(null)
 onMounted(async () => {
+  window.addEventListener('paste', onPaste)
   try {
     const res = await fetch('/api/version')
     if (res.ok) build.value = await res.json()
   } catch (e) { /* badge is optional */ }
+})
+onBeforeUnmount(() => window.removeEventListener('paste', onPaste))
+
+// Cmd/Ctrl+V with a picture on the clipboard loads it as a drawing (not
+// when pasting into a text field). Clipboard images arrive as "image.png"
+// with no extension we route on, so they get a name.
+function onPaste(e) {
+  const t = e.target
+  if (t && (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA' || t.isContentEditable)) return
+  const items = [...(e.clipboardData?.items || [])]
+  const it = items.find((i) => i.kind === 'file' && i.type.startsWith('image/'))
+  let file = it ? it.getAsFile() : e.clipboardData?.files?.[0]
+  if (!file || !file.type.startsWith('image/')) return
+  e.preventDefault()
+  const ext = (file.type.split('/')[1] || 'png').replace('jpeg', 'jpg')
+  if (!/\.[a-z0-9]+$/i.test(file.name || '')) {
+    file = new File([file], `pasted-drawing-${Date.now()}.${ext}`, { type: file.type })
+  }
+  takeFile(file)
+}
+
+// A live preview of the edited recipe replaces the shape on the stage
+watch(() => store.liveStl, (live) => {
+  if (!live || !store.isImageJob) return
+  buffer.value = markRaw({ data: live.data, kind: 'stl' })
+  stageView.value = '3d'
+  previewError.value = null
+})
+
+// A finished Blueprint build has a preview.stl: show it (a rebuild
+// rewrites the file, so the fetch is never cached).
+watch(() => [store.status, store.jobId], async ([s, job]) => {
+  if (s !== 'done' || !store.isImageJob || !store.result?.ok || !job) return
+  try {
+    const res = await fetch(`/api/jobs/${job}/preview?t=${Date.now()}`)
+    if (!res.ok) throw new Error(`the server sent no preview (${res.status})`)
+    const data = await res.arrayBuffer()
+    if (job !== store.jobId) return
+    buffer.value = markRaw({ data, kind: 'stl' })
+    stageView.value = '3d'
+    previewError.value = null
+  } catch (e) {
+    previewError.value = `No 3D preview (${friendlyError(e)}). The STEP and the script still download.`
+  }
 })
 
 // why the 3D preview is missing while the file itself is fine
@@ -50,6 +101,16 @@ async function takeFile(file) {
   loadingName.value = file.name
   previewError.value = null
   try {
+    if (IMAGE_EXTS.includes(kind)) {
+      // a drawing: Blueprint's, whatever tool was up
+      buffer.value = null
+      stageView.value = 'drawing'
+      if (store.tool !== 'blueprint') store.setTool('blueprint')
+      await store.uploadImage(file)
+      return
+    }
+    // a mesh dropped while Blueprint is up belongs to the mesh tools
+    if (store.tool === 'blueprint') store.setTool('solid')
     if (kind === 'stl' || kind === 'obj') {
       let data
       try {
@@ -95,6 +156,7 @@ const TOOL_HEAD = {
   solid: { title: 'Mesh → Solid', blurb: 'Find the design intent and write a clean STEP solid.' },
   loft: { title: 'Sliced Loft', blurb: 'Slice along an axis and loft the outlines into a smooth solid.' },
   xray: { title: 'X-Ray', blurb: 'Section sketches between two planes, as a Fusion script.' },
+  blueprint: { title: 'Blueprint', blurb: 'A dimensioned drawing read into parametric sketches and extrusions.' },
 }
 const toolHead = computed(() => TOOL_HEAD[store.tool] || TOOL_HEAD.solid)
 
@@ -136,23 +198,37 @@ const canConvert = computed(
         @dragleave="dragOver = false"
         @drop.prevent="onDrop"
       >
+        <div v-if="store.isImageJob" class="stagetabs" role="tablist">
+          <button :class="{ on: stageView === 'drawing' }" role="tab" @click="stageView = 'drawing'">Drawing</button>
+          <button :class="{ on: stageView === '3d' }" :disabled="!buffer" role="tab"
+                  :title="buffer ? '' : 'the 3D preview appears once the part is built'"
+                  @click="stageView = '3d'">3D</button>
+        </div>
+        <div v-if="store.isImageJob && (store.liveBusy || store.liveError)" class="redraw" :class="{ failed: !store.liveBusy && store.liveError }" role="status">
+          <template v-if="store.liveBusy"><span class="spin edge slow" aria-hidden="true"></span> Redrawing object…</template>
+          <template v-else>Redraw failed: {{ store.liveError }}</template>
+        </div>
+        <img
+          v-if="store.isImageJob && stageView === 'drawing'"
+          class="drawing" :src="store.imageUrl" :alt="store.filename || 'the drawing'"
+        />
         <MeshViewer
-          v-if="buffer"
+          v-if="buffer && (!store.isImageJob || stageView === '3d')"
           :buffer="buffer"
-          :unit-scale="store.unitScale"
-          :triangle-body="store.triangleBody"
+          :unit-scale="store.isImageJob ? 1 : store.unitScale"
+          :triangle-body="store.isImageJob ? store.featureMap : store.triangleBody"
           :selected="store.selected"
           :hovered="store.hovered"
           :planes="store.viewPlanes"
           :sections="store.viewSections"
-          @pick="store.toggleBody($event)"
+          @pick="store.isImageJob ? null : store.toggleBody($event)"
           @hover="store.hovered = $event"
           @error="previewError = $event"
         />
         <p v-if="previewError && (buffer || store.jobId)" class="preview-note micro">
           {{ previewError }}
         </p>
-        <div v-if="!buffer" class="dropzone">
+        <div v-if="!buffer && !store.isImageJob" class="dropzone">
           <div class="prism-mark" aria-hidden="true">
             <svg viewBox="0 0 120 100" width="120" height="100">
               <path d="M60 8 L112 82 L8 82 Z" fill="none"
@@ -166,12 +242,12 @@ const canConvert = computed(
           </template>
           <template v-else>
             <p class="big">Drop an STL, OBJ, PLY, OFF, 3MF or GLB here</p>
-            <p class="sub">or</p>
+            <p class="sub">or a dimensioned drawing (JPG / PNG, or paste one) for Blueprint — or</p>
             <button class="browse" @click="fileInput.click()">Choose a file</button>
           </template>
         </div>
         <input
-          ref="fileInput" type="file" accept=".stl,.obj,.ply,.off,.3mf,.glb,.gltf" hidden
+          ref="fileInput" type="file" :accept="ACCEPT_ATTR" hidden
           @change="takeFile($event.target.files[0]); $event.target.value = ''"
         />
       </div>
@@ -181,17 +257,21 @@ const canConvert = computed(
           <h1>{{ toolHead.title }}</h1>
           <p class="micro">{{ toolHead.blurb }}</p>
         </header>
-        <BodyPicker />
-        <p v-if="store.bodiesError" class="bodies-note micro">
-          The body list could not be built ({{ store.bodiesError }}), so the whole
-          file will be converted as one selection.
-        </p>
-        <SetupPanel />
+        <!-- Blueprint has no mesh: no body picker, no units, its own buttons and report -->
+        <template v-if="store.tool !== 'blueprint'">
+          <BodyPicker />
+          <p v-if="store.bodiesError" class="bodies-note micro">
+            The body list could not be built ({{ store.bodiesError }}), so the whole
+            file will be converted as one selection.
+          </p>
+          <SetupPanel />
+        </template>
         <SolidPanel v-if="store.tool === 'solid'" />
         <LoftPanel v-else-if="store.tool === 'loft'" />
+        <BlueprintPanel v-else-if="store.tool === 'blueprint'" />
         <XRayPanel v-else />
-        <!-- x-ray never converts: no Convert button, its download is in its panel -->
-        <template v-if="store.tool !== 'xray'">
+        <!-- x-ray never converts and Blueprint has its own buttons: no Convert button here -->
+        <template v-if="store.tool !== 'xray' && store.tool !== 'blueprint'">
           <button
             class="convert"
             :disabled="!canConvert"
@@ -214,7 +294,7 @@ const canConvert = computed(
             when you are ready.
           </p>
         </template>
-        <ReportPanel />
+        <ReportPanel v-if="store.tool !== 'blueprint'" />
       </aside>
     </main>
   </div>
@@ -259,6 +339,63 @@ const canConvert = computed(
   cursor: pointer;
   flex: 0 0 auto;
 }
+
+/* Blueprint's stage: the drawing, and the Drawing | 3D switch */
+.drawing {
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+  background: var(--ink);
+  display: block;
+}
+.stagetabs {
+  position: absolute;
+  top: 12px;
+  left: 14px;
+  z-index: 3;
+  display: flex;
+  gap: 2px;
+  padding: 3px;
+  background: rgba(20, 23, 28, 0.85);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+}
+.stagetabs button {
+  height: 26px;
+  padding: 0 10px;
+  background: none;
+  border: none;
+  border-radius: 4px;
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+}
+.stagetabs button:hover:not(:disabled) { color: var(--text); background: var(--panel-2); }
+.stagetabs button.on { color: var(--edge); background: var(--panel-2); }
+.stagetabs button:disabled { opacity: 0.5; cursor: default; }
+.stage:has(.stagetabs) .preview-note { top: 46px; }
+/* "Redrawing object…" under the ViewCube (which sits top-right, 132 px + 12 px margin) */
+.redraw {
+  position: absolute;
+  top: 158px;
+  right: 14px;
+  z-index: 3;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 10px;
+  background: rgba(20, 23, 28, 0.85);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  color: var(--edge);
+  font-size: 12px;
+  font-weight: 600;
+  max-width: 320px;
+  pointer-events: none;
+}
+.redraw.failed { color: var(--warn, #f0ad4e); font-weight: 500; }
+.redraw .spin.slow { width: 14px; height: 14px; animation-duration: 1.6s; }
 
 .preview-note {
   position: absolute;

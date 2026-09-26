@@ -9,6 +9,7 @@ written with a readable 'error': the UI shows that sentence, and the
 traceback goes to the log for whoever wants it.
 """
 import json
+import os
 import sys
 import traceback
 
@@ -72,6 +73,12 @@ def main(argv=None):
         except Exception as e:
             raise RuntimeError(f'the conversion settings could not be read ({describe(e)})') from e
         result['params'] = params
+
+        if params.get('tool') == 'blueprint':
+            # Blueprint: no mesh; the recipe in params is built by CadQuery
+            # (STEP + preview + Fusion script) next to out_path
+            _blueprint(params, out_path, result)
+            return                # through finally: result.json written, exit code 0
 
         picked = params.get('bodies')
         if picked:
@@ -144,6 +151,43 @@ def main(argv=None):
             pass
         _write_result(result_path, result)
     sys.exit(0 if result['ok'] else 1)
+
+
+def _blueprint(params, out_path, result):
+    from stl_to_solid.blueprint.compile import compile_recipe
+    from stl_to_solid.blueprint.build_cq import BlueprintError
+    from .analysis import step_stats
+    result['mode'] = 'blueprint'
+    out_dir = os.path.dirname(os.path.abspath(out_path))
+    stem = os.path.splitext(os.path.basename(out_path))[0]
+    read = params.get('read') or {}
+    if read.get('model'):
+        u = read.get('usage') or {}
+        print('read with %s (%s, effort %s): %s in / %s out tokens in %s s%s' % (
+            read['model'], read.get('provider', '?'), read.get('effort', 'high'), u.get('input_tokens', '?'),
+            u.get('output_tokens', '?'), read.get('seconds', '?'),
+            ', repaired once' if read.get('repaired') else ''))
+        for w in (read.get('validation') or {}).get('warnings') or []:
+            print('warning:', w)
+    print('blueprint: building %d feature(s)' % len((params.get('recipe') or {}).get('features') or []))
+    try:
+        r = compile_recipe(params['recipe'], out_dir, title=params.get('title') or 'Blueprint', stem=stem)
+    except BlueprintError as e:
+        if e.report is not None:
+            result['validation'] = {'errors': list(e.report.errors), 'warnings': list(e.report.warnings)}
+        raise
+    try:
+        stats = step_stats(out_path)
+    except Exception as e:
+        traceback.print_exc()
+        print(f'note: could not measure the written STEP ({describe(e)})')
+        stats = {'file_size': None, 'faces': 0, 'solids': None, 'solids_claimed': None,
+                 'closed': None, 'surface_types': {}, 'unmeasured': True}
+    result.update(r, ok=True, output_stats=stats)
+    for w in r.get('warnings', []):
+        print('warning:', w)
+    print('blueprint: %d solid(s), %.1f mm^3, bbox %s' % (
+        r['solids'], r['volume_mm3'], ' x '.join('%.2f' % v for v in r['bbox']['size'])))
 
 
 if __name__ == '__main__':
