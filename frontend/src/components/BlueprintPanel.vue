@@ -226,11 +226,21 @@ const readLabel = computed(() => {
           <div class="kv">
             <span class="k">offset</span>
             <RecipeField :model-value="f.offset" :original="orig(fi, ['offset'])" @update:model-value="f.offset = $event" />
+            <span class="k">dir</span>
+            <select class="mini" v-model="f.direction" :class="{ touched: f.direction !== orig(fi, ['direction']) }"
+                    title="'+' along the plane's normal (XY: up), '-' the other way, symmetric both ways">
+              <option value="+">+</option>
+              <option value="-">−</option>
+              <option value="symmetric">sym</option>
+            </select>
             <template v-if="!f.through_all">
-              <span class="k">extrude {{ f.direction }}</span>
+              <span class="k">distance</span>
               <RecipeField :model-value="f.distance" :original="orig(fi, ['distance'])" @update:model-value="f.distance = $event" />
             </template>
-            <span v-else class="k">through all</span>
+            <label v-if="f.op === 'cut'" class="tick" :class="{ touched: f.through_all !== orig(fi, ['through_all']) }"
+                   title="cut the whole part along the normal, whatever is in line">
+              <input type="checkbox" v-model="f.through_all" /> through all
+            </label>
           </div>
           <div v-for="(s, si) in f.shapes" :key="si" class="kv shape">
             <span class="kind">{{ s.kind }}</span>
@@ -356,6 +366,10 @@ const readLabel = computed(() => {
 .kv .k:first-child { margin-left: 0; }
 .kv.shape { padding-left: 8px; }
 .kv .kind { font-weight: 600; font-size: 11px; text-transform: uppercase; letter-spacing: 0.04em; }
+.kv select.mini { width: auto; padding: 2px 4px; font-size: 12px; max-width: 64px; }
+.kv .tick { display: inline-flex; align-items: center; gap: 4px; font-size: 11px; color: var(--muted); margin-left: 4px; }
+.kv .tick input { accent-color: var(--edge); margin: 0; }
+.kv .tick.touched { color: var(--edge); }
 .logbox pre {
   margin-top: 6px;
   max-height: 180px;

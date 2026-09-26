@@ -157,3 +157,14 @@ def test_loose_join_and_sticking_out_hole_are_warnings(sg90):
     _feature(fresh, 'screw')['shapes'][0]['center']['u'] = 'boss_x + 2.5'
     rep = validate(fresh)
     assert any('screw' in w and 'sticks out' in w for w in rep.warnings)
+
+
+def test_through_all_cut_through_more_than_its_target_warns(sg90):
+    rep = validate(sg90)
+    assert not any('passes through' in w for w in rep.warnings)     # the tab holes sit outside the body
+    # a slot from the hole inward to the body edge, cut through all: the body is in line too
+    _feature(sg90, 'tab_holes')['shapes'].append(
+        {'kind': 'slot', 'p1': {'u': '-tab_len + hole_in', 'v': 'body_d/2'}, 'p2': {'u': 0, 'v': 'body_d/2'},
+         'width': 1.3})
+    rep = validate(sg90)
+    assert any('tab_holes' in w and 'passes through tabs, body' in w for w in rep.warnings), rep.warnings

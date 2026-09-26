@@ -278,6 +278,7 @@ def validate(recipe):
 
     # --- bounding-box simulation ----------------------------------------------------
     material = []          # (lo, hi) boxes of material added so far
+    box_owner = []         # the feature id that added each box
     for f in feats:
         fid = f['id']
         _, _, n = PLANE_AXES[f['plane']]
@@ -292,6 +293,7 @@ def validate(recipe):
                 report.warnings.append(f'{fid}: this join touches no existing material (it would be a loose '
                                        'body in Fusion)')
             material.extend(boxes)
+            box_owner.extend([fid] * len(boxes))
         else:
             if not material:
                 report.errors.append(f'{fid}: a cut before any body')
@@ -307,6 +309,17 @@ def validate(recipe):
                 if hosts and not any(_contains_uv(m, b, f['plane']) for m in hosts):
                     report.warnings.append(f'{fid}: a hole sticks out of the face it is cut into')
                     break
+            if f['through_all']:
+                # a through-all cut goes the whole way: everything in line is
+                # cut, not just the face it was aimed at
+                hit = []
+                for b in boxes:
+                    for m, owner in zip(material, box_owner):
+                        if _overlap(b, m, tol=-TOUCH) and owner not in hit:
+                            hit.append(owner)
+                if len(hit) > 1:
+                    report.warnings.append(f'{fid}: this through-all cut passes through {", ".join(hit)}; if '
+                                           'only one of them should be cut, give it a distance instead')
 
     # --- duplicates -----------------------------------------------------------------
     keys = {}
