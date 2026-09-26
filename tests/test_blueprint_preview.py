@@ -107,10 +107,14 @@ def test_preview_route(sg90, tmp_path, monkeypatch):
         assert r.status_code == 200, r.text
         d = r.json()
         assert d['solids'] == 1 and len(d['triangle_feature']) > 100
-        assert d['stl_url'].endswith('/live.stl')
-        stl = c.get(d['stl_url'])
-        assert stl.status_code == 200 and stl.headers['cache-control'] == 'no-store'
-        assert stl.headers['content-type'].startswith('model/stl')
+        import base64
+        stl = base64.b64decode(d['stl_b64'])
+        assert len(stl) > 1000 and 'stl_bytes' not in d
+        # binary STL: 80-byte header then the triangle count, matching the map
+        import struct
+        assert struct.unpack('<I', stl[80:84])[0] == len(d['triangle_feature'])
+        r2 = c.get(f'/api/blueprints/{job}/live.stl')
+        assert r2.status_code == 200 and r2.headers['cache-control'] == 'no-store'
         bad = json.loads(json.dumps(sg90))
         bad['overall']['w'] = 50
         r = c.post(f'/api/blueprints/{job}/preview', json={'recipe': bad})

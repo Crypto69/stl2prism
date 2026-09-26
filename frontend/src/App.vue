@@ -204,6 +204,10 @@ const canConvert = computed(
                   :title="buffer ? '' : 'the 3D preview appears once the part is built'"
                   @click="stageView = '3d'">3D</button>
         </div>
+        <div v-if="store.isImageJob && (store.liveBusy || store.liveError)" class="redraw" :class="{ failed: !store.liveBusy && store.liveError }" role="status">
+          <template v-if="store.liveBusy"><span class="spin edge slow" aria-hidden="true"></span> Redrawing object…</template>
+          <template v-else>Redraw failed: {{ store.liveError }}</template>
+        </div>
         <img
           v-if="store.isImageJob && stageView === 'drawing'"
           class="drawing" :src="store.imageUrl" :alt="store.filename || 'the drawing'"
@@ -371,6 +375,27 @@ const canConvert = computed(
 .stagetabs button.on { color: var(--edge); background: var(--panel-2); }
 .stagetabs button:disabled { opacity: 0.5; cursor: default; }
 .stage:has(.stagetabs) .preview-note { top: 46px; }
+/* "Redrawing object…" under the ViewCube (which sits top-right, 132 px + 12 px margin) */
+.redraw {
+  position: absolute;
+  top: 158px;
+  right: 14px;
+  z-index: 3;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 10px;
+  background: rgba(20, 23, 28, 0.85);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  color: var(--edge);
+  font-size: 12px;
+  font-weight: 600;
+  max-width: 320px;
+  pointer-events: none;
+}
+.redraw.failed { color: var(--warn, #f0ad4e); font-weight: 500; }
+.redraw .spin.slow { width: 14px; height: 14px; animation-duration: 1.6s; }
 
 .preview-note {
   position: absolute;

@@ -39,7 +39,10 @@ const revert = () => { draft.value = clone(store.recipe) }
 let liveTimer = null
 watch(draft, (d) => {
   clearTimeout(liveTimer)
-  if (!d || !dirty.value || store.busy) return
+  if (!d || store.busy) return
+  // an edit, or an edit undone while the view still shows the edited
+  // shape: either way the view must follow the draft
+  if (!dirty.value && !store.liveStl) return
   liveTimer = setTimeout(() => store.previewLive(d), 500)
 }, { deep: true })
 onBeforeUnmount(() => clearTimeout(liveTimer))

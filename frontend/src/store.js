@@ -783,10 +783,12 @@ export const useConvertStore = defineStore('convert', {
         if (!res.ok) throw new Error(await errText(res))
         const d = await res.json()
         if (mine !== liveSeq || job !== this.jobId) return
-        const stl = await fetch(`${d.stl_url}?t=${Date.now()}`)
-        if (!stl.ok) throw new Error(await errText(stl))
-        const data = await stl.arrayBuffer()
-        if (mine !== liveSeq || job !== this.jobId) return
+        // the mesh comes inside the answer, so it always matches the map
+        const bin = atob(d.stl_b64 || '')
+        const data = new ArrayBuffer(bin.length)
+        const view = new Uint8Array(data)
+        for (let i = 0; i < bin.length; i++) view[i] = bin.charCodeAt(i)
+        if (!bin.length) throw new Error('the server sent an empty preview mesh')
         this.$patch({
           liveStl: markRaw({ data, kind: 'stl', seq: mine }),
           featureList: d.features || [], featureMap: d.triangle_feature || null,

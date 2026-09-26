@@ -105,6 +105,14 @@ class Helper:
             if not ans.get('ok'):
                 raise PreviewError(ans.get('error') or 'the preview failed', ans.get('kind', 'build'),
                                    ans.get('validation'))
+            # read the mesh while the lock is still held: the next request
+            # overwrites <stem>.stl, and a mesh from one build with the
+            # feature map of another paints the view in stripes
+            try:
+                with open(os.path.join(out_dir, f'{stem}.stl'), 'rb') as f:
+                    ans['stl_bytes'] = f.read()
+            except OSError as e:
+                raise PreviewError(f'the preview mesh could not be read ({e})', 'helper')
             return ans
 
     def close(self):

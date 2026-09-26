@@ -580,8 +580,9 @@ def blueprint_build(job_id: str, body: BuildBody):
 async def blueprint_preview(job_id: str, body: BuildBody):
     """A live look at an edited recipe: the shape only, built by the warm
     preview helper (no STEP, no script, the job's result untouched). Answers
-    with the size, volume and warnings plus the per-triangle feature index
-    for colouring; the mesh itself is at /live.stl."""
+    with the size, volume and warnings, the per-triangle feature index for
+    colouring, and the mesh itself (binary STL, base64) so mesh and map
+    always belong to the same build."""
     from stl_to_solid.blueprint import normalize, validate
     job, _ = _drawing_path(job_id)
     recipe = normalize(body.recipe)
@@ -595,7 +596,8 @@ async def blueprint_preview(job_id: str, body: BuildBody):
         ans = await run_in_threadpool(bp_preview.helper.build, recipe, d, 'live')
     except bp_preview.PreviewError as e:
         raise HTTPException(400 if e.kind == 'recipe' else 500, str(e))
-    ans['stl_url'] = f'/api/blueprints/{job_id}/live.stl'
+    import base64
+    ans['stl_b64'] = base64.b64encode(ans.pop('stl_bytes', b'')).decode('ascii')
     ans['recipe'] = recipe
     return sanitize(ans)
 
