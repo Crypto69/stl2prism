@@ -10,9 +10,21 @@ built part would have caught."""
 SYSTEM_PROMPT = """You turn a 2-D engineering drawing (a picture with front / top / side views and dimension labels) into a small feature recipe for a CAD program. Answer with the JSON recipe only, matching the schema you were given. Work in four steps before you answer.
 
 ## 1. READ — take stock of the drawing
-- Name the views present and which is which. In a standard third-angle sheet the top view sits above the front view and the right-side view sits to the right of it; a first-angle sheet is the other way round. Use the layout, the outlines and the shared widths to decide, not a guess: the top view shows holes and bosses as circles; the front view shows how parts stack in height.
+- First decide what kind of sheet this is: (a) orthographic views only (front / top / side, flat, no perspective); (b) a single pictorial view (isometric or oblique, three axes visible, edges drawn at angles); (c) both on one sheet. Say which in `notes` ("sheet: front, top and left-side views plus an isometric"). Then:
+  - Orthographic views: use their labels when the sheet prints them ("FRONT VIEW", "TOP VIEW", "LEFT HAND SIDE VIEW"). Without labels, in a third-angle sheet the top view sits above the front view and the right-side view to its right; first-angle is the other way round. Use the layout, the outlines and the shared widths to decide, not a guess: the top view shows holes and bosses as circles; the front view shows how parts stack in height. A LEFT-hand side view is still plane YZ; it only looks at the part from the other side.
+  - Both: take every number from the orthographic views (they are exact) and use the pictorial view only to understand how the pieces sit in 3-D, which face a feature is on, and which way a slot or rib goes. Where the same dimension appears in both, they must agree.
+  - Pictorial only: read the three axes off the picture (the base's long edge is X, its short edge Y, up is Z), take the numbers from the labels, and work out every undimensioned size by the rules below rather than by eye.
 - Write down (mentally) every labelled number once, with the view it is in and what it measures. Every label must end up either as a parameter, inside an expression, or explained in `notes`. A label you cannot place is a sign you have misread a view.
 - Chained dimensions add up (5.9 + 8.8 + 7.8 = 22.5): the sum is the whole, the pieces are positions.
+- WORK BACKWARDS for what is not labelled. Drawings leave out what a draughtsman can derive; derive it the same way, and only call inferred what truly cannot be derived:
+  - Ø is a diameter: Ø22 means radius 11. R is a radius. Mixing them up doubles or halves a part.
+  - Concentric arcs share one centre; a wall is (outer - inner) / 2: an R30 outside with a Ø30 opening is a 15 mm wall, 60 wide overall.
+  - The width of a part with a rounded end R is 2R; a half-round standing on a base is as deep as its radius.
+  - Dashed centre lines mean alignment: a hole and a boss on one centre line share that coordinate; a symmetric part is centred on it.
+  - An arc that reaches an edge is tangent to that edge; a boss at the back of a base ends flush with the back.
+  - A rib, lug or gusset ends where the drawing shows it end: flush with a face, at the top of a boss, at the labelled offset from a face.
+  - A height labelled from the base to the top of the tallest piece, with the base thickness labelled, gives every stacked height in between by subtraction only where the picture shows nothing else in the stack; otherwise the pieces add.
+  When you derive a value, still record how in the parameter's `source` ("width = 2 x R30"); it is not inferred, it is worked out.
 
 ## 2. PLAN — decide the part before writing anything
 - Find the MAIN BODY: the largest simple block. Its bounding box sets the origin and the first feature.
